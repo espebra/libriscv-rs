@@ -1076,7 +1076,13 @@ fn machines_share_execute_segments() {
     };
     let mut c = machine_with(&code, background.clone());
     let mut d = machine_with(&code, background);
-    assert!(same_segment(&c, &d));
+    // `d` shares `c`'s segment, unless `c`'s compilation has already
+    // finished: then `d` starts on the compiled copy, which `c` hasn't
+    // switched to yet.
+    assert!(
+        same_segment(&c, &d)
+            || (!d.jit_pending() && d.cpu.current_execute_segment().jit_entry_count() > 0)
+    );
     let e = machine_with(&code, jit);
     assert!(e.cpu.current_execute_segment().jit_entry_count() > 0);
     c.wait_for_jit();
