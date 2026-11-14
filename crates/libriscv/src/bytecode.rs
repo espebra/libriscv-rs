@@ -178,6 +178,7 @@ fn set(m: &mut Machine, r: u32, v: u64) {
 macro_rules! sequential {
     ($($(#[$attr:meta])* $name:ident, $step:expr, |$m:ident, $ins:ident| $body:block)*) => {$(
         $(#[$attr])*
+        #[rustc_align(64)]
         pub(crate) extern "rust-preserve-none" fn $name(
             exec: &DecodedSegment,
             cache: &[DecoderEntry],
@@ -344,6 +345,7 @@ sequential! {
 
 /// The register-register bytecodes (C++ `RV32I_BC_OP_*`, `RV64I_BC_OP_*`),
 /// sharing their arithmetic with the precise handlers.
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn op<O: RtypeAlu>(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
@@ -362,6 +364,7 @@ pub(crate) extern "rust-preserve-none" fn op<O: RtypeAlu>(
 /// The CA-format register-register ops that C++ leaves to
 /// `RV32C_BC_FUNCTION` (C.SUB, C.AND, C.SUBW, C.ADDW, C.MUL): `rs1 = rs1 op
 /// rs2`, then the next entry, exactly what that bytecode does.
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn c_op<O: RtypeAlu>(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
@@ -392,6 +395,7 @@ sequential! {
 }
 
 /// AUIPC reconstructs its address from the block end (C++ `rv32i_auipc`).
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn auipc(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
@@ -418,6 +422,7 @@ pub(crate) extern "rust-preserve-none" fn auipc(
 macro_rules! loads {
     ($($(#[$attr:meta])* $name:ident, $slow:ident, $step:expr, $n:literal, |$m:ident, $rd:ident, $b:ident| $set:expr;)*) => {$(
         $(#[$attr])*
+        #[rustc_align(64)]
         pub(crate) extern "rust-preserve-none" fn $name(
             exec: &DecodedSegment,
             cache: &[DecoderEntry],
@@ -496,6 +501,7 @@ loads! {
 macro_rules! stores {
     ($($(#[$attr:meta])* $name:ident, $slow:ident, $step:expr, |$m:ident, $rs2:ident| $value:expr;)*) => {$(
         $(#[$attr])*
+        #[rustc_align(64)]
         pub(crate) extern "rust-preserve-none" fn $name(
             exec: &DecodedSegment,
             cache: &[DecoderEntry],
@@ -567,6 +573,7 @@ stores! {
 macro_rules! fp_arith {
     ($($(#[$attr:meta])* $name:ident, |$a:ident, $b:ident| $e:expr;)*) => {$(
         $(#[$attr])*
+        #[rustc_align(64)]
         pub(crate) extern "rust-preserve-none" fn $name(
             exec: &DecodedSegment,
             cache: &[DecoderEntry],
@@ -616,6 +623,7 @@ fp_arith! {
 macro_rules! branches {
     ($($(#[$attr:meta])* $name:ident, forward: $fw:expr, |$a:ident, $b:ident| $cond:expr;)*) => {$(
         $(#[$attr])*
+        #[rustc_align(64)]
         pub(crate) extern "rust-preserve-none" fn $name(
             exec: &DecodedSegment,
             cache: &[DecoderEntry],
@@ -657,6 +665,7 @@ branches! {
 
 /// C++ `RV32C_BC_BEQZ`. Unlike the 4-byte branches, C++ checks the counter
 /// on forward branches too (`PERFORM_BRANCH`).
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn c_beqz(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
@@ -674,6 +683,7 @@ pub(crate) extern "rust-preserve-none" fn c_beqz(
 }
 
 /// C++ `RV32C_BC_BNEZ`
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn c_bnez(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
@@ -691,6 +701,7 @@ pub(crate) extern "rust-preserve-none" fn c_bnez(
 }
 
 /// C++ `RV32C_BC_JMP`: the offset is the whole entry.
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn c_jmp(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
@@ -704,6 +715,7 @@ pub(crate) extern "rust-preserve-none" fn c_jmp(
 }
 
 /// C++ `RV32C_BC_JR`: the entry is the register.
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn c_jr(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
@@ -718,6 +730,7 @@ pub(crate) extern "rust-preserve-none" fn c_jr(
 }
 
 /// C++ `RV32C_BC_JALR`. Reads the target before writing RA.
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn c_jalr(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
@@ -733,6 +746,7 @@ pub(crate) extern "rust-preserve-none" fn c_jalr(
 }
 
 /// C++ `RV32I_BC_JAL`, with a link register other than `x0`/`ra`.
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn jal(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
@@ -748,6 +762,7 @@ pub(crate) extern "rust-preserve-none" fn jal(
 }
 
 /// C++ `RV32I_BC_FAST_JAL` (JAL with `rd = x0`): the offset is the whole entry.
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn fast_jal(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
@@ -761,6 +776,7 @@ pub(crate) extern "rust-preserve-none" fn fast_jal(
 }
 
 /// C++ `RV32I_BC_FAST_CALL` (JAL with `rd = ra`).
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn fast_call(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
@@ -775,6 +791,7 @@ pub(crate) extern "rust-preserve-none" fn fast_call(
 }
 
 /// C++ `RV32I_BC_JALR`.
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn jalr(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],

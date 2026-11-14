@@ -137,7 +137,9 @@ To decide at the start of the phase that needs them (recommendation given):
 ## Toolchain
 
 Pinned nightly in `rust-toolchain.toml` (currently `nightly-2026-09-28`,
-rustc `d080e7dff`). We need it for `become` (`feature(explicit_tail_calls)`).
+rustc `d080e7dff`). We need it for `become` (`feature(explicit_tail_calls)`);
+the handlers also use `feature(rust_preserve_none_cc)` and `feature(fn_align)`
+(see Dispatch).
 The feature is still flagged *incomplete* upstream, so a miscompile is
 possible; the difftests and instruction-count checks are the safety net.
 
@@ -165,6 +167,7 @@ How the C++ version maps over:
 | `VIEW_INSTR_AS(fi, FasterItype)` reading `d->instr` | The caller passes the entry's (re-encoded) bits as `ins`, so a handler never looks up its own entry |
 | `d += 1` pointer bump | index `i + 1`; read with `exec.cache.get(i)`. That's one bounds check per instruction (a compare and a predicted branch), the price of safe Rust |
 | `__attribute__((preserve_none))` | `extern "rust-preserve-none" fn` (`feature(rust_preserve_none_cc)`). Without it every handler saved and restored six callee-saved registers: it cut CoreMark's host instructions by 17% |
+| (handler placement left to the compiler) | Hot handlers are 64-byte aligned (`#[rustc_align(64)]`, `feature(fn_align)`). Otherwise the interpreter's speed shifted by a few percent with wherever unrelated changes placed them; aligned, fixed-workload CoreMark took 2.5–5% fewer cycles (32-byte alignment didn't help) |
 | `return RETURN_VALUES()`, `next_execute_segment(...)` exits | `become halt_exit(...)` etc.: exits are tail calls to cold handlers too, so a fast handler makes no calls and needs no stack frame |
 | `BEGIN_BLOCK()` adds the block's instruction count; `OVERFLOW_CHECK()` only on branches/jumps | Same. The counting has to match exactly to keep instruction-count parity |
 | `cpu.trigger_exception()` throws | Store the `MachineError` in the machine and return `Exit::Fault`. The return value is a one-byte enum |

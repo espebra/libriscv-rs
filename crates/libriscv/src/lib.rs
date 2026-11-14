@@ -60,6 +60,10 @@
 // Still marked incomplete upstream; the difftests are our safety net.
 #![feature(explicit_tail_calls)]
 #![feature(rust_preserve_none_cc)]
+// Handler entry points aligned to cache lines (`#[rustc_align(64)]`): the
+// threaded interpreter's speed otherwise varies by a few percent with
+// where unrelated code changes happen to place them.
+#![feature(fn_align)]
 #![allow(incomplete_features)]
 
 #[cfg(feature = "aot")]

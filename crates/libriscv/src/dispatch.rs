@@ -335,6 +335,7 @@ pub(crate) use overflow_checked_jump;
 /// FUNCTION's stale-segment check (FMADD). The entry holds the original
 /// instruction bits.
 #[cfg(feature = "ext-f")]
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn seq<O: Op>(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
@@ -353,6 +354,7 @@ pub(crate) extern "rust-preserve-none" fn seq<O: Op>(
 /// C++ `RV32C_BC_FUNCTION`: a compressed instruction executed through its
 /// precise handler, continuing with the next entry. Unlike
 /// `RV32I_BC_FUNCTION` it doesn't check for a stale segment afterwards.
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn cseq<O: Op>(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
@@ -371,6 +373,7 @@ pub(crate) extern "rust-preserve-none" fn cseq<O: Op>(
 /// C++ `RV32I_BC_FUNCTION`: a slow-path instruction in the middle of a
 /// block. Like C++ it re-checks the segment afterwards, since the
 /// instruction may have made it stale (FENCE.I).
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn function<O: Op>(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
@@ -392,6 +395,7 @@ pub(crate) extern "rust-preserve-none" fn function<O: Op>(
 
 /// C++ `RV32I_BC_FUNCBLOCK`: the last instruction of an over-long block,
 /// executed precisely (with `pc` visible to it).
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn funcblock<O: Op>(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
@@ -414,6 +418,7 @@ pub(crate) extern "rust-preserve-none" fn funcblock<O: Op>(
 }
 
 /// ECALL (C++ `rv32i_syscall`).
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn syscall(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
@@ -445,6 +450,7 @@ pub(crate) extern "rust-preserve-none" fn syscall(
 }
 
 /// WFI and the STOP instruction (C++ `rv32i_stop`).
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn stop(
     _exec: &DecodedSegment,
     _cache: &[DecoderEntry],
@@ -466,6 +472,7 @@ pub(crate) extern "rust-preserve-none" fn stop(
 }
 
 /// Other SYSTEM instructions: EBREAK, CSRs (C++ `rv32i_system`).
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn system(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
@@ -497,6 +504,7 @@ pub(crate) extern "rust-preserve-none" fn system(
 /// C++ `execute_invalid`: an entry that can't be executed from the cache.
 /// Entries without instruction bits (the middle of a 4-byte instruction)
 /// are executed precisely from the segment's code instead.
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn execute_invalid(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
@@ -546,6 +554,7 @@ pub(crate) extern "rust-preserve-none" fn execute_invalid(
 /// a decoder block, such as a loop head, which can't be patched because the
 /// interpreter falls through them. Then the entry's own handler is the
 /// interpreter's.
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn native_enter(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
