@@ -402,10 +402,10 @@ impl DecodedSegment {
         if exlen == 0 {
             return Err(MachineError::invalid_program("Empty execute segment", 0));
         }
-        let mut data = vec![0u8; code.len() + 8];
-        if let Some(dst) = data.get_mut(4..4 + code.len()) {
-            dst.copy_from_slice(code);
-        }
+        let mut data = Vec::with_capacity(code.len() + 8);
+        data.extend_from_slice(&[0; 4]);
+        data.extend_from_slice(code);
+        data.extend_from_slice(&[0; 4]);
         // One extra entry: jumps and branches don't re-check PC after not
         // branching, so the entry after the last instruction must be invalid.
         let n_entries = (exlen + 8) / DIVISOR;
@@ -415,7 +415,7 @@ impl DecodedSegment {
             begin: vaddr,
             end,
             data: data.into_boxed_slice(),
-            cache: vec![DecoderEntry::invalid(0); n_entries].into_boxed_slice(),
+            cache: Box::default(),
             stale: Arc::new(AtomicBool::new(false)),
             execute_only,
             crc32c,
@@ -426,9 +426,8 @@ impl DecodedSegment {
             #[cfg(feature = "jit")]
             jit_done: OnceLock::new(),
         };
-        let dst = seg.decode_execute_range(vaddr, end);
-        // The entry after the last instruction is invalid (already is, from
-        // the initialisation above).
+        let (cache, dst) = seg.decode_execute_range(vaddr, end, n_entries);
+        seg.cache = cache.into_boxed_slice();
         seg.realize_fastsim(vaddr, dst)?;
         Ok(seg)
     }
@@ -575,14 +574,19 @@ impl DecodedSegment {
         Ok(old)
     }
 
-    fn entry_mut(&mut self, pc: u64) -> Option<&mut DecoderEntry> {
-        let i = self.index(pc);
-        self.cache.get_mut(i)
-    }
-
-    /// Port of `Memory::decode_execute_range`.
-    fn decode_execute_range(&mut self, from: u64, to: u64) -> u64 {
+    /// Port of `Memory::decode_execute_range` for the whole segment
+    /// (`from` is its beginning): its `n_entries` decoder entries, built in
+    /// order, those after the last instruction invalid. Returns them and
+    /// the address after the last decoded instruction.
+    fn decode_execute_range(
+        &self,
+        from: u64,
+        to: u64,
+        n_entries: usize,
+    ) -> (Vec<DecoderEntry>, u64) {
+        debug_assert_eq!(from, self.begin);
         let (begin, end) = (self.begin, self.end);
+        let mut cache = Vec::with_capacity(n_entries);
         // With compressed instructions, entries that land inside a 4-byte
         // instruction must stay invalid, or they would get wrong block data.
         let mut was_full_instruction = true;
@@ -605,9 +609,7 @@ impl DecodedSegment {
                 // The instruction bits stay zero (C++ never writes them).
                 DecoderEntry::invalid(0)
             };
-            if let Some(entry) = self.entry_mut(dst) {
-                *entry = new_entry;
-            }
+            cache.push(new_entry);
             if COMPRESSED {
                 dst += 2;
                 was_full_instruction = if was_full_instruction {
@@ -619,7 +621,10 @@ impl DecodedSegment {
                 dst += 4;
             }
         }
-        dst
+        // The entry after the last instruction is invalid: jumps and
+        // branches don't re-check PC after not branching.
+        cache.resize(n_entries.max(cache.len()), DecoderEntry::invalid(0));
+        (cache, dst)
     }
 
     /// Turns an entry into a block-ending invalid instruction. C++ sets the
