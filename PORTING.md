@@ -1056,6 +1056,12 @@ guests are ignored (or, for `linux.rs` and `vmcall.rs`, compiled out)
 without the A, C and F features; freestanding guests are built for what
 the features allow.
 
+CI runs the dynamic STREAM executable (`binaries/STREAM/stream.dyn`)
+under Ubuntu's riscv64 glibc: on Linux with the interpreter and `-j`
+(the second `-j` run must use the cached system code), and on a FreeBSD
+VM (`freebsd` job) with the interpreter and `-j`. Loading cached JIT code
+is Linux-only, so on FreeBSD `-j` compiles everything on every run.
+
 The C++ reference is always run with `--no-translate --accurate` so we compare
 against the interpreter with exact instruction counts.
 `scripts/build-cpp-reference.sh` builds the threaded, tailcall and switch

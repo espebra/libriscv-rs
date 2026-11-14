@@ -150,6 +150,58 @@ jobs:
             echo "::error::Cached --jit run (${ms} ms) is not faster than the cold one (${cold_ms} ms)"; exit 1
           fi
 
+  # Build rvlinux on FreeBSD and run the dynamic STREAM executable there:
+  # interpreted, with the JIT, and with the JIT again. Loading cached JIT
+  # code is Linux-only, so the second --jit run must ignore the files the
+  # first one saved and compile everything again.
+  freebsd:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # FreeBSD has no riscv64 glibc package: take Ubuntu's, extracted into
+      # the workspace that is copied into the VM.
+      - name: Fetch riscv64 glibc (ld.so and shared libraries)
+        run: |
+          sudo apt-get update
+          apt-get download libc6-riscv64-cross
+          dpkg-deb -x libc6-riscv64-cross_*.deb riscv64-glibc
+          rm libc6-riscv64-cross_*.deb
+
+      - name: Build and run STREAM on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.3"
+          usesh: true
+          copyback: false
+          prepare: pkg install -y curl
+          run: |
+            set -eu
+            cp -R riscv64-glibc/usr/riscv64-linux-gnu /usr/
+
+            # The pinned nightly, without the rustfmt/clippy components of
+            # rust-toolchain.toml (not needed here).
+            channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$channel"
+            export PATH="$HOME/.cargo/bin:$PATH" RUSTUP_TOOLCHAIN="$channel"
+            cargo build --release -p rvlinux --features jit
+
+            # The guest's ld.so opens the program itself, so the path must be absolute.
+            prog="$PWD/binaries/STREAM/stream.dyn"
+            cache=$(mktemp -d)
+            run() {
+              name=$1; shift
+              echo "=== $name"
+              ./target/release/rvlinux "$@" "$prog" > "$name.out"
+              cat "$name.out"
+              grep -q '^Triad:' "$name.out"
+              grep -q '^Solution Validates' "$name.out"
+              grep -q '^>>> Program exited, exit code = 0 ' "$name.out"
+            }
+            run interpreter
+            run jit -j --jit-cache-dir "$cache"
+            run jit-again -j --jit-cache-dir "$cache"
+
   features:
     runs-on: ubuntu-24.04
     steps:
