@@ -73,6 +73,37 @@ pub(crate) fn direct_jalr_target(exec: &DecodedSegment, a: &Analysis, i: usize) 
         .filter(|&t| a.region_at(exec, t).is_some())
 }
 
+/// The call at `a.insns[i]` in `region`, if it is made as a native call:
+/// `jal` or a constant `jalr` with a link register, to a region, returning
+/// to a label of `region`. `(target, callee region)`.
+pub(crate) fn native_call(
+    exec: &DecodedSegment,
+    a: &Analysis,
+    region: RegionId,
+    i: usize,
+) -> Option<(u64, RegionId)> {
+    let ins = a.insns.get(i)?;
+    let target = match ins.op {
+        JOp::Jal { rd, target } if rd & 31 != 0 => target,
+        JOp::Jalr { rd, .. } if rd & 31 != 0 => direct_jalr_target(exec, a, i)?,
+        _ => return None,
+    };
+    let next = ins.pc.wrapping_add(ins.len);
+    if !returns_to(exec, a, region, next) {
+        return None;
+    }
+    Some((target, a.region_at(exec, target)?))
+}
+
+/// A call returning to `next` from `region` can be native: `next` is a
+/// label of `region`.
+pub(crate) fn returns_to(exec: &DecodedSegment, a: &Analysis, region: RegionId, next: u64) -> bool {
+    a.region_at(exec, next) == Some(region)
+        && a.regions
+            .get(region)
+            .is_some_and(|r| r.entries.contains(&next))
+}
+
 /// Every region's [`Summary`]: its own registers, then those of the
 /// regions it may transfer to, to a fixed point.
 pub(crate) fn summaries(exec: &DecodedSegment, a: &Analysis) -> Option<Vec<Summary>> {

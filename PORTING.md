@@ -842,7 +842,8 @@ host's (as for the JIT). The JIT makes native calls the same way (see
 "Native calls" here and under JIT).
 
 **Code shape** (`aot/emit.rs`): per region, `extern "rust-preserve-none"
-fn r<N>(s: &mut S, pc, counter, depth) -> (target, counter)`, in modules
+fn r<N>(s: &mut S, xs, fr, m, pc, counter, depth) -> (target, counter)`
+(`xs`/`fr` the integer and FP register files, `m` the arena), in modules
 of 40 regions (`rustc` splits codegen units by module: one module per
 segment compiled static glibc on one thread). Guest registers it uses are
 locals, loaded on entry and the written ones stored at the single exit
@@ -865,10 +866,13 @@ bool that the first access of each run tests: it leaves at the same
 instruction a run check would (or earlier, when only the wider span
 fails, which only costs speed), and replaces the run checks that LLVM
 otherwise hoists into the entry one by one (core_state_transition did
-eight on every call). The arena, the instruction limit and the rounding
-mode are locals: read through `s`, which escapes into the tail calls,
-they were reloaded after every guest store. With an N-bit
-address space accesses are masked, without checks.
+eight on every call). The instruction limit and the rounding mode are
+locals: read through `s`, they were reloaded after every guest store. The
+register files and the arena are `&mut` parameters of their own, not
+fields of `S` (they were until 2026-11-14): LLVM marks them `noalias`, so
+it knows a guest store leaves the registers alone, and forwards an inlined
+callee's register loads from the caller's stores (see "Inlining"). With an
+N-bit address space accesses are masked, without checks.
 
 **Native calls** (2026-11-14; C++ `emit_function_call`). A call (`jal`,
 or `jalr` with a link register, including `auipc`+`jalr` with a constant
@@ -886,11 +890,40 @@ is a `Summary` (`codegen::calls`, shared with the JIT): its own registers and, t
 regions it transfers to; all of them after an indirect jump. Region
 checks only cover base registers no native callee may write. Past `DEPTH`
 (32) nested calls, a call is a tail call as before, and the return comes
-back through the table. The register stores and reloads go through one
-borrow of each register file: through `s`, LLVM reloaded the file's
-address after every store. Before this, a call in a loop cost three
+back through the table. Before this, a call in a loop cost three
 region transfers, each storing and reloading every register (CoreMark's
 `core_bench_state` ran 9x the instructions native code does).
+
+**Inlining** (2026-11-14, `emit::inlined`). A native call still cost about
+as much as a small callee's body: the stores and reloads, the callee's
+loads and stores of its own, its entry dispatch, and the caller's spills
+around the call (`rust-preserve-none` keeps nothing in registers across
+it). A region that is called natively and never tail-calls
+(`emit::self_contained`: it leaves only by guest returns, native calls
+and exits to the host) is `#[inline(always)]`, if its size with what is
+inlined into it is at most 256 instructions, and that times its call
+sites at most 1024 (or the size at most 16). Inlined at a call with a
+constant entry, LLVM folds its entry dispatch, and with the `noalias`
+register files its registers are plain values again. Tail calls are what
+rules a region out: LLVM turns a `become` in an inlined body into a plain
+call, which would let guest code grow the host stack without bound. So an
+inlined region's own native calls past `DEPTH` leave for the host
+(`EXIT_JUMP`; the host continues at the callee, with the depth back at
+0) instead of tail-calling; its only `become` left is the root
+dispatch's for an unknown entry, which a constant entry folds away (and
+which an entry missing from the root is missing from the table too). A
+cycle of calls isn't inlined. Larger limits (512 / 2048) ran fewer
+instructions on CoreMark but took more cycles.
+
+**Devirtualization** (2026-11-14, `emit::address_taken`). An indirect
+call (`jalr` with a link register and no constant target) stores and
+reloads every register. If the segment takes the address of at most 4
+labels (`auipc`, `lui` or `li` followed by an `addi` of the same
+register: `la`, `lla`, a `lui` pair; not an `auipc` alone, which before a
+call is the previous call's return label), an indirect call first
+compares its target with each, and on a match makes the direct native
+call, with that callee's `Summary`, inlined if it qualifies. CoreMark's
+list sort calls its comparator (`cmp_idx` or `cmp_complex`) this way.
 
 **Control flow** (`aot/structure.rs`). A `loop { match pc { .. } }`
 dispatcher (what `structure::dispatch` writes) was 2.4x slower than the JIT
@@ -936,6 +969,31 @@ entries, and callers' spills around calls (`rust-preserve-none` saves
 nothing). Static glibc translates (~470 KB of code) to ~19 MB of Rust in
 0.1 s; `rustc` takes ~47 s for it on 32 cores (one module took 72 s,
 single-threaded), CoreMark freestanding a few seconds.
+2026-11-14 later, the same CoreMark, `perf stat` host instructions and
+cycles per iteration, interleaved against a build of the previous commit:
+
+| | instructions | cycles |
+|---|---:|---:|
+| N-bit, before | 597k | 168.5k |
+| + inlining small leaves | 524k | ~158k |
+| + devirtualization | 515k | 153.4k |
+| + inlining every self-contained region | 506k | 151.2k |
+| + `noalias` register files and arena | 457k | 134.6k |
+| checked, before / after | 877k / 753k | 218.5k / 193.3k |
+| native x86-64 `-O2` (gcc 13) | 401k | 135.8k |
+
+N-bit AOT runs CoreMark at native speed (per function, every part was
+within ~1% of native but the list sort's comparator calls, before the
+`noalias` change). The `noalias` change is what made inlining pay off:
+an inlined callee loads its registers after the caller's guest stores
+(saving `ra` and the `s` registers on the guest stack), and through
+fields of `S` LLVM couldn't tell those didn't change the registers; a
+16-byte load of two registers the caller had just stored separately
+missed store forwarding, 40% of `cmp_complex`'s cycles. The C calling
+convention for regions was slower than `rust-preserve-none` (611k
+instructions), and turning off LLVM's SLP vectorizer slower too. Static
+glibc: `rustc` 44 to 47 s wall time (CPU 134 to 180 s), the shared object
+14.0 to 16.4 MB.
 
 **Testing.** `libriscv`'s `tests/aot.rs` (feature `aot-dylib`, needs
 `rustc`): the JIT tests' programs (hand-written, 150 random integer and
@@ -948,15 +1006,21 @@ and 2000 FP programs clean), and native calls
 (`support::native_call_programs`, shared with `tests/jit.rs`: recursion
 past `DEPTH`, also leaving for the host at the bottom, `auipc`+`jalr` and
 indirect calls, a callee moving the caller's base register, a callee
-leaving for the host, a return elsewhere, FP registers across calls). `rvlinux`'s `tests/aot.rs`: freestanding
+leaving for the host, a return elsewhere, an inlined callee calling past
+`DEPTH`, devirtualized indirect calls and one to another target, FP
+registers across calls). `rvlinux`'s `tests/aot.rs`: freestanding
 CoreMark through `--aot-save-shared`/`--aot-load`, layouts, `--no-aot`,
 bad files; ignored because slow: static glibc (~1 min) and the embedded
 translation (builds `rvlinux` again in `target/aot-embed`).
 
-Not yet: lazy translation, translating only hot code, more registers
-across region transfers and calls (passed as arguments instead of through
-`S::x`), liveness-based stores and reloads at calls, saving translations
-of segments that came from the cache.
+Not yet: lazy translation, translating only hot code, saving
+translations of segments that came from the cache. For the calls that
+aren't inlined (large callees, tail-calling ones, indirect calls to
+other targets): registers passed as arguments across region transfers
+and calls instead of through the register file, and liveness-based
+stores before calls (a callee's `Summary` counts every register it uses
+as read, also those it writes first). Inlining removed most of what
+these were for on CoreMark.
 
 ## Virtual paging
 
@@ -1630,7 +1694,7 @@ no references into guest memory, so:
 - [x] JIT: code cache, Cranelift output saved as an object to link in or a shared object to load (`jit_cache`, `rvlinux --jit-save-object`/`--jit-save-shared`/`--jit-load`, `RVLINUX_JIT_EMBED`; the role of C++'s translation cache and embedded translations); see "Code cache" under "JIT"
 - [x] JIT: automatic N-bit address space (`jit_automatic_nbit_address_space`, `rvlinux --nbit-address-space`; port of `nbit_arena.cpp`)
 - [x] JIT: native calls between regions (asmjit `emit_direct_call`, shared with AOT in `codegen::calls`); see "Native calls" under "JIT"
-- [x] AOT: translation to safe Rust (`aot`/`aot-dylib` features, `rvlinux --aot-save`/`--aot-save-shared`/`--aot-load`, `RVLINUX_AOT_EMBED`), structured control flow, region-to-region `become`; see "AOT"
+- [x] AOT: translation to safe Rust (`aot`/`aot-dylib` features, `rvlinux --aot-save`/`--aot-save-shared`/`--aot-load`, `RVLINUX_AOT_EMBED`), structured control flow, region-to-region `become`, native calls (inlined when self-contained, devirtualized for address-taken functions); see "AOT"
 - [ ] JIT: lazy compilation, AArch64 (icache flush in `libriscv-jit-rt`). Lazy compilation matters most for dynamic executables: `libc.so`'s whole executable mapping (1.5 MB) becomes one segment, and compiling it up front takes ~10 s (release)
 
 ### Phase 5 — Remaining features

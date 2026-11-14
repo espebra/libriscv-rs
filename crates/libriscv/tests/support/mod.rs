@@ -592,15 +592,26 @@ pub const fn auipc(rd: u32) -> u32 {
 
 /// What [`native_call_programs`] leave in `a0` when they run to the end,
 /// where it says something.
-pub const NATIVE_CALL_RESULTS: [Option<u64>; 5] = [Some(5050), Some(1275), None, Some(5 + 7), None];
+pub const NATIVE_CALL_RESULTS: [Option<u64>; 7] = [
+    Some(5050),
+    Some(1275),
+    None,
+    Some(5 + 7),
+    Some(1275),
+    Some(10 * 3 + 100),
+    None,
+];
 
 /// Programs for native calls (guest calls as host calls, returning to the
 /// caller's region): recursion past the native depth limit, also leaving
 /// for the host at its deepest, `auipc`+`jalr` and indirect calls, a
 /// callee writing a base register the caller checks on entry, a callee
 /// leaving for the host (the caller's frame is gone: its return goes
-/// through the entry table), a return elsewhere than after the call, and
-/// FP registers live across calls. With their initial registers.
+/// through the entry table), a return elsewhere than after the call, a
+/// callee with calls of its own called past the depth limit (the AOT
+/// inlines it), indirect calls to address-taken functions (the AOT
+/// devirtualizes them) and to another, and FP registers live across
+/// calls. With their initial registers.
 pub fn native_call_programs() -> Vec<(Vec<u8>, Regs)> {
     let mut programs = Vec::new();
     // sum(n) = n + sum(n - 1), recursively, 100 deep.
@@ -675,6 +686,69 @@ pub fn native_call_programs() -> Vec<(Vec<u8>, Regs)> {
             itype(0x67, 0, 0, 1, 0),     // 0x2C: ret
             itype(0x13, 0, 1, 1, 4),     // 0x30: k: addi ra, ra, 4
             itype(0x67, 0, 0, 1, 0),     // 0x34: ret
+        ]),
+        [0; 64],
+    ));
+    // f recurses 50 deep and calls g at every level, which calls h: past
+    // the native depth limit, g's call to h (g inlined into f, h into g)
+    // leaves for the host, which continues at h.
+    programs.push((
+        words(&[
+            itype(0x13, 0, 10, 0, 50),     // 0x00: li a0, 50
+            jtype(1, 0x0C),                // 0x04: jal ra, f (0x10)
+            jtype(0, 0),                   // 0x08: j .
+            0x13,                          // 0x0C: nop
+            itype(0x13, 0, 2, 2, -16),     // 0x10: f: addi sp, sp, -16
+            stype(3, 2, 1, 8),             // 0x14: sd ra, 8(sp)
+            stype(3, 2, 10, 0),            // 0x18: sd a0, 0(sp)
+            btype(0, 10, 0, 0x20),         // 0x1C: beqz a0, 0x3C
+            jtype(1, 0x30),                // 0x20: jal ra, g (0x50)
+            itype(0x13, 0, 10, 10, -1),    // 0x24: addi a0, a0, -1
+            jtype(1, -0x18),               // 0x28: jal ra, f
+            itype(0x03, 3, 11, 2, 0),      // 0x2C: ld a1, 0(sp)
+            rtype(0x33, 0, 0, 10, 10, 11), // 0x30: add a0, a0, a1
+            jtype(0, 0x0C),                // 0x34: j 0x40
+            0x13,                          // 0x38: nop
+            itype(0x13, 0, 10, 0, 0),      // 0x3C: li a0, 0
+            itype(0x03, 3, 1, 2, 8),       // 0x40: ld ra, 8(sp)
+            itype(0x13, 0, 2, 2, 16),      // 0x44: addi sp, sp, 16
+            itype(0x67, 0, 0, 1, 0),       // 0x48: ret
+            0x13,                          // 0x4C: nop
+            itype(0x13, 0, 5, 1, 0),       // 0x50: g: mv t0, ra
+            jtype(1, 0x0C),                // 0x54: jal ra, h (0x60)
+            itype(0x67, 0, 0, 5, 0),       // 0x58: jr t0
+            0x13,                          // 0x5C: nop
+            rtype(0x33, 0, 0, 12, 12, 10), // 0x60: h: add a2, a2, a0
+            itype(0x67, 0, 0, 1, 0),       // 0x64: ret
+        ]),
+        stack_regs,
+    ));
+    // Indirect calls through t1 and t2, which hold the addresses of f1
+    // and f2 (`auipc`+`addi`), then through t3, computed: f3.
+    programs.push((
+        words(&[
+            itype(0x13, 0, 11, 0, 10),    // 0x00: li a1, 10
+            itype(0x13, 0, 10, 0, 0),     // 0x04: li a0, 0
+            auipc(6),                     // 0x08: auipc t1, 0
+            itype(0x13, 0, 6, 6, 0x38),   // 0x0C: addi t1, t1, 0x38: f1
+            auipc(7),                     // 0x10: auipc t2, 0
+            itype(0x13, 0, 7, 7, 0x38),   // 0x14: addi t2, t2, 0x38: f2
+            itype(0x67, 0, 1, 6, 0),      // 0x18: loop: jalr ra, 0(t1)
+            itype(0x67, 0, 1, 7, 0),      // 0x1C: jalr ra, 0(t2)
+            itype(0x13, 0, 11, 11, -1),   // 0x20: addi a1, a1, -1
+            btype(1, 11, 0, -0x0C),       // 0x24: bnez a1, loop
+            itype(0x13, 0, 12, 0, 0x10),  // 0x28: li a2, 0x10
+            rtype(0x33, 0, 0, 28, 6, 12), // 0x2C: add t3, t1, a2: f3
+            itype(0x67, 0, 1, 28, 0),     // 0x30: jalr ra, 0(t3)
+            jtype(0, 0),                  // 0x34: j .
+            jtype(0, 0),                  // 0x38: j . (not reached)
+            jtype(0, 0),                  // 0x3C: j . (not reached)
+            itype(0x13, 0, 10, 10, 1),    // 0x40: f1: addi a0, a0, 1
+            itype(0x67, 0, 0, 1, 0),      // 0x44: ret
+            itype(0x13, 0, 10, 10, 2),    // 0x48: f2: addi a0, a0, 2
+            itype(0x67, 0, 0, 1, 0),      // 0x4C: ret
+            itype(0x13, 0, 10, 10, 100),  // 0x50: f3: addi a0, a0, 100
+            itype(0x67, 0, 0, 1, 0),      // 0x54: ret
         ]),
         [0; 64],
     ));

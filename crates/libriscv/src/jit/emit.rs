@@ -85,7 +85,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variab
 use libriscv_jit_rt::{CodeMemory, JitState, MemoryLayout};
 
 use crate::codegen::calls::{
-    DEPTH, DONE, RegSet, Summary, direct_jalr_target, is_return, region_regs, summaries,
+    self, DEPTH, DONE, RegSet, Summary, direct_jalr_target, is_return, region_regs, summaries,
 };
 use crate::codegen::classify::{AluI, AluR, Cond, FBin, FCmp, FFma, FInt, JOp, Unary, operands};
 use crate::codegen::region::{Analysis, Insn, RegionId, block_icount};
@@ -1863,22 +1863,12 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
     /// a constant `jalr` with a link register, to a region, returning to
     /// a label of this region. `(target, callee region)`.
     fn native_call(&self, i: usize) -> Option<(u64, RegionId)> {
-        let ins = self.a.insns.get(i)?;
-        let target = match ins.op {
-            JOp::Jal { rd, target } if rd & 31 != 0 => target,
-            JOp::Jalr { rd, .. } if rd & 31 != 0 => direct_jalr_target(self.exec, self.a, i)?,
-            _ => return None,
-        };
-        let next = ins.pc.wrapping_add(ins.len);
-        if !self.returns_here(next) {
-            return None;
-        }
-        Some((target, self.a.region_at(self.exec, target)?))
+        calls::native_call(self.exec, self.a, self.region, i)
     }
 
     /// A call returning to `next` can be native: `next` is a label here.
     fn returns_here(&self, next: u64) -> bool {
-        self.a.region_at(self.exec, next) == Some(self.region) && self.labels.contains_key(&next)
+        calls::returns_to(self.exec, self.a, self.region, next)
     }
 
     /// `depth < DEPTH`: another native call fits.

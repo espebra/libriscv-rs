@@ -7,7 +7,8 @@
 //! Each segment becomes a module, each region a function
 //!
 //! ```text
-//! extern "rust-preserve-none" fn r<N>(s: &mut S<'_>, pc: u64, c: u64, d: u32) -> (u64, u64)
+//! extern "rust-preserve-none" fn r<N>(s: &mut S, xs: &mut [u64; 32], fr: &mut [u64; 32], m: &mut [u8; N],
+//!     pc: u64, c: u64, d: u32) -> (u64, u64)
 //! ```
 //!
 //! that keeps the guest registers it uses in locals (C++ `use_register_caching`),
@@ -37,7 +38,8 @@ use std::fmt::Write as _;
 
 use super::structure::{MAX_GROWTH, dispatch, structure};
 use crate::codegen::calls::{
-    DEPTH, DONE, RegSet, Summary, direct_jalr_target, is_return, region_regs, summaries,
+    DEPTH, DONE, RegSet, Summary, direct_jalr_target, is_return, native_call, region_regs,
+    returns_to, summaries,
 };
 use crate::codegen::classify::{AluI, AluR, Cond, FBin, FCmp, FFma, FInt, JOp, Unary, operands};
 use crate::codegen::region::{Analysis, Insn, RegionId, block_icount};
@@ -58,6 +60,128 @@ const CHUNK: usize = 40;
 /// How much a region's structured code may grow with all its entries as
 /// roots, before its weak entries are dropped (see `RegionWriter::write`).
 const ALL_ENTRIES_GROWTH: usize = 2;
+
+/// An inlined region's size, with what is inlined into it, is at most
+/// this many instructions (see [`inlined`]);
+const INLINE_MAX: usize = 256;
+/// and that times its native call sites at most this, or the size at most
+/// [`INLINE_ALWAYS`].
+const INLINE_BUDGET: usize = 1024;
+const INLINE_ALWAYS: usize = 16;
+
+/// Which regions are inlined into their native callers
+/// (`#[inline(always)]`). A native call costs about as much as a small
+/// callee's body: the stores of the registers it may read and the reloads
+/// of those it may write, the callee's loads and stores of its own, and
+/// the caller's spills around the call (`rust-preserve-none` keeps nothing
+/// in registers across it). Inlined, with the call's constant entry, LLVM
+/// folds the callee's entry dispatch, and the registers are plain values
+/// again (given the `noalias` register files, see `F`): with
+/// [`address_taken`], CoreMark went from 597k host instructions and 168k
+/// cycles per iteration to 457k and 135k, native code's speed.
+///
+/// A region is inlined only if it never tail-calls (see
+/// [`self_contained`]): LLVM turns a `become` in an inlined body into a
+/// plain call, which would let guest code grow the host stack without
+/// bound. Its native calls past `DEPTH` leave for the host instead of
+/// tail-calling. Inlined callees count towards their callers' size, so
+/// copies don't multiply; a cycle of calls is not inlined.
+fn inlined(exec: &DecodedSegment, a: &Analysis, devirt: &[(u64, RegionId)]) -> Option<Vec<bool>> {
+    let n = a.regions.len();
+    // Each region's native callees (with repeats), and its call sites.
+    let mut callees: Vec<Vec<RegionId>> = vec![Vec::new(); n];
+    let mut sites = vec![0usize; n];
+    for (r, region) in a.regions.iter().enumerate() {
+        let out = callees.get_mut(r)?;
+        for &i in &region.insns {
+            if let Some((_, callee)) = native_call(exec, a, r, i) {
+                out.push(callee);
+            } else if indirect_call(exec, a, r, i) {
+                out.extend(devirt.iter().map(|&(_, callee)| callee));
+            }
+        }
+        for &c in out.iter() {
+            *sites.get_mut(c)? = sites.get(c)?.saturating_add(1);
+        }
+    }
+    // Sizes with the inlined callees, in post-order (iteratively: guest
+    // call chains may be long); a callee still on the stack is a cycle,
+    // which isn't inlined.
+    #[derive(Clone, Copy, PartialEq)]
+    enum State {
+        New,
+        Open,
+        Done,
+    }
+    let mut state = vec![State::New; n];
+    let mut size = vec![0usize; n];
+    let mut inline = vec![false; n];
+    for root in 0..n {
+        if *state.get(root)? != State::New {
+            continue;
+        }
+        let mut stack = vec![(root, 0usize)];
+        *state.get_mut(root)? = State::Open;
+        while let Some(&mut (r, ref mut next)) = stack.last_mut() {
+            let list = callees.get(r)?;
+            if let Some(&c) = list.get(*next) {
+                *next += 1;
+                if *state.get(c)? == State::New {
+                    *state.get_mut(c)? = State::Open;
+                    stack.push((c, 0));
+                }
+                continue;
+            }
+            stack.pop();
+            let mut total = a.regions.get(r)?.insns.len();
+            for &c in list {
+                if *state.get(c)? == State::Done && *inline.get(c)? {
+                    total = total.saturating_add(*size.get(c)?);
+                }
+            }
+            let k = *sites.get(r)?;
+            *size.get_mut(r)? = total;
+            *inline.get_mut(r)? = k > 0
+                && total <= INLINE_MAX
+                && (total <= INLINE_ALWAYS || total.saturating_mul(k) <= INLINE_BUDGET)
+                && self_contained(exec, a, r)?
+                // Calling a region still being visited: `r` is part of a
+                // cycle, and stays out of line.
+                && !list.iter().any(|&c| *state.get(c).unwrap_or(&State::Done) == State::Open);
+            *state.get_mut(r)? = State::Done;
+        }
+    }
+    Some(inline)
+}
+
+/// Region `r` leaves only by guest returns, native calls and exits to the
+/// host: no transfer to another region (`A::G`) and no indirect jump or
+/// call (`A::I`), so its function has no `become` but the one for an
+/// unknown entry, which a native call's constant entry folds away. (What
+/// `RegionWriter` emits for each instruction, with native calls past
+/// `DEPTH` leaving for the host.)
+fn self_contained(exec: &DecodedSegment, a: &Analysis, r: RegionId) -> Option<bool> {
+    // A transfer to `pc` stays in the region, or leaves for the host.
+    let stays = |pc: u64| a.region_at(exec, pc).is_none_or(|t| t == r);
+    for &i in &a.regions.get(r)?.insns {
+        let ins = a.insns.get(i)?;
+        let next = ins.pc.wrapping_add(ins.len);
+        let ok = match ins.op {
+            JOp::Branch { target, .. } => stays(target) && stays(next),
+            JOp::Jal { target, .. } => native_call(exec, a, r, i).is_some() || stays(target),
+            JOp::Jalr { .. } => match direct_jalr_target(exec, a, i) {
+                Some(t) => native_call(exec, a, r, i).is_some() || stays(t),
+                None => is_return(ins.op),
+            },
+            JOp::Dyncall => true,
+            _ => stays(next),
+        };
+        if !ok {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
 
 /// One translated segment: its module's source, and what the host needs to
 /// enter it.
@@ -261,6 +385,52 @@ pub(crate) const RUNTIME: &str = r#"
     }
 "#;
 
+/// The most address-taken functions an indirect call tests for (see
+/// [`address_taken`]).
+const MAX_DEVIRT: usize = 4;
+
+/// The functions the code takes the address of: `auipc`, `lui` or `li`
+/// followed by an `addi` of the same register (`la`, `lla`, a `lui` pair),
+/// giving a label of a region. (Not an `auipc` alone: a call's `auipc ra`
+/// right after another call is the label of that call's return.) If
+/// there are at most [`MAX_DEVIRT`], an indirect call compares its target
+/// with each and makes a direct native call on a match (devirtualization:
+/// with the callee's own [`Summary`] instead of every register, and
+/// inlined if it qualifies, see [`inlined`]); anything else is the generic indirect
+/// call. CoreMark's list sort calls its comparator (one of two) this way.
+/// `(target, region)`, ascending.
+fn address_taken(exec: &DecodedSegment, a: &Analysis) -> Vec<(u64, RegionId)> {
+    let mut out = Vec::new();
+    let mut prev: Option<&Insn> = None;
+    for ins in &a.insns {
+        let value = match (prev.map(|p| (p.op, p.pc.wrapping_add(p.len))), ins.op) {
+            (
+                Some((JOp::Const { rd, value }, end)),
+                JOp::AluImm {
+                    op: AluI::Add,
+                    rd: d,
+                    rs1,
+                    imm,
+                },
+            ) if end == ins.pc && rd == rs1 && rd == d => Some(value.wrapping_add(imm as u64)),
+            _ => None,
+        };
+        prev = Some(ins);
+        if let Some(v) = value
+            && let Some(r) = a.region_at(exec, v)
+            && a.regions.get(r).is_some_and(|reg| reg.entries.contains(&v))
+        {
+            out.push((v, r));
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    if out.len() > MAX_DEVIRT {
+        out.clear();
+    }
+    out
+}
+
 /// Translate the regions of `a` into the source of `exec`'s module, for
 /// guest memory `layout`. `None` if there is nothing to translate.
 pub(crate) fn translate(
@@ -274,6 +444,8 @@ pub(crate) fn translate(
     let cache_len = exec.cache.len();
     // The regions first: each decides which of its entries it keeps.
     let summaries = summaries(exec, a)?;
+    let devirt = address_taken(exec, a);
+    let inline = inlined(exec, a, &devirt)?;
     let mut regions = String::new();
     let mut entries: Vec<(u32, RegionId)> = Vec::new();
     for r in 0..a.regions.len() {
@@ -289,7 +461,9 @@ pub(crate) fn translate(
                 "        use c{k}::*;\n        mod c{k} {{ use super::*;"
             );
         }
-        for pc in RegionWriter::write(exec, a, r, layout, &summaries, &mut regions)? {
+        let w = (layout, summaries.as_slice(), devirt.as_slice());
+        let inline = inline.get(r).copied().unwrap_or(false);
+        for pc in RegionWriter::write(exec, a, r, w, inline, &mut regions)? {
             let i = exec.index(pc);
             if i < cache_len {
                 entries.push((u32::try_from(i).ok()?, r));
@@ -395,19 +569,21 @@ pub(crate) fn translate(
     }
     let _ = writeln!(
         o,
-        r#"        pub(super) struct S<'a> {{
-            x: &'a mut [u64; 32],
-            f: &'a mut [u64; 32],
-            m: &'a mut [u8; N],
+        r#"        pub(super) struct S {{
             max: u64,
             frm: u64,
             t: &'static [Option<F>],
             out: [u64; 3],
         }}
-        /// A region function: `(state, pc, counter, depth)` to `(target,
-        /// counter)`, where `target` is where a guest return went, or
-        /// `DONE`, and `depth` the native calls in progress (see `DEPTH`).
-        type F = for<'a, 'b> extern "rust-preserve-none" fn(&'a mut S<'b>, u64, u64, u32) -> (u64, u64);
+        /// A region function: `(state, registers, FP registers, arena, pc,
+        /// counter, depth)` to `(target, counter)`, where `target` is where
+        /// a guest return went, or `DONE`, and `depth` the native calls in
+        /// progress (see `DEPTH`). The register files and the arena are
+        /// parameters of their own, not fields of `S`: as `&mut` parameters
+        /// they are `noalias`, so LLVM knows that a guest store leaves the
+        /// registers alone, which lets it forward an inlined callee's
+        /// register loads from the caller's stores (see `inlined`).
+        type F = extern "rust-preserve-none" fn(&mut S, &mut [u64; 32], &mut [u64; 32], &mut [u8; N], u64, u64, u32) -> (u64, u64);
         static TABLE: std::sync::OnceLock<Box<[Option<F>]>> = std::sync::OnceLock::new();
         /// The entry table, by decoder index, for indirect jumps.
         fn table() -> Box<[Option<F>]> {{
@@ -425,12 +601,12 @@ pub(crate) fn translate(
             let t: &'static [Option<F>] = TABLE.get_or_init(table);
             let Some(&Some(func)) = t.get(index) else {{ return false }};
             let [pc, counter, max, frm] = *io;
-            let mut s = S {{ x, f, m, max, frm, t, out: [u64::MAX, pc, counter] }};
+            let mut s = S {{ max, frm, t, out: [u64::MAX, pc, counter] }};
             let (mut func, mut pc, mut c) = (func, pc, counter);
             // A guest return that no native caller took: continue at its
             // target through the entry table, as an indirect jump would.
             loop {{
-                let (target, counter) = func(&mut s, pc, c, 0);
+                let (target, counter) = func(&mut s, x, f, m, pc, c, 0);
                 if target == DONE {{
                     break;
                 }}
@@ -515,6 +691,21 @@ struct RegionWriter<'a> {
     written: u64,
     /// Index in `a.insns` of the instruction being written.
     index: usize,
+    /// The region is inlined into its native callers (see [`inlined`]):
+    /// its native calls past `DEPTH` leave for the host.
+    inline: bool,
+    /// The targets an indirect call tests for (see [`address_taken`]).
+    devirt: &'a [(u64, RegionId)],
+}
+
+/// The `jalr` at `a.insns[i]` in `region` is an indirect call made
+/// natively: a link register, no constant target, returning to a label.
+fn indirect_call(exec: &DecodedSegment, a: &Analysis, region: RegionId, i: usize) -> bool {
+    a.insns.get(i).is_some_and(|ins| {
+        matches!(ins.op, JOp::Jalr { rd, .. } if rd & 31 != 0)
+            && direct_jalr_target(exec, a, i).is_none()
+            && returns_to(exec, a, region, ins.pc.wrapping_add(ins.len))
+    })
 }
 
 /// Offsets `lo..=hi` of guest memory accesses through one base register.
@@ -555,8 +746,8 @@ impl<'a> RegionWriter<'a> {
         exec: &'a DecodedSegment,
         a: &'a Analysis,
         region: RegionId,
-        layout: MemoryLayout,
-        summaries: &'a [Summary],
+        (layout, summaries, devirt): (MemoryLayout, &'a [Summary], &'a [(u64, RegionId)]),
+        inline: bool,
         o: &mut String,
     ) -> Option<Vec<u64>> {
         let r = a.regions.get(region)?;
@@ -584,6 +775,8 @@ impl<'a> RegionWriter<'a> {
             used: used_set,
             written: written_set,
             index: 0,
+            inline,
+            devirt,
         };
         // Region checks need base registers that keep their entry value:
         // not written here, nor by a native call's callee.
@@ -626,26 +819,29 @@ impl<'a> RegionWriter<'a> {
                 (dispatch(&w.arms, &all), pcs)
             });
 
+        // `self_contained` and `call` saw to it that the only `become` is
+        // for an unknown entry (checked anyway: a tail call would stay out
+        // of line).
+        if inline && w.calls.is_empty() {
+            o.push_str("        #[inline(always)]\n");
+        }
         let _ = writeln!(
             o,
-            "        pub(super) extern \"rust-preserve-none\" fn r{region}(s: &mut S<'_>, pc: u64, c: u64, d: u32) -> (u64, u64) {{"
+            "        pub(super) extern \"rust-preserve-none\" fn r{region}(s: &mut S, xs: &mut [u64; 32], fr: &mut [u64; 32], m: &mut [u8; N], pc: u64, c: u64, d: u32) -> (u64, u64) {{"
         );
         for n in 1..32 {
             if used.get(n).copied().unwrap_or(false) {
-                let _ = writeln!(o, "            let mut x{n} = s.x[{n}];");
+                let _ = writeln!(o, "            let mut x{n} = xs[{n}];");
             }
         }
         for n in 0..32 {
             if fused.get(n).copied().unwrap_or(false) {
-                let _ = writeln!(o, "            let mut f{n} = s.f[{n}];");
+                let _ = writeln!(o, "            let mut f{n} = fr[{n}];");
             }
         }
-        // The arena, the limit and the rounding mode in locals: read
-        // through `s`, they would be reloaded after every guest store
-        // (`s` escapes into the tail calls, so LLVM can't tell that the
-        // arena doesn't overlap it).
-        // (Taken again after native calls, which need all of `s`.)
-        let _ = writeln!(o, "            let mut m = &mut *s.m;");
+        // The limit and the rounding mode in locals: read through `s`, they
+        // were reloaded after every guest store (when the arena was a field
+        // of `S` too).
         let _ = writeln!(o, "            let (max, frm) = (s.max, s.frm);");
         for line in &w.region_lines {
             let _ = writeln!(o, "            {line}");
@@ -655,8 +851,6 @@ impl<'a> RegionWriter<'a> {
         let _ = writeln!(o, "                let mut pc = pc;");
         o.push_str(&control);
         let _ = writeln!(o, "            }};");
-        // Through one borrow of each file (see `native_call_body`).
-        let _ = writeln!(o, "            {{ let xs = &mut *s.x; let fs = &mut *s.f;");
         for n in 1..32 {
             if written.get(n).copied().unwrap_or(false) {
                 let _ = writeln!(o, "            xs[{n}] = x{n};");
@@ -664,10 +858,9 @@ impl<'a> RegionWriter<'a> {
         }
         for n in 0..32 {
             if fwritten.get(n).copied().unwrap_or(false) {
-                let _ = writeln!(o, "            fs[{n}] = f{n};");
+                let _ = writeln!(o, "            fr[{n}] = f{n};");
             }
         }
-        let _ = writeln!(o, "            }}");
         let _ = writeln!(o, "            match a {{");
         let _ = writeln!(
             o,
@@ -677,7 +870,7 @@ impl<'a> RegionWriter<'a> {
         for &callee in &w.calls {
             let _ = writeln!(
                 o,
-                "                    {callee} => become r{callee}(s, p, c, d),"
+                "                    {callee} => become r{callee}(s, xs, fr, m, p, c, d),"
             );
         }
         let _ = writeln!(
@@ -690,7 +883,7 @@ impl<'a> RegionWriter<'a> {
             "                A::I(t) => {{
                     let i = ((t >> {SHIFT}).wrapping_sub(BEGIN >> {SHIFT})) as usize;
                     if let Some(f) = s.t.get(i).copied().flatten() {{
-                        become f(s, t, c, d)
+                        become f(s, xs, fr, m, t, c, d)
                     }}
                     s.out = [{EXIT_INDIRECT}, t, c];
                     (DONE, c)
@@ -813,22 +1006,12 @@ impl<'a> RegionWriter<'a> {
     /// a constant `jalr` with a link register, to a region, returning to
     /// a label of this region. `(target, callee region)`.
     fn native_call(&self, i: usize) -> Option<(u64, RegionId)> {
-        let ins = self.a.insns.get(i)?;
-        let target = match ins.op {
-            JOp::Jal { rd, target } if rd & 31 != 0 => target,
-            JOp::Jalr { rd, .. } if rd & 31 != 0 => direct_jalr_target(self.exec, self.a, i)?,
-            _ => return None,
-        };
-        let next = ins.pc.wrapping_add(ins.len);
-        if !self.returns_here(next) {
-            return None;
-        }
-        Some((target, self.a.region_at(self.exec, target)?))
+        native_call(self.exec, self.a, self.region, i)
     }
 
     /// A call returning to `next` can be native: `next` is a label here.
     fn returns_here(&self, next: u64) -> bool {
-        self.a.region_at(self.exec, next) == Some(self.region) && self.labels.contains(&next)
+        returns_to(self.exec, self.a, self.region, next)
     }
 
     /// A native call to `callee` at `target`, returning to `next` (C++
@@ -851,7 +1034,13 @@ impl<'a> RegionWriter<'a> {
             next,
         );
         self.line("} else {");
-        self.enter_block(target);
+        if self.inline {
+            // No `become` in an inlined region (see `inlined`): the host
+            // continues at the target, and enters native code again.
+            self.leave(EXIT_JUMP, target);
+        } else {
+            self.enter_block(target);
+        }
         self.line("}");
         self.enter_block(next);
     }
@@ -868,26 +1057,31 @@ impl<'a> RegionWriter<'a> {
         next: u64,
     ) {
         let (store, load) = (self.written & reads, self.used & writes);
-        // Through one borrow of each file: through `s`, LLVM reloads the
-        // file's address after every store.
-        let regs = |set: RegSet, f: &dyn Fn(char, u64) -> String| {
-            let mut out = String::from("{ let xs = &mut *s.x; let fs = &mut *s.f;");
+        // `f(local prefix, file, number)` for each register in `set`.
+        let regs = |set: RegSet, f: &dyn Fn(char, &str, u64) -> String| {
+            let mut out = String::new();
             for n in 1..64u64 {
                 if set >> n & 1 != 0 {
-                    out.push(' ');
-                    out.push_str(&if n < 32 { f('x', n) } else { f('f', n - 32) });
+                    if !out.is_empty() {
+                        out.push(' ');
+                    }
+                    out.push_str(&if n < 32 {
+                        f('x', "xs", n)
+                    } else {
+                        f('f', "fr", n - 32)
+                    });
                 }
             }
-            out.push_str(" }");
             out
         };
         if store & !1 != 0 {
-            self.line(&regs(store, &|k, n| format!("{k}s[{n}] = {k}{n};")));
+            self.line(&regs(store, &|k, file, n| format!("{file}[{n}] = {k}{n};")));
         }
-        self.line(&format!("let (ct, cc) = {func}(s, {target}, c, d + 1);"));
-        self.line("m = &mut *s.m; c = cc;");
+        self.line(&format!(
+            "let (ct, cc) = {func}(s, xs, fr, m, {target}, c, d + 1); c = cc;"
+        ));
         if load & !1 != 0 {
-            self.line(&regs(load, &|k, n| format!("{k}{n} = {k}s[{n}];")));
+            self.line(&regs(load, &|k, file, n| format!("{k}{n} = {file}[{n}];")));
         }
         self.line(&format!(
             "if ct != {next:#x} {{ if ct == DONE {{ break 'x A::D; }} break 'x A::R(ct); }}"
@@ -1315,7 +1509,16 @@ impl<'a> RegionWriter<'a> {
                     // To the native caller, which continues if `t` is its
                     // return address (or `enter`, through the table).
                     self.line("break 'x A::R(t);");
-                } else if rd & 31 != 0 && self.returns_here(next) {
+                    return Some(false);
+                }
+                if rd & 31 != 0 && self.returns_here(next) {
+                    // Devirtualized: a direct native call to each
+                    // address-taken function, when it is the target.
+                    for &(v, callee) in self.devirt {
+                        self.line(&format!("if t == {v:#x} {{"));
+                        self.call(callee, v, next);
+                        self.line("}");
+                    }
                     // An indirect call: a native call through the table.
                     self.line(&format!(
                         "if d < DEPTH && let Some(cf) = s.t.get(((t >> {SHIFT}).wrapping_sub(BEGIN >> {SHIFT})) as usize).copied().flatten() {{"
