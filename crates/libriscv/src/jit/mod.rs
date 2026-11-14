@@ -486,6 +486,42 @@ pub(crate) mod tests {
     /// enter native code: resuming after a halt at the back-edge, and after
     /// a background compilation arrives mid-loop (the slice ends at the
     /// back-edge). Otherwise the interpreter runs the rest of the loop.
+    /// Large segments are compiled on several threads; the image must be
+    /// the one a single thread compiles.
+    #[test]
+    fn compiling_on_several_threads_gives_the_same_image() {
+        // Many regions: compiled ADDIs separated by system calls (which
+        // aren't compiled), with forward branches between them.
+        let mut words = Vec::new();
+        for k in 0..400u32 {
+            words.push(0x0015_0513 | ((k % 7) << 20)); // addi a0, a0, 1 + k % 7
+            words.push(0x0000_0463); // beqz zero, +8
+            words.push(0x0000_0013); // nop
+            words.push(0x0000_0073); // ecall
+        }
+        words.push(JSELF);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut m = Machine::new(
+            &[],
+            MachineOptions {
+                memory_max: 1 << 20,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        m.init_execute_area(&code, V).unwrap();
+        let exec = m.cpu.current_execute_segment();
+        let a = crate::codegen::region::analyse(exec);
+        assert!(a.regions.len() >= 400, "{} regions", a.regions.len());
+        let layout = m.memory.native_layout();
+        let one = super::emit::compile_on(exec, &a, layout, 1);
+        assert_eq!(one.is_some(), cfg!(target_arch = "x86_64"));
+        for threads in [2, 8, 64] {
+            let many = super::emit::compile_on(exec, &a, layout, threads);
+            assert_eq!(format!("{one:?}"), format!("{many:?}"), "{threads} threads");
+        }
+    }
+
     #[test]
     fn resuming_at_a_loop_head_inside_a_block_enters_native_code() {
         let head = V + 8;
