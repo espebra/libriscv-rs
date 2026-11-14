@@ -160,7 +160,7 @@ How the C++ version maps over:
 
 | C++ (`tailcall_dispatch.cpp`) | Rust |
 |---|---|
-| `INSTRUCTION(bc, name)`: `static TcoRet<W> name(DecoderData<W>* d, DecodedExecuteSegment<W>* exec, CPU<W>& cpu, addr_t pc, InstrCounter& counter)` | `extern "rust-preserve-none" fn name(exec: &DecodedSegment, i: usize, m: &mut Machine, pc: u64, counter: Counter, ins: u32) -> Exit` with one signature for all handlers |
+| `INSTRUCTION(bc, name)`: `static TcoRet<W> name(DecoderData<W>* d, DecodedExecuteSegment<W>* exec, CPU<W>& cpu, addr_t pc, InstrCounter& counter)` | `extern "rust-preserve-none" fn name(exec: &DecodedSegment, cache: &[DecoderEntry], i: usize, m: &mut Machine, counter: Counter, ins: u32, pc: u64) -> Exit` with one signature for all handlers. The order puts `ins` in rcx, where variable shifts want their count (cl) |
 | `MUSTTAIL return computed_opcode<W>[bc](...)` | `become (entry.handler)(..., entry.instr)`. Store the handler `fn` in the decoder entry itself, so there's no second table lookup |
 | `VIEW_INSTR_AS(fi, FasterItype)` reading `d->instr` | The caller passes the entry's (re-encoded) bits as `ins`, so a handler never looks up its own entry |
 | `d += 1` pointer bump | index `i + 1`; read with `exec.cache.get(i)`. That's one bounds check per instruction (a compare and a predicted branch), the price of safe Rust |
@@ -172,9 +172,8 @@ How the C++ version maps over:
 
 Ownership: the decoded segment sits behind an `Arc` (C++ already shares
 segments via `shared_ptr`). The dispatcher clones it out, so `&exec` and
-`&mut machine` are disjoint borrows. The handler signature is
-`fn(&DecodedSegment, usize, &mut Machine, u64, Counter) -> Exit`, where
-`Counter` is the value/limit pair passed in two registers.
+`&mut machine` are disjoint borrows. `Counter` is the value/limit pair
+passed in two registers.
 
 **Semantics follow `cpu_dispatch.cpp`.** The C++ tail-call dispatcher differs
 observably from its threaded/switch dispatcher (`cpu_dispatch.cpp`), and the

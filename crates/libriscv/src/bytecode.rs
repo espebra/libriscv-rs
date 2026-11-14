@@ -183,9 +183,9 @@ macro_rules! sequential {
             cache: &[DecoderEntry],
             i: usize,
             $m: &mut Machine,
-            pc: u64,
             c: Counter,
             $ins: u32,
+            pc: u64,
         ) -> Exit {
             $body
             execute!(exec, cache, i + $step, $m, pc, c)
@@ -349,9 +349,9 @@ pub(crate) extern "rust-preserve-none" fn op<O: RtypeAlu>(
     cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
-    pc: u64,
     c: Counter,
     ins: u32,
+    pc: u64,
 ) -> Exit {
     let fi = FasterOpType(ins);
     let v = O::compute(reg(m, fi.rs1()), reg(m, fi.rs2()));
@@ -367,9 +367,9 @@ pub(crate) extern "rust-preserve-none" fn c_op<O: RtypeAlu>(
     cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
-    pc: u64,
     c: Counter,
     ins: u32,
+    pc: u64,
 ) -> Exit {
     let fi = FasterItype(ins);
     let v = O::compute(reg(m, fi.rs1()), reg(m, fi.rs2()));
@@ -397,9 +397,9 @@ pub(crate) extern "rust-preserve-none" fn auipc(
     cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
-    pc: u64,
     c: Counter,
     ins: u32,
+    pc: u64,
 ) -> Exit {
     let fi = FasterJtype(ins);
     let block_bytes = entry!(exec, cache, i, m, pc, c).block_bytes();
@@ -423,14 +423,14 @@ macro_rules! loads {
             cache: &[DecoderEntry],
             i: usize,
             $m: &mut Machine,
-            pc: u64,
             c: Counter,
             ins: u32,
+            pc: u64,
         ) -> Exit {
             let fi = FasterItype(ins);
             let addr = reg($m, fi.rs2()).wrapping_add(fi.signed_imm() as u64);
             let Some($b) = $m.memory.arena_read::<$n>(addr) else {
-                become $slow(exec, cache, i, $m, pc, c, ins)
+                become $slow(exec, cache, i, $m, c, ins, pc)
             };
             let $rd = fi.rs1();
             $set;
@@ -444,9 +444,9 @@ macro_rules! loads {
             cache: &[DecoderEntry],
             i: usize,
             $m: &mut Machine,
-            pc: u64,
             c: Counter,
             ins: u32,
+            pc: u64,
         ) -> Exit {
             let fi = FasterItype(ins);
             let addr = reg($m, fi.rs2()).wrapping_add(fi.signed_imm() as u64);
@@ -501,16 +501,16 @@ macro_rules! stores {
             cache: &[DecoderEntry],
             i: usize,
             $m: &mut Machine,
-            pc: u64,
             c: Counter,
             ins: u32,
+            pc: u64,
         ) -> Exit {
             let fi = FasterItype(ins);
             let addr = reg($m, fi.rs1()).wrapping_add(fi.signed_imm() as u64);
             let $rs2 = fi.rs2();
             let value = $value;
             if !$m.memory.arena_write(addr, value) {
-                become $slow(exec, cache, i, $m, pc, c, ins)
+                become $slow(exec, cache, i, $m, c, ins, pc)
             }
             execute!(exec, cache, i + $step, $m, pc, c)
         }
@@ -522,9 +522,9 @@ macro_rules! stores {
             cache: &[DecoderEntry],
             i: usize,
             $m: &mut Machine,
-            pc: u64,
             c: Counter,
             ins: u32,
+            pc: u64,
         ) -> Exit {
             let fi = FasterItype(ins);
             let addr = reg($m, fi.rs1()).wrapping_add(fi.signed_imm() as u64);
@@ -572,9 +572,9 @@ macro_rules! fp_arith {
             cache: &[DecoderEntry],
             i: usize,
             m: &mut Machine,
-            pc: u64,
             c: Counter,
             ins: u32,
+            pc: u64,
         ) -> Exit {
             use crate::isa::rvfd::{CANONICAL_NAN_F32, NANBOXING, load_u32};
             let fi = FasterFloatType(ins);
@@ -621,9 +621,9 @@ macro_rules! branches {
             cache: &[DecoderEntry],
             i: usize,
             m: &mut Machine,
-            pc: u64,
             c: Counter,
             ins: u32,
+            pc: u64,
         ) -> Exit {
             let fi = FasterItype(ins);
             let $a = reg(m, fi.rs1());
@@ -662,9 +662,9 @@ pub(crate) extern "rust-preserve-none" fn c_beqz(
     cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
-    pc: u64,
     c: Counter,
     ins: u32,
+    pc: u64,
 ) -> Exit {
     let fi = FasterItype(ins);
     if reg(m, fi.rs1()) == 0 {
@@ -679,9 +679,9 @@ pub(crate) extern "rust-preserve-none" fn c_bnez(
     cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
-    pc: u64,
     c: Counter,
     ins: u32,
+    pc: u64,
 ) -> Exit {
     let fi = FasterItype(ins);
     if reg(m, fi.rs1()) != 0 {
@@ -696,9 +696,9 @@ pub(crate) extern "rust-preserve-none" fn c_jmp(
     cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
-    pc: u64,
     c: Counter,
     ins: u32,
+    pc: u64,
 ) -> Exit {
     next_block!(exec, cache, i, m, pc, c, i64::from(ins as i32), true)
 }
@@ -709,9 +709,9 @@ pub(crate) extern "rust-preserve-none" fn c_jr(
     cache: &[DecoderEntry],
     _i: usize,
     m: &mut Machine,
-    _pc: u64,
     c: Counter,
     ins: u32,
+    _pc: u64,
 ) -> Exit {
     let target = reg(m, ins) & !1;
     overflow_checked_jump!(exec, cache, m, target, c)
@@ -723,9 +723,9 @@ pub(crate) extern "rust-preserve-none" fn c_jalr(
     cache: &[DecoderEntry],
     _i: usize,
     m: &mut Machine,
-    pc: u64,
     c: Counter,
     ins: u32,
+    pc: u64,
 ) -> Exit {
     let target = reg(m, ins);
     set(m, REG_RA, pc.wrapping_add(2));
@@ -738,9 +738,9 @@ pub(crate) extern "rust-preserve-none" fn jal(
     cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
-    pc: u64,
     c: Counter,
     ins: u32,
+    pc: u64,
 ) -> Exit {
     let fi = FasterJtype(ins);
     set(m, fi.rd(), pc.wrapping_add(4));
@@ -753,9 +753,9 @@ pub(crate) extern "rust-preserve-none" fn fast_jal(
     cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
-    pc: u64,
     c: Counter,
     ins: u32,
+    pc: u64,
 ) -> Exit {
     next_block!(exec, cache, i, m, pc, c, i64::from(ins as i32), true)
 }
@@ -766,9 +766,9 @@ pub(crate) extern "rust-preserve-none" fn fast_call(
     cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
-    pc: u64,
     c: Counter,
     ins: u32,
+    pc: u64,
 ) -> Exit {
     set(m, REG_RA, pc.wrapping_add(4));
     next_block!(exec, cache, i, m, pc, c, i64::from(ins as i32), true)
@@ -780,9 +780,9 @@ pub(crate) extern "rust-preserve-none" fn jalr(
     cache: &[DecoderEntry],
     _i: usize,
     m: &mut Machine,
-    pc: u64,
     c: Counter,
     ins: u32,
+    pc: u64,
 ) -> Exit {
     let fi = FasterItype(ins);
     // If rs1 == rd, avoid the clobber by computing the address first.
