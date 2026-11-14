@@ -480,12 +480,6 @@ pub(crate) mod tests {
         assert_eq!(got, expected);
     }
 
-    /// A loop head inside a decoder block (straight-line code runs into
-    /// it) is a native entry, but its decoder entry isn't patched, since the
-    /// interpreter falls through it. A block beginning there must still
-    /// enter native code: resuming after a halt at the back-edge, and after
-    /// a background compilation arrives mid-loop (the slice ends at the
-    /// back-edge). Otherwise the interpreter runs the rest of the loop.
     /// Large segments are compiled on several threads; the image must be
     /// the one a single thread compiles.
     #[test]
@@ -522,6 +516,12 @@ pub(crate) mod tests {
         }
     }
 
+    /// A loop head inside a decoder block (straight-line code runs into
+    /// it) is a native entry, but its decoder entry isn't patched, since the
+    /// interpreter falls through it. A block beginning there must still
+    /// enter native code: resuming after a halt at the back-edge, and after
+    /// a background compilation arrives mid-loop (the slice ends at the
+    /// back-edge). Otherwise the interpreter runs the rest of the loop.
     #[test]
     fn resuming_at_a_loop_head_inside_a_block_enters_native_code() {
         let head = V + 8;
