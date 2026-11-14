@@ -16,21 +16,21 @@ plan and the C++ → Rust file mapping live there.
 ## Commands
 
 ```sh
-cargo test                                   # all tests (tool-dependent tests skip if tools missing)
+cargo test                                   # all tests, JIT included (tool-dependent tests skip if tools missing)
 LIBRISCV_REQUIRE_TOOLCHAIN=1 cargo test      # same, but fail instead of skipping
 cargo test -- --ignored                      # include not-yet-enabled difftests
-cargo clippy --all-targets -- -D warnings    # must be clean (also with --features libriscv/jit,rvlinux/jit)
-cargo test --workspace --features libriscv/jit,rvlinux/jit   # + Cranelift JIT, difftests also run --jit
-cargo test --workspace --features libriscv/jit,rvlinux/jit,libriscv/aot-dylib,rvlinux/aot-dylib  # + AOT (needs rustc)
+cargo clippy --all-targets -- -D warnings    # must be clean (also with --no-default-features)
+cargo test --workspace --no-default-features # interpreter only: no Cranelift, no unsafe in the build
+cargo test --workspace --features libriscv/aot-dylib,rvlinux/aot-dylib  # + AOT (needs rustc)
 rvlinux --jit-save-shared x.so prog.elf; rvlinux --jit-load x.so prog.elf   # JIT code cache (also --jit-save-object, RVLINUX_JIT_EMBED)
 rvlinux --aot-save-shared x.so prog.elf; rvlinux --aot-load x.so prog.elf   # AOT: translate to safe Rust (also --aot-save x.rs, RVLINUX_AOT_EMBED)
-rvlinux -j dynamic.elf                       # caches ld.so + system libraries in ~/.cache/rvlinux/jit by itself (--jit-cache-dir, --no-jit-cache)
+rvlinux dynamic.elf                          # JIT by default (-n interprets); caches ld.so + system libraries in ~/.cache/rvlinux/jit by itself (--jit-cache-dir, --no-jit-cache)
 ```
 
-Expected durations (warm build, 32 cores): the whole suite ~42 s with the JIT
-features (test binaries run one after another: `difftest.rs` ~18 s, bounded
+Expected durations (warm build, 32 cores): the whole suite ~42 s with the JIT,
+the default (test binaries run one after another: `difftest.rs` ~18 s, bounded
 by one up-front JIT compile of static libstdc++; `libriscv`'s tests ~21 s,
-`shared_rodata.rs`'s `jit_runs_on_shared_rodata` alone ~7 s), ~9 s without. Cranelift is always built optimized
+`shared_rodata.rs`'s `jit_runs_on_shared_rodata` alone ~7 s), ~9 s without (`--no-default-features`). Cranelift is always built optimized
 (`[profile.dev.package."*"]`); our crates stay at opt-level 0. A test that
 loops over many runs should be split into separate tests (see `difftests!`)
 so the harness runs them concurrently. Never `git stash` work to time HEAD.
@@ -39,7 +39,7 @@ so the harness runs them concurrently. Never `git stash` work to time HEAD.
 cargo fmt --all
 scripts/difftest.sh prog.elf [args...]       # diff one ELF against the C++ emulator
 scripts/build-cpp-reference.sh               # C++ threaded/tailcall/switch builds -> target/cpp-ref/
-cargo bench -p rvlinux --features jit --bench coremark   # CoreMark: Rust interpreter/JIT vs C++
+cargo bench -p rvlinux --bench coremark   # CoreMark: Rust interpreter/JIT vs C++
 fuzz/do_fuzz.sh vmfuzzer -- -max_total_time=300   # libFuzzer (vmfuzzer/elffuzzer/syshelperfuzzer); needs cargo-fuzz
 ```
 
@@ -54,7 +54,7 @@ Guests compile with `riscv64-linux-gnu-gcc-14` (`$RCC`); outputs are cached in
 - **No `unsafe`.** Enforced by `forbid(unsafe_code)`; never work around it
   (no `allow`, no unsafe-using helper crates added to dodge it). The one
   exception is `crates/libriscv-jit-rt`, the executable-memory runtime of the
-  optional `jit` feature (it also loads AOT shared objects for `aot-dylib`,
+  default-on `jit` feature (it also loads AOT shared objects for `aot-dylib`,
   and owns the guest arena mapping for shared rodata):
   keep its unsafe surface minimal and documented, and keep everything else
   (including `libriscv/src/jit/` and `aot/`) unsafe-free. Code the AOT

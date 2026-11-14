@@ -189,7 +189,14 @@ fn embedded_translation() {
     let target = root.join("target").join("aot-embed");
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
-        .args(["build", "-p", "rvlinux", "--features", "aot"])
+        .args([
+            "build",
+            "-p",
+            "rvlinux",
+            "--no-default-features",
+            "--features",
+            "aot",
+        ])
         .env("CARGO_TARGET_DIR", &target)
         .env("RVLINUX_AOT_EMBED", &rs)
         .status()

@@ -57,7 +57,11 @@ fn usage(name: &str) {
     println!("  -s, --silent       Suppress program completion information");
     println!("  -f, --fuel amt     Set max instructions until program halts");
     println!("  -m, --memory amt   Set max memory size in MiB (default: 4000 MiB)");
-    println!("  -n, --no-translate Accepted for compatibility (always interpreted)");
+    if cfg!(feature = "jit") {
+        println!("  -n, --no-translate Interpret only: don't use the JIT (also --no-jit)");
+    } else {
+        println!("  -n, --no-translate Accepted for compatibility (always interpreted)");
+    }
     println!("  -S, --sandbox      Enable strict sandbox");
     println!(
         "  -P, --proxy        Enable proxy mode, allowing access to all files (disabling the sandbox)"
@@ -93,7 +97,7 @@ fn usage(name: &str) {
         );
     }
     if cfg!(feature = "jit") {
-        println!("  -j, --jit          Compile to native code with the Cranelift JIT");
+        println!("  -j, --jit          Compile to native code with the Cranelift JIT (default)");
         println!("  -B, --background   Compile in the background while interpreting (default)");
         println!("      --no-background Compile each segment before running it");
         println!(
@@ -110,7 +114,7 @@ fn usage(name: &str) {
             "      --no-jit-cache     Ignore saved code (loaded, linked into this program, or cached)"
         );
         println!(
-            "      --jit-cache-dir dir  Where --jit caches the code of the dynamic linker and system"
+            "      --jit-cache-dir dir  Where the JIT caches the code of the dynamic linker and system"
         );
         println!(
             "                         libraries (default: $XDG_CACHE_HOME/rvlinux/jit or ~/.cache/rvlinux/jit)"
@@ -121,7 +125,11 @@ fn usage(name: &str) {
 fn parse_args() -> Result<CliArgs, String> {
     let mut it = std::env::args();
     let name = it.next().unwrap_or_else(|| "rvlinux".into());
-    let mut args = CliArgs::default();
+    let mut args = CliArgs {
+        // The JIT is the default when it's built in; `-n` interprets.
+        jit: cfg!(feature = "jit"),
+        ..CliArgs::default()
+    };
     let num = |it: &mut std::env::Args, flag: &str| -> Result<u64, String> {
         let v = it
             .next()
@@ -142,7 +150,8 @@ fn parse_args() -> Result<CliArgs, String> {
             "-v" | "--verbose" => args.verbose = true,
             "-a" | "--accurate" => args.accurate = true,
             "-s" | "--silent" => args.silent = true,
-            "-n" | "--no-translate" => {}
+            "-n" | "--no-translate" => args.jit = false,
+            "--no-jit" if cfg!(feature = "jit") => args.jit = false,
             "-S" | "--sandbox" => args.sandbox = true,
             "-P" | "--proxy" => args.proxy = true,
             "-A" | "--allow" => args.allowed_files.push(
@@ -433,7 +442,7 @@ fn main() -> ExitCode {
 
 /// The JIT cache directory for a dynamic executable: the code of the
 /// dynamic linker (the initial segment) and of the pinned libraries is
-/// the same in every program, so `--jit` saves it the first time and uses
+/// the same in every program, so the JIT saves it the first time and uses
 /// it from then on. The program's own code is never cached.
 #[cfg(feature = "jit")]
 fn jit_cache_dir(args: &CliArgs, is_dynamic: bool) -> Option<libriscv::jit_cache::CacheDir> {

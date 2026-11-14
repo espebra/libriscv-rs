@@ -19,7 +19,8 @@ jit = ["libriscv/jit"]
 
 [dependencies]
 libfuzzer-sys = "0.4"
-# libriscv's defaults except ext-c, which is the `compressed` feature here.
+# libriscv's default extensions except ext-c, which is the `compressed`
+# feature here (and the JIT, which is the `jit` feature here).
 libriscv = { path = "../crates/libriscv", default-features = false, features = ["ext-a", "ext-f", "ext-v"] }
 
 # Not part of the main workspace: cargo-fuzz needs nightly sanitizer flags

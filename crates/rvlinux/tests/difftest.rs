@@ -1909,7 +1909,7 @@ int main(int argc, char** argv) {
             );
         }
         let rust = std::process::Command::new(rvlinux())
-            .arg("--accurate")
+            .args(["--no-translate", "--accurate"])
             .args(extra)
             .args(flags)
             .arg(&elf)

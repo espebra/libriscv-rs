@@ -7,8 +7,10 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# RV64 only: the port does not support RV32 or RV128.
-default = ["ext-a", "ext-c", "ext-f", "ext-v"]
+# RV64 only: the port does not support RV32 or RV128. The JIT is on by
+# default; `default-features = false` (plus the extensions) leaves it and
+# its dependencies (Cranelift, `libriscv-jit-rt`) out.
+default = ["ext-a", "ext-c", "ext-f", "ext-v", "jit"]
 ext-a = []
 ext-c = []
 ext-f = []

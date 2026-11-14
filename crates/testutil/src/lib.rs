@@ -640,7 +640,8 @@ pub fn run_reference_with(elf: &Path, flags: &[&str], args: &[&str]) -> io::Resu
 
 /// Run `elf` under a Rust `rvlinux` binary with the same flags as
 /// [`run_reference`]. Pass `env!("CARGO_BIN_EXE_rvlinux")` from tests in
-/// the `rvlinux` crate.
+/// the `rvlinux` crate. `rvlinux` uses the JIT by default when built with
+/// it: pass `--jit` to override `--no-translate`.
 pub fn run_rust(rvlinux: &Path, elf: &Path, args: &[&str]) -> io::Result<RunOutput> {
     run_rust_with(rvlinux, elf, &[], args)
 }
@@ -652,7 +653,7 @@ pub fn run_rust_with(
     flags: &[&str],
     args: &[&str],
 ) -> io::Result<RunOutput> {
-    let mut all = vec!["--accurate"];
+    let mut all = vec!["--no-translate", "--accurate"];
     all.extend_from_slice(flags);
     run_emulator(rvlinux, &all, elf, args)
 }

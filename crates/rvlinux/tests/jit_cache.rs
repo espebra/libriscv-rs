@@ -1,6 +1,6 @@
 //! The JIT code cache: `--jit-save-object`, `--jit-save-shared`,
 //! `--jit-load`, code linked into `rvlinux` (`RVLINUX_JIT_EMBED`) and the
-//! cache directory `--jit` keeps for dynamic executables (`--jit-cache-dir`).
+//! cache directory the JIT keeps for dynamic executables (`--jit-cache-dir`).
 //! Saved code must behave exactly like the JIT (and so the interpreter):
 //! the same output, exit code and instruction count, and it must only be
 //! used for the segments and memory layout it was compiled for.
@@ -200,9 +200,9 @@ fn quit_after_loading(elf: &Path, flags: &[&str]) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
-/// With `--jit`, a dynamic executable's dynamic linker is saved to the
-/// cache directory by itself, and found there by the next run. (Only the
-/// dynamic linker: `-Q` quits before it maps anything.)
+/// With the JIT (the default), a dynamic executable's dynamic linker is
+/// saved to the cache directory by itself, and found there by the next
+/// run. (Only the dynamic linker: `-Q` quits before it maps anything.)
 #[test]
 fn cache_directory() {
     if !have_tools() {
@@ -211,10 +211,10 @@ fn cache_directory() {
     let elf = build("-O2");
     let dir = cache_dir("dir");
     let dir_s = dir.to_str().unwrap();
-    let flags = ["--jit", "--jit-cache-dir", dir_s];
-    // Not without --jit, nor with --no-jit-cache.
-    quit_after_loading(&elf, &["--jit-cache-dir", dir_s]);
-    quit_after_loading(&elf, &["--jit", "--jit-cache-dir", dir_s, "--no-jit-cache"]);
+    let flags = ["--jit-cache-dir", dir_s];
+    // Not with --no-translate, nor with --no-jit-cache.
+    quit_after_loading(&elf, &["--no-translate", "--jit-cache-dir", dir_s]);
+    quit_after_loading(&elf, &["--jit-cache-dir", dir_s, "--no-jit-cache"]);
     assert!(cached_files(&dir).is_empty());
 
     let stderr = quit_after_loading(&elf, &flags);

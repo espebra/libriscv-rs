@@ -8,7 +8,10 @@ repository.workspace = true
 publish = false
 
 [features]
-# Adds `--jit`: run with the Cranelift JIT.
+default = ["jit"]
+# Runs with the Cranelift JIT (and its code cache for dynamic executables)
+# unless given `--no-translate`. Without it (`--no-default-features`),
+# `rvlinux` only interprets, and no crate in the build has unsafe code.
 jit = ["libriscv/jit"]
 # Adds `--aot-save`/`--aot-save-shared`: translate the program to Rust ahead
 # of time, and runs translations compiled into `rvlinux`
@@ -18,7 +21,7 @@ aot = ["libriscv/aot"]
 aot-dylib = ["aot", "libriscv/aot-dylib"]
 
 [dependencies]
-libriscv.workspace = true
+libriscv = { workspace = true, features = ["ext-a", "ext-c", "ext-f", "ext-v"] }
 
 [lints]
 workspace = true

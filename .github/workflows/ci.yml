@@ -22,7 +22,7 @@ jobs:
         run: rustup toolchain install
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo clippy --all-targets --features libriscv/jit,rvlinux/jit -- -D warnings
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
 
   test:
     runs-on: ubuntu-24.04
@@ -63,7 +63,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release -DRISCV_BINARY_TRANSLATION=OFF
           cmake --build libriscv-cpp/emulator/.build --target rvlinux
 
-      - name: Test
+      - name: Test (with the JIT, the default; difftests also run --jit)
         env:
           LIBRISCV_CPP: ${{ github.workspace }}/libriscv-cpp
           LIBRISCV_CPP_EMULATOR: ${{ github.workspace }}/libriscv-cpp/emulator/.build/rvlinux
@@ -79,13 +79,13 @@ jobs:
           LIBRISCV_REQUIRE_TOOLCHAIN: "1"
         run: cargo test -p libriscv --no-default-features
 
-      - name: Test with the JIT (difftests also run --jit)
+      - name: Test without the JIT (interpreter only)
         env:
           LIBRISCV_CPP: ${{ github.workspace }}/libriscv-cpp
           LIBRISCV_CPP_EMULATOR: ${{ github.workspace }}/libriscv-cpp/emulator/.build/rvlinux
           COREMARK_DIR: ${{ github.workspace }}/coremark
           LIBRISCV_REQUIRE_TOOLCHAIN: "1"
-        run: cargo test --workspace --features libriscv/jit,rvlinux/jit
+        run: cargo test --workspace --no-default-features
 
       - name: Test the JIT without the C extension
         run: cargo test -p libriscv --no-default-features --features jit
@@ -133,7 +133,7 @@ jobs:
             grep -q '^>>> Program exited, exit code = 0 ' "$name.out"
           }
 
-          run interpreter
+          run interpreter -n
 
           run jit-cold -j --jit-cache-dir "$cache"
           cold_ms=$ms
@@ -198,7 +198,7 @@ jobs:
               grep -q '^Solution Validates' "$name.out"
               grep -q '^>>> Program exited, exit code = 0 ' "$name.out"
             }
-            run interpreter
+            run interpreter -n
             run jit -j --jit-cache-dir "$cache"
             run jit-again -j --jit-cache-dir "$cache"
 

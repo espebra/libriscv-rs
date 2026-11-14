@@ -11,7 +11,9 @@ license = "BSD-3-Clause"
 repository = "https://github.com/libriscv/libriscv-rs"
 
 [workspace.dependencies]
-libriscv = { path = "crates/libriscv" }
+# Without its default features, so that `rvlinux`'s own `jit` feature
+# decides whether the JIT is built (members list the extensions they use).
+libriscv = { path = "crates/libriscv", default-features = false }
 libriscv-jit-rt = { path = "crates/libriscv-jit-rt" }
 testutil = { path = "crates/testutil" }
 

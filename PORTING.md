@@ -392,11 +392,19 @@ with returns through the entry table then; see "Native calls" under JIT.)
 
 ## JIT
 
-The optional `jit` feature (`MachineOptions::jit`, `rvlinux --jit`) is the
+The `jit` feature (`MachineOptions::jit`, `rvlinux --jit`) is the
 counterpart of C++'s asmjit backend, built on Cranelift instead of porting
 `asmjit/`. Code: `crates/libriscv/src/jit/` (`classify.rs`: instruction
 selection, `region.rs`: segment analysis and region formation, `emit.rs`:
 Cranelift IR, linking) and `crates/libriscv-jit-rt`.
+
+It is a default feature of both `libriscv` and `rvlinux` (2026-11-14), and
+`rvlinux` built with it runs the JIT, with the code cache directory for
+dynamic executables, unless given `-n`/`--no-translate` (or `--no-jit`).
+`--no-default-features` builds leave it out (`libriscv` then needs its
+extension features listed; `rvlinux` lists them itself), so that the
+interpreter-only build, with no unsafe code in any crate, stays one flag
+away.
 
 **Unsafe boundary.** Generating code needs no `unsafe`; mapping it executable
 and calling it does. That lives in `libriscv-jit-rt`, a small crate with
@@ -615,8 +623,10 @@ safe Rust can't do without slowing every dispatch. Instead:
   panics publishes "nothing compiled", so nobody waits forever.
 
 **Testing.** The difftests run every guest a second time with `--jit` when
-`rvlinux` is built with the feature (`cargo test --workspace --features
-libriscv/jit,rvlinux/jit`). `crates/libriscv/tests/jit.rs` compares complete
+`rvlinux` is built with the feature (the default; `cargo test --workspace
+--no-default-features` runs only the interpreter). `testutil::run_rust`
+passes `--no-translate` like the reference, so tests interpret unless they
+ask for `--jit`. `crates/libriscv/tests/jit.rs` compares complete
 machine state (registers, PC, counter, memory, error) between JIT and
 interpreter for hand-written and random programs at ~50 instruction limits
 each, and the same with background compilation (where the code arrives at
@@ -693,7 +703,7 @@ compilations are counted, and `jit_cache::wait_for_saves` waits for them,
 since background threads don't keep a process alive. Unlike saving to a
 `JitCacheOutput`, it doesn't stop a machine from sharing segments.
 Nothing is ever deleted (a new build gets a new subdirectory).
-`rvlinux --jit` uses it for dynamic executables: the dynamic linker (the
+`rvlinux`'s JIT (on by default) uses it for dynamic executables: the dynamic linker (the
 initial segment) and the pinned library slots (see "Execute segments
 from pages" under memory), never the program, in
 `--jit-cache-dir`, else `$XDG_CACHE_HOME/rvlinux/jit` or

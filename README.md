@@ -38,7 +38,7 @@ override with `LIBRISCV_CPP` or `LIBRISCV_CPP_EMULATOR`).
 
 ## JIT code cache
 
-With the `jit` feature, the code Cranelift compiles can be saved and reused
+With the `jit` feature (the default), the code Cranelift compiles can be saved and reused
 by later runs: a cache of the JIT's output, not a separate compiler.
 
 ```sh
@@ -60,7 +60,7 @@ then compiled into the host program or into a shared object:
 
 ```sh
 rvlinux -Q --aot-save prog.rs prog.elf          # translate to Rust source
-RVLINUX_AOT_EMBED=prog.rs cargo build -p rvlinux --features aot   # compile it in: no unsafe anywhere
+RVLINUX_AOT_EMBED=prog.rs cargo build -p rvlinux --no-default-features --features aot   # compile it in: no unsafe anywhere
 rvlinux -Q --aot-save-shared prog.so prog.elf   # or compile it with rustc into a shared object
 rvlinux --aot-load prog.so prog.elf             # (feature aot-dylib)
 ```
