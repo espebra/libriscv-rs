@@ -1494,6 +1494,10 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   forwards, or just behind it modulo 2^64 going backwards), the bytes
   repeat with that period; a chunk repeats them the same way rather than
   shrinking to the distance (a byte at a time for `memmove(-1, 0, n)`).
+  A backward chunk's end may also lie wholly in the arena's read (source)
+  or write (destination) window, where the loop's loads and stores never
+  fault and skip the page table, so copies between the arena and pages
+  outside it go a chunk at a time too.
 - `native/backtrace.rs`: `Memory::lookup`/`print_backtrace` as
   `Machine::lookup`/`print_backtrace`, without demangling (C++ demangles
   with `__cxa_demangle` when built with `DEMANGLE_ENABLED`).

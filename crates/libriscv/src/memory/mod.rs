@@ -1411,6 +1411,34 @@ mod tests {
             (MIB, far, far + P + 3, 3 * P, None, None),
             (MIB, far, far + 5, 5 * P, Some(far + 3 * P), None),
             (MIB, far, far + 3, 5 * P, None, Some(far + P)),
+            // Into the arena from pages outside it: unmapped (zero) pages,
+            // data pages, and across the arena's end.
+            (MIB, 0x3008, far + 0x40_0008, 3 * P, None, None),
+            (MIB, 0x3003, far + 0x40_0008, 3 * P, None, None),
+            (MIB, 0x5003, far + 8, 3 * P, None, None),
+            (MIB, MIB - P - 5, far + 8, 3 * P, None, None),
+            (MIB, MIB - P - 8, far + 0x40_0000, 3 * P, None, None),
+            // Out of the arena: across its read window's end, and into a
+            // read-only page part of the way.
+            (MIB, far + 0x10_0008, MIB - 2 * P + 8, 4 * P, None, None),
+            (
+                MIB,
+                far + 0x10_0008,
+                0x3008,
+                5 * P,
+                None,
+                Some(far + 0x10_0000 + 2 * P),
+            ),
+            // Within the arena, wrapping (memmove(-1, src, n)): the stores
+            // land low in the arena, the loads start in the arena or in the
+            // zero page below its read window.
+            (MIB, u64::MAX, 0x5000, 3 * P, None, None),
+            (MIB, u64::MAX, 0, 3 * P, None, None),
+            // Into the arena across the end of its read-only data (mid-page,
+            // see `setup`): stores below it don't take the arena's path.
+            (MIB, 0x2000, far + 8, 3 * P, None, None),
+            (MIB, 0x2000, far + 0x40_0000, 2 * P, None, None),
+            (MIB, 0x2000, far + 8, 3 * P, None, Some(0x2000)),
         ];
         for (i, &(max, dst, src, len, unreadable, read_only_page)) in cases.iter().enumerate() {
             // The huge lengths fault (or run out of memory) on the way;
@@ -1427,6 +1455,8 @@ mod tests {
                 if let Some(page) = read_only_page {
                     mem.set_page_attr(page, P, read_only).unwrap();
                 }
+                // As if a program's read-only data ended mid-page.
+                mem.initial_rodata_end = 0x2800;
                 mem
             };
             let (mut chunked, mut reference) = (setup(), setup());
@@ -1479,6 +1509,21 @@ mod tests {
         // The last source byte repeats down to the start.
         assert_eq!(mem.read_u8(a).unwrap(), 9);
         assert_eq!(mem.read_u8(a + 48 * MIB - 1).unwrap(), 9);
+    }
+
+    /// A native memmove's backward copy of 48 MiB from unmapped pages into
+    /// the arena: `libcfuzzer` inputs spent 0.3 s looking up the missing
+    /// source page for every byte.
+    #[test]
+    fn a_long_memmove_backward_into_the_arena_is_fast() {
+        let mut mem = empty_memory(128 * MIB);
+        let a = 0x10_0000_0000;
+        mem.memcpy(MIB, &[7; 64]).unwrap();
+        let start = std::time::Instant::now();
+        mem.memmove_backward(MIB + 3, a, 48 * MIB).unwrap();
+        assert!(start.elapsed().as_secs() < 2, "{:?}", start.elapsed());
+        assert_eq!(mem.read_u8(MIB + 2).unwrap(), 7);
+        assert_eq!(mem.read_u8(MIB + 3).unwrap(), 0);
     }
 
     /// `set_page_attr` changes runs of existing pages through the index;

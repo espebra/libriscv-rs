@@ -862,44 +862,72 @@ impl Memory {
 
     /// How many bytes [`memmove_backward`](Self::memmove_backward) can copy
     /// as one chunk ending at `dst + i` / `src + i`, or 0 to take one
-    /// element. Both ends must be outside the arena, and the chunk stays in
-    /// one page of each (keeping the loop's page-at-a-time faults: a
-    /// source page is read, then the destination page made writable, as
-    /// the chunk's first element does). Going backwards, a store can only
+    /// element. The chunk stays in one page of each end, and each end is
+    /// either outside the arena (keeping the loop's page-at-a-time faults:
+    /// a source page is read, then the destination page made writable, as
+    /// the chunk's first element does) or wholly in the arena's read
+    /// (source) or write (destination) window, where the loop's loads and
+    /// stores never fault and skip the page table. Going backwards, a store can only
     /// reach a later load when `dst` is behind `src` modulo 2^64 (the copy
     /// wraps the address space); the chunk copies those the loop's way
     /// (see [`Overlap`]). The bounds are multiples of 8 when the addresses
     /// are.
     fn paged_copy_chunk_back(&self, dst: u64, src: u64, i: u64) -> u64 {
         let (s_last, d_last) = (src.wrapping_add(i - 1), dst.wrapping_add(i - 1));
-        if !self.outside_arena(s_last) || !self.outside_arena(d_last) {
-            return 0;
-        }
-        i.min((s_last & PAGE_MASK) + 1)
-            .min((d_last & PAGE_MASK) + 1)
+        let n = i
+            .min((s_last & PAGE_MASK) + 1)
+            .min((d_last & PAGE_MASK) + 1);
+        // In one page, so the starts don't wrap.
+        let (s_first, d_first) = (s_last - (n - 1), d_last - (n - 1));
+        let src_ok = self.outside_arena(s_last) || self.read_window_range(s_first, n).is_some();
+        let dst_ok = self.outside_arena(d_last) || self.write_window_range(d_first, n).is_some();
+        if src_ok && dst_ok { n } else { 0 }
     }
 
     /// Copy `n` bytes within one source and one destination page (see
     /// [`paged_copy_chunk`](Self::paged_copy_chunk)): load the source page,
     /// then make the destination page writable, as the loop's first
-    /// element does.
+    /// element does. An end in the arena's read (source) or write
+    /// (destination) window is accessed there instead, as the loop's
+    /// loads and stores are.
     fn copy_paged_chunk(&mut self, dst: u64, src: u64, n: u64, overlap: Overlap) -> Result<()> {
         let mut buf = [0u8; PAGE];
-        let (so, d_o, n) = (
-            (src & PAGE_MASK) as usize,
-            (dst & PAGE_MASK) as usize,
-            n as usize,
-        );
-        let page = self.get_readable_pageno(src / PAGE_SIZE)?;
-        if let (Some(b), Some(s)) = (buf.get_mut(..n), page.get(so..so + n)) {
+        let (so, d_o) = ((src & PAGE_MASK) as usize, (dst & PAGE_MASK) as usize);
+        let from_arena = self.read_window_range(src, n);
+        let to_arena = self.write_window_range(dst, n);
+        let n = n as usize;
+        let source = match from_arena {
+            Some(r) => self.arena.get(r),
+            None => self.get_readable_pageno(src / PAGE_SIZE)?.get(so..so + n),
+        };
+        if let (Some(b), Some(s)) = (buf.get_mut(..n), source) {
             b.copy_from_slice(s);
             overlap.apply(b);
         }
-        let page = self.writable_page(dst / PAGE_SIZE)?;
-        if let (Some(d), Some(b)) = (page.get_mut(d_o..d_o + n), buf.get(..n)) {
+        let dest = match to_arena {
+            Some(r) => self.arena.get_mut(r),
+            None => self.writable_page(dst / PAGE_SIZE)?.get_mut(d_o..d_o + n),
+        };
+        if let (Some(d), Some(b)) = (dest, buf.get(..n)) {
             d.copy_from_slice(b);
         }
         Ok(())
+    }
+
+    /// The arena indices of `[addr, addr + len)` if it is in the arena's
+    /// read window (where every load takes the arena fast path).
+    fn read_window_range(&self, addr: u64, len: u64) -> Option<std::ops::Range<usize>> {
+        if len == 0 {
+            return None;
+        }
+        let offset = addr.wrapping_sub(RWREAD_BEGIN);
+        if offset < self.read_boundary && len <= self.read_boundary - offset {
+            let a = usize::try_from(addr).ok()?;
+            let n = usize::try_from(len).ok()?;
+            let range = a..a.checked_add(n)?;
+            return (range.end <= self.arena.len()).then_some(range);
+        }
+        None
     }
 
     /// The arena indices of `[addr, addr + len)` if it is in the arena's
