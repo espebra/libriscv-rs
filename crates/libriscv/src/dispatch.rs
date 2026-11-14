@@ -896,6 +896,9 @@ impl Machine {
                 Exit::Halt => return Ok((self.dispatch.counter, self.dispatch.pc)),
                 Exit::Jump => {
                     c = self.dispatch.counter;
+                    if let Some(stopped) = self.stop_in_other_segment(self.dispatch.pc, c) {
+                        return Ok(stopped);
+                    }
                     pc = self.next_execute_segment(self.dispatch.pc)?;
                     // The new segment may be compiling in the background.
                     #[cfg(feature = "jit")]

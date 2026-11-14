@@ -168,7 +168,7 @@ How the C++ version maps over:
 | `return RETURN_VALUES()`, `next_execute_segment(...)` exits | `become halt_exit(...)` etc.: exits are tail calls to cold handlers too, so a fast handler makes no calls and needs no stack frame |
 | `BEGIN_BLOCK()` adds the block's instruction count; `OVERFLOW_CHECK()` only on branches/jumps | Same. The counting has to match exactly to keep instruction-count parity |
 | `cpu.trigger_exception()` throws | Store the `MachineError` in the machine and return `Exit::Fault`. The return value is a one-byte enum |
-| `next_execute_segment()` on out-of-segment jumps | Return `Exit::Jump`; `dispatch_simulate` switches segment and re-enters the chain with `BEGIN_BLOCK`. Returning is needed because the chain borrows the segment, and it's a slow path anyway |
+| `next_execute_segment()` on out-of-segment jumps | Return `Exit::Jump`; `dispatch_simulate` switches segment and re-enters the chain with `BEGIN_BLOCK`. Returning is needed because the chain borrows the segment, and it's a slow path anyway. A jump to a STOP beginning a block of another usable segment (a VM call returning to the exit function) stops with that block counted, without switching: switching costs atomic reference counting, twice per VM call (an empty `vmcall` went from 65 to 23 ns) |
 
 Ownership: the decoded segment sits behind an `Arc` (C++ already shares
 segments via `shared_ptr`). The dispatcher clones it out, so `&exec` and
