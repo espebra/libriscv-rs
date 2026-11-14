@@ -410,32 +410,115 @@ fn relocate(image: &mut [u8], at: usize, kind: Reloc, what: i64) -> Option<()> {
     Some(())
 }
 
+/// Most threads compiling one segment's regions.
+const MAX_COMPILE_THREADS: usize = 16;
+/// Regions per thread below which more threads don't pay off.
+const REGIONS_PER_THREAD: usize = 64;
+
+/// Compile every region of `a`, in region order, on up to `threads`
+/// threads (each taking the next region not yet taken). The regions are
+/// independent functions, and Cranelift's output for a function doesn't
+/// depend on which thread compiles it, so the image is the same. `None`
+/// if any region fails, or a thread panics.
+fn compile_regions(
+    segment: &Segment<'_>,
+    isa: &OwnedTargetIsa,
+    threads: usize,
+) -> Option<Vec<Object>> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+    let n = segment.a.regions.len();
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    // Compile regions until there are none left: `(region, object)`.
+    let work = || {
+        let mut ctx = Context::new();
+        let mut fctx = FunctionBuilderContext::new();
+        let mut done = Vec::new();
+        while !failed.load(Relaxed) {
+            let r = next.fetch_add(1, Relaxed);
+            if r >= n {
+                break;
+            }
+            ctx.clear();
+            ctx.func =
+                Function::with_name_signature(UserFuncName::user(0, r as u32), tail_signature());
+            let object = RegionEmitter::emit(segment, r, &mut ctx.func, &mut fctx, isa)
+                .and_then(|()| compile_function(&mut ctx, isa));
+            let Some(object) = object else {
+                failed.store(true, Relaxed);
+                break;
+            };
+            done.push((r, object));
+        }
+        done
+    };
+    let mut done = std::thread::scope(|s| {
+        // Threads that can't be started leave their share to the others.
+        let helpers: Vec<_> = (1..threads)
+            .filter_map(|_| {
+                std::thread::Builder::new()
+                    .name("libriscv-jit".into())
+                    .spawn_scoped(s, work)
+                    .ok()
+            })
+            .collect();
+        let mut done = work();
+        for helper in helpers {
+            match helper.join() {
+                Ok(more) => done.extend(more),
+                Err(_) => failed.store(true, Relaxed),
+            }
+        }
+        done
+    });
+    if failed.load(Relaxed) || done.len() != n {
+        return None;
+    }
+    done.sort_unstable_by_key(|&(r, _)| r);
+    Some(done.into_iter().map(|(_, object)| object).collect())
+}
+
 /// Compile every region of `a` and link them into an [`Image`].
 /// `layout`: see [`compile`](super::compile).
 pub(crate) fn compile(exec: &DecodedSegment, a: &Analysis, layout: MemoryLayout) -> Option<Image> {
     if a.regions.is_empty() {
         return None;
     }
+    compile_on(exec, a, layout, compile_threads(a.regions.len()))
+}
+
+/// The threads [`compile`] uses for `regions` regions.
+fn compile_threads(regions: usize) -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(MAX_COMPILE_THREADS)
+        .min(regions / REGIONS_PER_THREAD)
+        .max(1)
+}
+
+/// [`compile`] on up to `threads` threads.
+pub(crate) fn compile_on(
+    exec: &DecodedSegment,
+    a: &Analysis,
+    layout: MemoryLayout,
+    threads: usize,
+) -> Option<Image> {
+    if a.regions.is_empty() {
+        return None;
+    }
     let isa = host_isa()?;
     let summaries = summaries(exec, a)?;
-    let mut ctx = Context::new();
-    let mut fctx = FunctionBuilderContext::new();
-    let mut objects = Vec::with_capacity(a.regions.len() + 1);
-    for r in 0..a.regions.len() {
-        ctx.clear();
-        ctx.func = Function::with_name_signature(UserFuncName::user(0, r as u32), tail_signature());
-        let segment = Segment {
-            exec,
-            a,
-            layout,
-            summaries: &summaries,
-        };
-        RegionEmitter::emit(&segment, r, &mut ctx.func, &mut fctx, &isa)?;
-        objects.push(compile_function(&mut ctx, &isa)?);
-    }
+    let segment = Segment {
+        exec,
+        a,
+        layout,
+        summaries: &summaries,
+    };
+    let mut objects = compile_regions(&segment, &isa, threads)?;
     // The trampoline: called from Rust with the C calling convention as
     // `(state, function, pc, counter)`, it enters the `tail` world.
-    ctx.clear();
+    let mut ctx = Context::new();
+    let mut fctx = FunctionBuilderContext::new();
     ctx.func = trampoline(exec, &isa, &mut fctx);
     objects.push(compile_function(&mut ctx, &isa)?);
 

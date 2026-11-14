@@ -137,7 +137,9 @@ To decide at the start of the phase that needs them (recommendation given):
 ## Toolchain
 
 Pinned nightly in `rust-toolchain.toml` (currently `nightly-2026-09-28`,
-rustc `d080e7dff`). We need it for `become` (`feature(explicit_tail_calls)`).
+rustc `d080e7dff`). We need it for `become` (`feature(explicit_tail_calls)`);
+the handlers also use `feature(rust_preserve_none_cc)` and `feature(fn_align)`
+(see Dispatch).
 The feature is still flagged *incomplete* upstream, so a miscompile is
 possible; the difftests and instruction-count checks are the safety net.
 
@@ -160,21 +162,21 @@ How the C++ version maps over:
 
 | C++ (`tailcall_dispatch.cpp`) | Rust |
 |---|---|
-| `INSTRUCTION(bc, name)`: `static TcoRet<W> name(DecoderData<W>* d, DecodedExecuteSegment<W>* exec, CPU<W>& cpu, addr_t pc, InstrCounter& counter)` | `extern "rust-preserve-none" fn name(exec: &DecodedSegment, i: usize, m: &mut Machine, pc: u64, counter: Counter, ins: u32) -> Exit` with one signature for all handlers |
+| `INSTRUCTION(bc, name)`: `static TcoRet<W> name(DecoderData<W>* d, DecodedExecuteSegment<W>* exec, CPU<W>& cpu, addr_t pc, InstrCounter& counter)` | `extern "rust-preserve-none" fn name(exec: &DecodedSegment, cache: &[DecoderEntry], i: usize, m: &mut Machine, counter: Counter, ins: u32, pc: u64) -> Exit` with one signature for all handlers. The order puts `ins` in rcx, where variable shifts want their count (cl) |
 | `MUSTTAIL return computed_opcode<W>[bc](...)` | `become (entry.handler)(..., entry.instr)`. Store the handler `fn` in the decoder entry itself, so there's no second table lookup |
 | `VIEW_INSTR_AS(fi, FasterItype)` reading `d->instr` | The caller passes the entry's (re-encoded) bits as `ins`, so a handler never looks up its own entry |
 | `d += 1` pointer bump | index `i + 1`; read with `exec.cache.get(i)`. That's one bounds check per instruction (a compare and a predicted branch), the price of safe Rust |
 | `__attribute__((preserve_none))` | `extern "rust-preserve-none" fn` (`feature(rust_preserve_none_cc)`). Without it every handler saved and restored six callee-saved registers: it cut CoreMark's host instructions by 17% |
+| (handler placement left to the compiler) | Hot handlers are 64-byte aligned (`#[rustc_align(64)]`, `feature(fn_align)`). Otherwise the interpreter's speed shifted by a few percent with wherever unrelated changes placed them; aligned, fixed-workload CoreMark took 2.5–5% fewer cycles (32-byte alignment didn't help) |
 | `return RETURN_VALUES()`, `next_execute_segment(...)` exits | `become halt_exit(...)` etc.: exits are tail calls to cold handlers too, so a fast handler makes no calls and needs no stack frame |
 | `BEGIN_BLOCK()` adds the block's instruction count; `OVERFLOW_CHECK()` only on branches/jumps | Same. The counting has to match exactly to keep instruction-count parity |
 | `cpu.trigger_exception()` throws | Store the `MachineError` in the machine and return `Exit::Fault`. The return value is a one-byte enum |
-| `next_execute_segment()` on out-of-segment jumps | Return `Exit::Jump`; `dispatch_simulate` switches segment and re-enters the chain with `BEGIN_BLOCK`. Returning is needed because the chain borrows the segment, and it's a slow path anyway |
+| `next_execute_segment()` on out-of-segment jumps | Return `Exit::Jump`; `dispatch_simulate` switches segment and re-enters the chain with `BEGIN_BLOCK`. Returning is needed because the chain borrows the segment, and it's a slow path anyway. A jump to a STOP beginning a block of another usable segment (a VM call returning to the exit function) stops with that block counted, without switching: switching costs atomic reference counting, twice per VM call (an empty `vmcall` went from 65 to 23 ns) |
 
 Ownership: the decoded segment sits behind an `Arc` (C++ already shares
 segments via `shared_ptr`). The dispatcher clones it out, so `&exec` and
-`&mut machine` are disjoint borrows. The handler signature is
-`fn(&DecodedSegment, usize, &mut Machine, u64, Counter) -> Exit`, where
-`Counter` is the value/limit pair passed in two registers.
+`&mut machine` are disjoint borrows. `Counter` is the value/limit pair
+passed in two registers.
 
 **Semantics follow `cpu_dispatch.cpp`.** The C++ tail-call dispatcher differs
 observably from its threaded/switch dispatcher (`cpu_dispatch.cpp`), and the
@@ -212,7 +214,11 @@ interpreter's speed comes from:
   the pre-decoded operands. They never return a `Result`: the only fallible
   ones, loads and stores, read the flat arena inline (`Memory::arena_read`,
   which can't fail) and tail-call a cold `*_slow` handler for the page
-  table and faults. C++ gets the same effect from exceptions.
+  table and faults. C++ gets the same effect from exceptions. In between,
+  a `*_cached` handler serves page cache hits outside the arena
+  (`Memory::read_cached`/`write_cached`, stores only to unshared pages of
+  their own) without calls, so it needs no stack frame: every load and
+  store of a machine without an arena (forks) goes there.
 - Slow paths (`RV32I_BC_FUNCTION`, `RV32C_BC_FUNCTION`, `FUNCBLOCK`) keep
   the original instruction and run the precise handler, as in C++.
 
@@ -312,7 +318,10 @@ exact-counting variants report 1435905543 / 1266007356 instructions:
 The Rust JIT doesn't pay off here: the executable segment holds all of libc
 (460 KB), and compiling it takes ~1.9 s with Cranelift, after which
 CoreMark runs in ~260 ms. asmjit compiles it in ~150 ms. Lazy compilation
-(see Phase 4) is what fixes this.
+(see Phase 4) is what fixes this. (Since then, a segment's regions are
+compiled on up to 16 threads, the same image as on one: on a 28-core Xeon
+Gold 6132, compiling this segment went from 3.1 s to 0.29 s of wall time,
+for 18% more CPU time.)
 
 ### CoreMark 1.0
 
@@ -1479,9 +1488,16 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   arena shortcut included; tested against the loop): one native memcpy of
   up to 512 MiB runs before its penalty is charged. The native memmove's
   backward copy (`Memory::memmove_backward`, when `dst >= src`) does the
-  same: page-bounded chunks from the end, no longer than the distance by
-  which `dst` is behind `src` modulo 2^64, matching C++'s loop of word or
-  byte loads and stores from the end (tested against it).
+  same: page-bounded chunks from the end, matching C++'s loop of word or
+  byte loads and stores from the end (tested against it). Where the
+  loop's stores reach its later loads (`dst` just ahead of `src` going
+  forwards, or just behind it modulo 2^64 going backwards), the bytes
+  repeat with that period; a chunk repeats them the same way rather than
+  shrinking to the distance (a byte at a time for `memmove(-1, 0, n)`).
+  A backward chunk's end may also lie wholly in the arena's read (source)
+  or write (destination) window, where the loop's loads and stores never
+  fault and skip the page table, so copies between the arena and pages
+  outside it go a chunk at a time too.
 - `native/backtrace.rs`: `Memory::lookup`/`print_backtrace` as
   `Machine::lookup`/`print_backtrace`, without demangling (C++ demangles
   with `__cxa_demangle` when built with `DEMANGLE_ENABLED`).

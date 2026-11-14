@@ -630,6 +630,50 @@ const REGS_PROGRAM: &str = r#"
 		return 0;
 	}"#;
 
+/// A VM call returns to the exit function, whose STOP is in another
+/// execute segment; the dispatcher stops there without switching to it.
+/// That must count and stop exactly like executing the exit function:
+/// compare with stepping the same call through it (`simulate_precise`).
+#[test]
+fn returning_to_the_exit_function_counts_like_stepping_through_it() {
+    if !testutil::need_compiler() {
+        return;
+    }
+    let binary = build(REGS_PROGRAM);
+    let setup = || {
+        let mut m = machine(&binary);
+        m.simulate(MAX_INSTRUCTIONS).unwrap();
+        // The first call creates the exit function's execute segment.
+        m.vmcall("bump", 1).unwrap();
+        m
+    };
+    for n in [1i64, 1000] {
+        let mut called = setup();
+        let value = called.vmcall_limited(MAX_INSTRUCTIONS, "spin", n).unwrap();
+        assert_eq!(value, n as u64);
+
+        let mut stepped = setup();
+        let spin = stepped.address_of("spin").unwrap();
+        stepped.reset_stack_pointer();
+        stepped.setup_call(&(n,)).unwrap();
+        stepped.cpu.jump(spin).unwrap();
+        stepped.set_instruction_counter(0);
+        stepped.set_max_instructions(MAX_INSTRUCTIONS);
+        stepped.simulate_precise().unwrap();
+
+        assert_eq!(stepped.return_value(), value, "n = {n}");
+        assert_eq!(stepped.cpu.pc(), called.cpu.pc(), "n = {n}");
+        assert_eq!(stepped.cpu.pc(), called.memory.exit_address() + 4);
+        assert_eq!(
+            stepped.instruction_counter(),
+            called.instruction_counter(),
+            "n = {n}"
+        );
+        // Running on resumes after the STOP in both.
+        assert_eq!(stepped.cpu.registers(), called.cpu.registers(), "n = {n}");
+    }
+}
+
 /// `preempt` restores every register, PC included; `preempt_clobbering`
 /// leaves what the function left.
 #[test]

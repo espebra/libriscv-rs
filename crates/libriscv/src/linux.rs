@@ -45,10 +45,14 @@ impl Machine {
 
     /// Push a string with its zero terminator (C++ `stack_push(std::string)`).
     pub fn stack_push_str(&mut self, s: &str) -> Result<u64> {
-        let mut data = Vec::with_capacity(s.len() + 1);
-        data.extend_from_slice(s.as_bytes());
-        data.push(0);
-        self.stack_push(&data)
+        // stack_push of the string and its terminator, without building
+        // them in a buffer first: the same copies, in the same order.
+        let len = s.len() as u64 + 1;
+        let sp = self.cpu.reg(REG_SP).wrapping_sub(len) & !7;
+        self.cpu.set_reg(REG_SP, sp);
+        self.copy_to_guest(sp, s.as_bytes())?;
+        self.copy_to_guest(sp.wrapping_add(len - 1), &[0])?;
+        Ok(sp)
     }
 
     /// Push a [`GuestPod`](crate::GuestPod) (C++ `stack_push(const T&)`).

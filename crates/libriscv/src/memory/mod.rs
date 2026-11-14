@@ -544,16 +544,20 @@ impl Memory {
 
     /// Port of `Memory::exec_segment_for`.
     pub fn exec_segment_for(&self, vaddr: u64) -> Option<Arc<DecodedSegment>> {
+        self.exec_segment_ref(vaddr).cloned()
+    }
+
+    /// [`exec_segment_for`](Self::exec_segment_for) without taking a
+    /// reference: the caller clones only what it keeps (each clone and
+    /// drop is an atomic operation, and switching segments is on every
+    /// VM call's path).
+    pub(crate) fn exec_segment_ref(&self, vaddr: u64) -> Option<&Arc<DecodedSegment>> {
         if let Some(main) = &self.main_exec
             && main.is_within(vaddr, 2)
         {
-            return Some(Arc::clone(main));
+            return Some(main);
         }
-        self.exec
-            .iter()
-            .flatten()
-            .find(|s| s.is_within(vaddr, 2))
-            .cloned()
+        self.exec.iter().flatten().find(|s| s.is_within(vaddr, 2))
     }
 
     /// Number of non-main execute segment slots (C++ `execute_segments_count`).
@@ -1398,6 +1402,43 @@ mod tests {
             ),
             (MIB, far, far + 8, 0u64.wrapping_sub(8), None, None),
             (MIB, far, far + 3, 0u64.wrapping_sub(3), None, None),
+            // dst just behind src: the top bytes repeat downwards, over
+            // page boundaries, up to a fault.
+            (MIB, far, far + 1, 3 * P + 5, None, None),
+            (MIB, far + 3, far + 8, 3 * P, None, None),
+            (MIB, far, far + 24, 3 * P, None, None),
+            (MIB, far + 8, far + P + 16, 3 * P, None, None),
+            (MIB, far, far + P + 3, 3 * P, None, None),
+            (MIB, far, far + 5, 5 * P, Some(far + 3 * P), None),
+            (MIB, far, far + 3, 5 * P, None, Some(far + P)),
+            // Into the arena from pages outside it: unmapped (zero) pages,
+            // data pages, and across the arena's end.
+            (MIB, 0x3008, far + 0x40_0008, 3 * P, None, None),
+            (MIB, 0x3003, far + 0x40_0008, 3 * P, None, None),
+            (MIB, 0x5003, far + 8, 3 * P, None, None),
+            (MIB, MIB - P - 5, far + 8, 3 * P, None, None),
+            (MIB, MIB - P - 8, far + 0x40_0000, 3 * P, None, None),
+            // Out of the arena: across its read window's end, and into a
+            // read-only page part of the way.
+            (MIB, far + 0x10_0008, MIB - 2 * P + 8, 4 * P, None, None),
+            (
+                MIB,
+                far + 0x10_0008,
+                0x3008,
+                5 * P,
+                None,
+                Some(far + 0x10_0000 + 2 * P),
+            ),
+            // Within the arena, wrapping (memmove(-1, src, n)): the stores
+            // land low in the arena, the loads start in the arena or in the
+            // zero page below its read window.
+            (MIB, u64::MAX, 0x5000, 3 * P, None, None),
+            (MIB, u64::MAX, 0, 3 * P, None, None),
+            // Into the arena across the end of its read-only data (mid-page,
+            // see `setup`): stores below it don't take the arena's path.
+            (MIB, 0x2000, far + 8, 3 * P, None, None),
+            (MIB, 0x2000, far + 0x40_0000, 2 * P, None, None),
+            (MIB, 0x2000, far + 8, 3 * P, None, Some(0x2000)),
         ];
         for (i, &(max, dst, src, len, unreadable, read_only_page)) in cases.iter().enumerate() {
             // The huge lengths fault (or run out of memory) on the way;
@@ -1414,6 +1455,8 @@ mod tests {
                 if let Some(page) = read_only_page {
                     mem.set_page_attr(page, P, read_only).unwrap();
                 }
+                // As if a program's read-only data ended mid-page.
+                mem.initial_rodata_end = 0x2800;
                 mem
             };
             let (mut chunked, mut reference) = (setup(), setup());
@@ -1449,6 +1492,38 @@ mod tests {
         let a = 0x10_0000_0000;
         mem.memmove_backward(a + 0x1000_0003, a, 16 * MIB).unwrap();
         assert!(start.elapsed().as_secs() < 2, "{:?}", start.elapsed());
+    }
+
+    /// A native memmove's backward copy of 48 MiB with the destination a
+    /// byte behind the source modulo 2^64, so each store reaches the next
+    /// load: `forkfuzzer` inputs (`memmove(-1, 0, 19 MiB)`) took 2 s per
+    /// machine copying a byte per chunk.
+    #[test]
+    fn a_long_memmove_backward_onto_its_own_source_is_fast() {
+        let mut mem = empty_memory(128 * MIB);
+        let a = 0x10_0000_0000;
+        mem.memcpy(a + 48 * MIB - 1, &[7, 9]).unwrap();
+        let start = std::time::Instant::now();
+        mem.memmove_backward(a, a + 1, 48 * MIB).unwrap();
+        assert!(start.elapsed().as_secs() < 2, "{:?}", start.elapsed());
+        // The last source byte repeats down to the start.
+        assert_eq!(mem.read_u8(a).unwrap(), 9);
+        assert_eq!(mem.read_u8(a + 48 * MIB - 1).unwrap(), 9);
+    }
+
+    /// A native memmove's backward copy of 48 MiB from unmapped pages into
+    /// the arena: `libcfuzzer` inputs spent 0.3 s looking up the missing
+    /// source page for every byte.
+    #[test]
+    fn a_long_memmove_backward_into_the_arena_is_fast() {
+        let mut mem = empty_memory(128 * MIB);
+        let a = 0x10_0000_0000;
+        mem.memcpy(MIB, &[7; 64]).unwrap();
+        let start = std::time::Instant::now();
+        mem.memmove_backward(MIB + 3, a, 48 * MIB).unwrap();
+        assert!(start.elapsed().as_secs() < 2, "{:?}", start.elapsed());
+        assert_eq!(mem.read_u8(MIB + 2).unwrap(), 7);
+        assert_eq!(mem.read_u8(MIB + 3).unwrap(), 0);
     }
 
     /// `set_page_attr` changes runs of existing pages through the index;
@@ -1550,6 +1625,111 @@ mod tests {
         assert!(start.elapsed().as_secs() < 4, "{:?}", start.elapsed());
     }
 
+    /// Arena pages get page table entries from their attributes and lose
+    /// them when freed; lookups that miss the page cache skip the index
+    /// for arena pages without one, which must agree with the index.
+    #[test]
+    fn arena_page_entries_are_tracked() {
+        const P: u64 = PAGE_SIZE;
+        let mut mem = empty_memory(MIB);
+        let read_only = PageAttributes {
+            write: false,
+            ..PageAttributes::default()
+        };
+        mem.paging.check_arena_indexed();
+        mem.set_page_attr(4 * P, 3 * P, read_only).unwrap();
+        mem.set_page_attr(100 * P, P, read_only).unwrap();
+        mem.write_u64(50 * P, 1).unwrap();
+        mem.paging.check_arena_indexed();
+        assert_eq!(mem.page_attributes(5 * P).unwrap(), read_only);
+        mem.free_pages(5 * P, P);
+        mem.paging.check_arena_indexed();
+        mem.set_page_attr(4 * P, 4 * P, PageAttributes::default())
+            .unwrap();
+        mem.memdiscard(100 * P, P, true).unwrap();
+        mem.paging.check_arena_indexed();
+        mem.memcpy(4 * P - 3, &[7; 3 * PAGE_SIZE as usize]).unwrap();
+        mem.paging.check_arena_indexed();
+        assert_eq!(mem.read_u8(6 * P).unwrap(), 7);
+    }
+
+    /// The page cache shortcuts of the interpreter's paged loads and
+    /// stores give what the page-table path gives, or leave it to it:
+    /// loads of every kind of page (own, a fork's loaned, zero, unreadable,
+    /// across pages), and stores only to writable pages of their own that
+    /// no fork shares.
+    #[test]
+    fn cached_page_accesses_match_the_page_table_path() {
+        const P: u64 = PAGE_SIZE;
+        let options = MachineOptions {
+            memory_max: MIB,
+            use_memory_arena: false,
+            ..Default::default()
+        };
+        let mut mem = Memory::new(Arc::from(Vec::new()), &options).unwrap().0;
+        let base = 0x10_0000;
+        for page in 0..4 {
+            mem.write_u64(base + page * P + 8, 0x1111 * (page + 1))
+                .unwrap();
+        }
+        let none = PageAttributes {
+            read: false,
+            write: false,
+            exec: false,
+            ..PageAttributes::default()
+        };
+        let read_only = PageAttributes {
+            write: false,
+            ..PageAttributes::default()
+        };
+        mem.set_page_attr(base + 2 * P, P, none).unwrap();
+        mem.set_page_attr(base + 3 * P, P, read_only).unwrap();
+        let mut fork = mem.fork(&options).unwrap();
+        let addrs = [
+            base + 8,
+            base + P - 3,     // across into the next page
+            base + P + 8,     // own (loaned in the fork)
+            base + 2 * P + 8, // unreadable
+            base + 3 * P + 8, // read-only
+            base + 9 * P,     // no entry: the zero page
+        ];
+        for m in [&mut mem, &mut fork] {
+            for &addr in &addrs {
+                let slow = m.read_slow::<8>(addr).map_err(|e| e.kind);
+                // read_slow filled the page cache (where there is a page).
+                let cached = m.read_cached::<8>(addr);
+                if let Some(v) = cached {
+                    assert_eq!(Ok(v), slow, "{addr:#x}");
+                }
+                let hits = addr == base + 8 || addr == base + P + 8 || addr == base + 3 * P + 8;
+                assert_eq!(cached.is_some(), hits, "{addr:#x}");
+            }
+        }
+        // Stores: the fork's pages are shared with mem until written, on
+        // both sides (mem's own bytes are loaned to the fork).
+        for &addr in &addrs {
+            assert!(!fork.write_cached(addr, [7; 8]), "{addr:#x}");
+            assert!(!mem.write_cached(addr, [7; 8]), "{addr:#x}");
+        }
+        assert_eq!(fork.read_u64(base + P + 8).unwrap(), 0x2222);
+        fork.write_slow(base + 8, [1; 8]).unwrap(); // copies the page
+        assert!(fork.write_cached(base + 16, [2; 8]));
+        assert_eq!(fork.read_u64(base + 16).unwrap(), 0x0202_0202_0202_0202);
+        // mem's page is its own again (the fork copied), but cold.
+        assert!(!mem.write_cached(base + 3 * P + 8, [3; 8])); // read-only
+        mem.write_slow(base + 8, [4; 8]).unwrap();
+        assert!(mem.write_cached(base + 24, [5; 8]));
+        assert_eq!(mem.read_u64(base + 24).unwrap(), 0x0505_0505_0505_0505);
+        assert_eq!(fork.read_u64(base + 24).unwrap(), 0);
+        assert_eq!(mem.read_u64(base + P + 8).unwrap(), 0x2222);
+        // Without the fork, mem's pages are its own: only the attributes
+        // decide.
+        drop(fork);
+        assert!(mem.write_cached(base + P + 16, [6; 8]));
+        assert!(!mem.write_cached(base + 3 * P + 8, [6; 8])); // read-only
+        assert_eq!(mem.read_u64(base + 3 * P + 8).unwrap(), 0x4444);
+    }
+
     /// The native memcpy outside the arena copies a page-bounded chunk at
     /// a time; it must leave memory, faults and created pages exactly as
     /// C++'s loop of loads and stores (`memcpy_within_elementwise`) does.
@@ -1623,6 +1803,14 @@ mod tests {
             (MIB, far + 0x10_0003, top + 5, 2 * P + 0x3000, None, None),
             // dst wrapping.
             (MIB, top + 8, far + 8, 3 * P, None, None),
+            // dst just ahead: the first bytes repeat, over page
+            // boundaries, up to a fault.
+            (MIB, far + 3, far, 3 * P + 7, None, None),
+            (MIB, far + 24, far, 3 * P, None, None),
+            (MIB, far + P - 1, far, 3 * P, None, None),
+            (MIB, far + P + 5, far + 2, 3 * P, None, None),
+            (MIB, far + 5, far, 5 * P, Some(far + 3 * P), None),
+            (MIB, far + 3, far, 5 * P, None, Some(far + 2 * P)),
         ];
         for (i, &(max, dst, src, len, unreadable, read_only_page)) in cases.iter().enumerate() {
             let setup = || {
@@ -1671,5 +1859,21 @@ mod tests {
         let a = 0x10_0000_0000;
         mem.memcpy_within(a + 0x1000_0003, a, 16 * MIB).unwrap();
         assert!(start.elapsed().as_secs() < 2, "{:?}", start.elapsed());
+    }
+
+    /// A native memcpy of 48 MiB with the destination a byte ahead of the
+    /// source, so each store reaches the next load (the first byte
+    /// repeats): the forward counterpart of
+    /// `a_long_memmove_backward_onto_its_own_source_is_fast`.
+    #[test]
+    fn a_long_memcpy_onto_its_own_source_is_fast() {
+        let mut mem = empty_memory(128 * MIB);
+        let a = 0x10_0000_0000;
+        mem.memcpy(a, &[7, 9]).unwrap();
+        let start = std::time::Instant::now();
+        mem.memcpy_within(a + 1, a, 48 * MIB).unwrap();
+        assert!(start.elapsed().as_secs() < 2, "{:?}", start.elapsed());
+        assert_eq!(mem.read_u8(a + 1).unwrap(), 7);
+        assert_eq!(mem.read_u8(a + 48 * MIB).unwrap(), 7);
     }
 }

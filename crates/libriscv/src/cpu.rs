@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use crate::decoder_cache::{COMPRESSED, DecodedSegment};
+use crate::dispatch::{self, Counter};
 use crate::error::{ExceptionKind, MachineError, Result};
 use crate::instruction::Instr;
 use crate::machine::Machine;
@@ -147,15 +148,17 @@ impl Machine {
     /// FENCE.I-style self-modification) becomes executable. Anything else
     /// is an execute fault. Returns the PC to continue at.
     pub(crate) fn next_execute_segment(&mut self, pc: u64) -> Result<u64> {
-        let found = self.memory.exec_segment_for(pc);
-        if let Some(segment) = &found
+        if let Some(segment) = self.memory.exec_segment_ref(pc)
             && !segment.is_stale()
         {
-            self.cpu.exec = Arc::clone(segment);
+            if !Arc::ptr_eq(segment, &self.cpu.exec) {
+                self.cpu.exec = Arc::clone(segment);
+            }
             // Reached a usable segment, reset the no-progress guard.
             self.cpu.stale_restart_pc = u64::MAX;
             return Ok(pc);
         }
+        let found = self.memory.exec_segment_for(pc);
         // Read-fault handlers could be reading PC.
         self.cpu.regs.pc = pc;
         self.cpu.exec = found
@@ -201,6 +204,32 @@ impl Machine {
             self.cpu.stale_restart_pc = u64::MAX;
         }
         Ok(pc)
+    }
+
+    /// A jump out of the current segment to a STOP that begins a block of
+    /// another usable segment (a VM call returning to the exit function):
+    /// the result of switching to that segment and running the STOP
+    /// (`BEGIN_BLOCK`, then [`dispatch::stop`]), without switching. Each switch
+    /// clones and drops a segment `Arc` (atomic operations), and the next
+    /// VM call would switch back. `None` where the switch or the block
+    /// does anything else.
+    pub(crate) fn stop_in_other_segment(&mut self, pc: u64, c: Counter) -> Option<(Counter, u64)> {
+        let exec = self.memory.exec_segment_ref(pc)?;
+        if exec.is_stale() {
+            return None;
+        }
+        let i = exec.index(pc);
+        let e = exec.cache.get(i)?;
+        if !std::ptr::fn_addr_eq(e.handler, dispatch::stop as dispatch::Handler)
+            || exec.native.as_ref().is_some_and(|n| n.has_entry(i))
+        {
+            return None;
+        }
+        // As next_execute_segment does on reaching a usable segment.
+        self.cpu.stale_restart_pc = u64::MAX;
+        let block_pc = pc.wrapping_add(e.block_bytes());
+        let value = c.value.wrapping_add(e.instruction_count());
+        Some((Counter { value, max: 0 }, block_pc.wrapping_add(4)))
     }
 
     /// Port of `CPU::simulate_precise`: execute one instruction at a time

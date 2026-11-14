@@ -40,18 +40,25 @@ use crate::registers::REG_ECALL;
 
 /// The signature shared by all handlers: the current execute segment, its
 /// decoder cache (in registers, which saves two loads per instruction), the
-/// index of this handler's decoder entry, the machine, the dispatcher's
-/// `pc` (the last instruction of the current block), the counters, and the
+/// index of this handler's decoder entry, the machine, the counters, the
 /// entry's instruction bits (re-encoded by the rewriter for fast bytecodes,
-/// the original instruction otherwise).
+/// the original instruction otherwise), and the dispatcher's `pc` (the last
+/// instruction of the current block).
+///
+/// The order decides the registers (`preserve_none` on x86-64: r12, r13,
+/// r14, r15, rdi, rsi, rdx, rcx, r8, ...). It puts the instruction bits in
+/// rcx: a variable shift takes its count in cl, and the shift immediates
+/// are the low bits of the re-encoded instruction, so the shift handlers
+/// use them in place instead of saving and restoring a live rcx (CoreMark
+/// rv64imafdc: 4.5% fewer cycles than with the counters in rdx/rcx).
 pub(crate) type Handler = extern "rust-preserve-none" fn(
     &DecodedSegment,
     &[DecoderEntry],
     usize,
     &mut Machine,
-    u64,
     Counter,
     u32,
+    u64,
 ) -> Exit;
 
 /// The instruction counter and limit, kept in registers while dispatching
@@ -204,9 +211,9 @@ pub(crate) extern "rust-preserve-none" fn halt_exit(
     _cache: &[DecoderEntry],
     _i: usize,
     m: &mut Machine,
-    pc: u64,
     c: Counter,
     _ins: u32,
+    pc: u64,
 ) -> Exit {
     halt(m, pc, c)
 }
@@ -219,9 +226,9 @@ pub(crate) extern "rust-preserve-none" fn leave_exit(
     _cache: &[DecoderEntry],
     _i: usize,
     m: &mut Machine,
-    pc: u64,
     c: Counter,
     _ins: u32,
+    pc: u64,
 ) -> Exit {
     leave_segment(m, pc, c)
 }
@@ -234,9 +241,9 @@ pub(crate) extern "rust-preserve-none" fn bad_entry_exit(
     _cache: &[DecoderEntry],
     _i: usize,
     m: &mut Machine,
-    pc: u64,
     _c: Counter,
     _ins: u32,
+    pc: u64,
 ) -> Exit {
     bad_entry(m, pc)
 }
@@ -246,7 +253,7 @@ macro_rules! entry {
     ($exec:ident, $cache:ident, $i:expr, $m:ident, $pc:expr, $c:expr) => {
         match $cache.get($i) {
             Some(e) => e,
-            None => become $crate::dispatch::bad_entry_exit($exec, $cache, 0, $m, $pc, $c, 0),
+            None => become $crate::dispatch::bad_entry_exit($exec, $cache, 0, $m, $c, 0, $pc),
         }
     };
 }
@@ -258,7 +265,7 @@ macro_rules! execute {
     ($exec:ident, $cache:ident, $i:expr, $m:ident, $pc:expr, $c:expr) => {{
         let i: usize = $i;
         let e = $crate::dispatch::entry!($exec, $cache, i, $m, $pc, $c);
-        become (e.handler)($exec, $cache, i, $m, $pc, $c, e.instr)
+        become (e.handler)($exec, $cache, i, $m, $c, e.instr, $pc)
     }};
 }
 pub(crate) use execute;
@@ -274,7 +281,7 @@ macro_rules! begin_block {
             value: c.value.wrapping_add(e.instruction_count()),
             max: c.max,
         };
-        become (e.handler)($exec, $cache, i, $m, pc, c, e.instr)
+        become (e.handler)($exec, $cache, i, $m, c, e.instr, pc)
     }};
 }
 pub(crate) use begin_block;
@@ -289,7 +296,7 @@ macro_rules! next_block {
         let pc: u64 = ($pc).wrapping_add_signed(len);
         let i: usize = ($i).wrapping_add_signed((len >> $crate::decoder_cache::SHIFT) as isize);
         if $of && c.overflowed() {
-            become $crate::dispatch::halt_exit($exec, $cache, 0, $m, pc, c, 0);
+            become $crate::dispatch::halt_exit($exec, $cache, 0, $m, c, 0, pc);
         }
         $crate::dispatch::begin_block!($exec, $cache, i, $m, pc, c)
     }};
@@ -303,7 +310,7 @@ macro_rules! unchecked_jump {
         let pc: u64 = $pc;
         let c: $crate::dispatch::Counter = $c;
         if !(pc >= $exec.exec_begin() && pc < $exec.exec_end()) {
-            become $crate::dispatch::leave_exit($exec, $cache, 0, $m, pc, c, 0);
+            become $crate::dispatch::leave_exit($exec, $cache, 0, $m, c, 0, pc);
         }
         $crate::dispatch::begin_block!($exec, $cache, $exec.index(pc), $m, pc, c)
     }};
@@ -316,7 +323,7 @@ macro_rules! overflow_checked_jump {
         let pc: u64 = $pc;
         let c: $crate::dispatch::Counter = $c;
         if c.overflowed() {
-            become $crate::dispatch::halt_exit($exec, $cache, 0, $m, pc, c, 0);
+            become $crate::dispatch::halt_exit($exec, $cache, 0, $m, c, 0, pc);
         }
         $crate::dispatch::unchecked_jump!($exec, $cache, $m, pc, c)
     }};
@@ -328,14 +335,15 @@ pub(crate) use overflow_checked_jump;
 /// FUNCTION's stale-segment check (FMADD). The entry holds the original
 /// instruction bits.
 #[cfg(feature = "ext-f")]
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn seq<O: Op>(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
-    pc: u64,
     c: Counter,
     ins: u32,
+    pc: u64,
 ) -> Exit {
     if let Err(err) = O::exec(m, Instr(ins)) {
         return fault(m, err);
@@ -346,14 +354,15 @@ pub(crate) extern "rust-preserve-none" fn seq<O: Op>(
 /// C++ `RV32C_BC_FUNCTION`: a compressed instruction executed through its
 /// precise handler, continuing with the next entry. Unlike
 /// `RV32I_BC_FUNCTION` it doesn't check for a stale segment afterwards.
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn cseq<O: Op>(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
-    pc: u64,
     c: Counter,
     ins: u32,
+    pc: u64,
 ) -> Exit {
     if let Err(err) = O::exec(m, Instr(ins)) {
         return fault(m, err);
@@ -364,14 +373,15 @@ pub(crate) extern "rust-preserve-none" fn cseq<O: Op>(
 /// C++ `RV32I_BC_FUNCTION`: a slow-path instruction in the middle of a
 /// block. Like C++ it re-checks the segment afterwards, since the
 /// instruction may have made it stale (FENCE.I).
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn function<O: Op>(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
-    pc: u64,
     c: Counter,
     ins: u32,
+    pc: u64,
 ) -> Exit {
     if let Err(err) = O::exec(m, Instr(ins)) {
         return fault(m, err);
@@ -385,14 +395,15 @@ pub(crate) extern "rust-preserve-none" fn function<O: Op>(
 
 /// C++ `RV32I_BC_FUNCBLOCK`: the last instruction of an over-long block,
 /// executed precisely (with `pc` visible to it).
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn funcblock<O: Op>(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
-    pc: u64,
     c: Counter,
     ins: u32,
+    pc: u64,
 ) -> Exit {
     let instr = Instr(ins);
     m.cpu.regs.pc = exec.address_of(i);
@@ -407,14 +418,15 @@ pub(crate) extern "rust-preserve-none" fn funcblock<O: Op>(
 }
 
 /// ECALL (C++ `rv32i_syscall`).
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn syscall(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
-    pc: u64,
     c: Counter,
     _ins: u32,
+    pc: u64,
 ) -> Exit {
     // Make the current PC and the counters visible to the handler.
     m.cpu.regs.pc = pc;
@@ -438,14 +450,15 @@ pub(crate) extern "rust-preserve-none" fn syscall(
 }
 
 /// WFI and the STOP instruction (C++ `rv32i_stop`).
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn stop(
     _exec: &DecodedSegment,
     _cache: &[DecoderEntry],
     _i: usize,
     m: &mut Machine,
-    pc: u64,
     c: Counter,
     _ins: u32,
+    pc: u64,
 ) -> Exit {
     // Complete the STOP instruction, and stop.
     halt(
@@ -459,14 +472,15 @@ pub(crate) extern "rust-preserve-none" fn stop(
 }
 
 /// Other SYSTEM instructions: EBREAK, CSRs (C++ `rv32i_system`).
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn system(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
-    pc: u64,
     c: Counter,
     ins: u32,
+    pc: u64,
 ) -> Exit {
     let instr = Instr(ins);
     m.cpu.regs.pc = pc;
@@ -490,14 +504,15 @@ pub(crate) extern "rust-preserve-none" fn system(
 /// C++ `execute_invalid`: an entry that can't be executed from the cache.
 /// Entries without instruction bits (the middle of a 4-byte instruction)
 /// are executed precisely from the segment's code instead.
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn execute_invalid(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
-    _pc: u64,
     c: Counter,
     ins: u32,
+    _pc: u64,
 ) -> Exit {
     // The current PC, mid block.
     let pc = exec.address_of(i);
@@ -539,14 +554,15 @@ pub(crate) extern "rust-preserve-none" fn execute_invalid(
 /// a decoder block, such as a loop head, which can't be patched because the
 /// interpreter falls through them. Then the entry's own handler is the
 /// interpreter's.
+#[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn native_enter(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
-    pc: u64,
     c: Counter,
     ins: u32,
+    pc: u64,
 ) -> Exit {
     use crate::native_code::NativeExit;
 
@@ -560,7 +576,7 @@ pub(crate) extern "rust-preserve-none" fn native_enter(
     // code runs can make the segment stale, so checking once is enough.)
     if exec.is_stale() {
         let handler = jit.original_handler(i).unwrap_or(e.handler);
-        become handler(exec, cache, i, m, pc, c, ins)
+        become handler(exec, cache, i, m, c, ins, pc)
     }
     let (mut slot, mut entry_pc) = (i, start);
     // Native code counts the block it begins at, so it's entered with the
@@ -618,12 +634,12 @@ pub(crate) extern "rust-preserve-none" fn native_enter(
                     cache,
                     si,
                     m,
-                    block_pc,
                     Counter {
                         value: counter,
                         max: c.max,
                     },
                     e.instr,
+                    block_pc,
                 )
             }
             NativeExit::Dyncall { pc, counter } => {
@@ -700,19 +716,19 @@ pub(crate) extern "rust-preserve-none" fn native_enter(
                 let e = entry!(exec, cache, si, m, next, c);
                 let handler = jit.original_handler(si).unwrap_or(e.handler);
                 let block_pc = next.wrapping_add(e.block_bytes());
-                become handler(exec, cache, si, m, block_pc, c, e.instr)
+                become handler(exec, cache, si, m, c, e.instr, block_pc)
             }
             NativeExit::Fault(err) => return fault(m, err),
             NativeExit::Unavailable if slot == i => {
                 let handler = jit.original_handler(i).unwrap_or(e.handler);
-                become handler(exec, cache, i, m, pc, c, ins)
+                become handler(exec, cache, i, m, c, ins, pc)
             }
             NativeExit::Unavailable => {
                 // Re-entry after a dyncall: finish its block in the interpreter.
                 let e = entry!(exec, cache, slot, m, entry_pc, c);
                 let handler = jit.original_handler(slot).unwrap_or(e.handler);
                 let block_pc = entry_pc.wrapping_add(e.block_bytes());
-                become handler(exec, cache, slot, m, block_pc, c, e.instr)
+                become handler(exec, cache, slot, m, c, e.instr, block_pc)
             }
         }
     }
@@ -885,10 +901,13 @@ impl Machine {
                 Some(native) if native.has_entry(i) && !exec.is_stale() => native_enter,
                 _ => e.handler,
             };
-            match handler(&exec, &exec.cache, i, self, block_pc, c, e.instr) {
+            match handler(&exec, &exec.cache, i, self, c, e.instr, block_pc) {
                 Exit::Halt => return Ok((self.dispatch.counter, self.dispatch.pc)),
                 Exit::Jump => {
                     c = self.dispatch.counter;
+                    if let Some(stopped) = self.stop_in_other_segment(self.dispatch.pc, c) {
+                        return Ok(stopped);
+                    }
                     pc = self.next_execute_segment(self.dispatch.pc)?;
                     // The new segment may be compiling in the background.
                     #[cfg(feature = "jit")]
