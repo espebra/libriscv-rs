@@ -1488,9 +1488,12 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   arena shortcut included; tested against the loop): one native memcpy of
   up to 512 MiB runs before its penalty is charged. The native memmove's
   backward copy (`Memory::memmove_backward`, when `dst >= src`) does the
-  same: page-bounded chunks from the end, no longer than the distance by
-  which `dst` is behind `src` modulo 2^64, matching C++'s loop of word or
-  byte loads and stores from the end (tested against it).
+  same: page-bounded chunks from the end, matching C++'s loop of word or
+  byte loads and stores from the end (tested against it). Where the
+  loop's stores reach its later loads (`dst` just ahead of `src` going
+  forwards, or just behind it modulo 2^64 going backwards), the bytes
+  repeat with that period; a chunk repeats them the same way rather than
+  shrinking to the distance (a byte at a time for `memmove(-1, 0, n)`).
 - `native/backtrace.rs`: `Memory::lookup`/`print_backtrace` as
   `Machine::lookup`/`print_backtrace`, without demangling (C++ demangles
   with `__cxa_demangle` when built with `DEMANGLE_ENABLED`).

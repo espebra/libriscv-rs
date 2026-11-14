@@ -1402,6 +1402,15 @@ mod tests {
             ),
             (MIB, far, far + 8, 0u64.wrapping_sub(8), None, None),
             (MIB, far, far + 3, 0u64.wrapping_sub(3), None, None),
+            // dst just behind src: the top bytes repeat downwards, over
+            // page boundaries, up to a fault.
+            (MIB, far, far + 1, 3 * P + 5, None, None),
+            (MIB, far + 3, far + 8, 3 * P, None, None),
+            (MIB, far, far + 24, 3 * P, None, None),
+            (MIB, far + 8, far + P + 16, 3 * P, None, None),
+            (MIB, far, far + P + 3, 3 * P, None, None),
+            (MIB, far, far + 5, 5 * P, Some(far + 3 * P), None),
+            (MIB, far, far + 3, 5 * P, None, Some(far + P)),
         ];
         for (i, &(max, dst, src, len, unreadable, read_only_page)) in cases.iter().enumerate() {
             // The huge lengths fault (or run out of memory) on the way;
@@ -1453,6 +1462,23 @@ mod tests {
         let a = 0x10_0000_0000;
         mem.memmove_backward(a + 0x1000_0003, a, 16 * MIB).unwrap();
         assert!(start.elapsed().as_secs() < 2, "{:?}", start.elapsed());
+    }
+
+    /// A native memmove's backward copy of 48 MiB with the destination a
+    /// byte behind the source modulo 2^64, so each store reaches the next
+    /// load: `forkfuzzer` inputs (`memmove(-1, 0, 19 MiB)`) took 2 s per
+    /// machine copying a byte per chunk.
+    #[test]
+    fn a_long_memmove_backward_onto_its_own_source_is_fast() {
+        let mut mem = empty_memory(128 * MIB);
+        let a = 0x10_0000_0000;
+        mem.memcpy(a + 48 * MIB - 1, &[7, 9]).unwrap();
+        let start = std::time::Instant::now();
+        mem.memmove_backward(a, a + 1, 48 * MIB).unwrap();
+        assert!(start.elapsed().as_secs() < 2, "{:?}", start.elapsed());
+        // The last source byte repeats down to the start.
+        assert_eq!(mem.read_u8(a).unwrap(), 9);
+        assert_eq!(mem.read_u8(a + 48 * MIB - 1).unwrap(), 9);
     }
 
     /// `set_page_attr` changes runs of existing pages through the index;
@@ -1732,6 +1758,14 @@ mod tests {
             (MIB, far + 0x10_0003, top + 5, 2 * P + 0x3000, None, None),
             // dst wrapping.
             (MIB, top + 8, far + 8, 3 * P, None, None),
+            // dst just ahead: the first bytes repeat, over page
+            // boundaries, up to a fault.
+            (MIB, far + 3, far, 3 * P + 7, None, None),
+            (MIB, far + 24, far, 3 * P, None, None),
+            (MIB, far + P - 1, far, 3 * P, None, None),
+            (MIB, far + P + 5, far + 2, 3 * P, None, None),
+            (MIB, far + 5, far, 5 * P, Some(far + 3 * P), None),
+            (MIB, far + 3, far, 5 * P, None, Some(far + 2 * P)),
         ];
         for (i, &(max, dst, src, len, unreadable, read_only_page)) in cases.iter().enumerate() {
             let setup = || {
@@ -1780,5 +1814,21 @@ mod tests {
         let a = 0x10_0000_0000;
         mem.memcpy_within(a + 0x1000_0003, a, 16 * MIB).unwrap();
         assert!(start.elapsed().as_secs() < 2, "{:?}", start.elapsed());
+    }
+
+    /// A native memcpy of 48 MiB with the destination a byte ahead of the
+    /// source, so each store reaches the next load (the first byte
+    /// repeats): the forward counterpart of
+    /// `a_long_memmove_backward_onto_its_own_source_is_fast`.
+    #[test]
+    fn a_long_memcpy_onto_its_own_source_is_fast() {
+        let mut mem = empty_memory(128 * MIB);
+        let a = 0x10_0000_0000;
+        mem.memcpy(a, &[7, 9]).unwrap();
+        let start = std::time::Instant::now();
+        mem.memcpy_within(a + 1, a, 48 * MIB).unwrap();
+        assert!(start.elapsed().as_secs() < 2, "{:?}", start.elapsed());
+        assert_eq!(mem.read_u8(a + 1).unwrap(), 7);
+        assert_eq!(mem.read_u8(a + 48 * MIB).unwrap(), 7);
     }
 }
