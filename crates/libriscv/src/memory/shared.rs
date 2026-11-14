@@ -160,41 +160,58 @@ mod enabled {
     /// remembered for the next machine; an identical existing one if
     /// another machine created it meanwhile.
     fn create_image(key: &RodataKey, src: &[u8]) -> Option<Arc<RodataImage>> {
-        let seen = candidates(key);
+        create_image_with(key, src, &mut || {})
+    }
+
+    /// `create_image`, calling `before_publish` (without the lock held)
+    /// before each attempt to publish, which tests use to publish competing
+    /// images at the worst moment.
+    ///
+    /// C++ holds its lock throughout. Here the lock is dropped to compare
+    /// and create, so the image is only published once nothing new
+    /// appeared since the last comparison: otherwise two machines that
+    /// both rejected a third program's image (programs often share a
+    /// layout) would publish one each.
+    fn create_image_with(
+        key: &RodataKey,
+        src: &[u8],
+        before_publish: &mut dyn FnMut(),
+    ) -> Option<Arc<RodataImage>> {
+        let mut seen = candidates(key);
         if let Some(existing) = find_verified(&seen, |image| image == src) {
             return Some(existing);
         }
         let image = Arc::new(RodataImage::new(src).ok()?);
-        let newer: Vec<Arc<RodataImage>> = {
-            let mut map = images();
-            // Creating an image is rare: sweep the programs that were
-            // loaded once and never again.
-            map.retain(|_, list| {
-                list.retain(|w| w.strong_count() > 0);
-                !list.is_empty()
-            });
-            let list = map.entry(key.clone()).or_default();
-            let newer: Vec<_> = list
-                .iter()
-                .filter_map(Weak::upgrade)
-                .filter(|image| !seen.iter().any(|s| Arc::ptr_eq(s, image)))
-                .collect();
-            if newer.is_empty() {
-                list.push(Arc::downgrade(&image));
-                return Some(image);
+        loop {
+            before_publish();
+            let newer: Vec<Arc<RodataImage>> = {
+                let mut map = images();
+                // Creating an image is rare: sweep the programs that were
+                // loaded once and never again.
+                map.retain(|_, list| {
+                    list.retain(|w| w.strong_count() > 0);
+                    !list.is_empty()
+                });
+                let list = map.entry(key.clone()).or_default();
+                let newer: Vec<_> = list
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .filter(|image| !seen.iter().any(|s| Arc::ptr_eq(s, image)))
+                    .collect();
+                if newer.is_empty() {
+                    list.push(Arc::downgrade(&image));
+                    return Some(image);
+                }
+                newer
+            };
+            // Others published images for this layout while ours was
+            // being created: use theirs if it is the same program.
+            if let Some(existing) = find_verified(&newer, |image| image == src) {
+                return Some(existing);
             }
-            newer
-        };
-        // Others published images for this layout while ours was being
-        // created: use theirs if it is the same program.
-        if let Some(existing) = find_verified(&newer, |image| image == src) {
-            return Some(existing);
+            // Ends: every round sees more images, and they are finite.
+            seen.extend(newer);
         }
-        images()
-            .entry(key.clone())
-            .or_default()
-            .push(Arc::downgrade(&image));
-        Some(image)
     }
 
     /// One read-only segment, and where in the binary its bytes are.
@@ -396,6 +413,53 @@ mod enabled {
                 .image
                 .as_ref()
                 .map_or(0, |image| image.len() as u64)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #![allow(clippy::unwrap_used)]
+        use super::*;
+
+        /// A layout no machine of the other tests has.
+        fn key(arena_size: u64) -> RodataKey {
+            RodataKey {
+                rodata_end: 4096,
+                arena_size,
+                segments: vec![RodataSegment {
+                    vaddr: 0,
+                    size: 4096,
+                }],
+            }
+        }
+
+        /// Two machines of one program that both reject another program's
+        /// image of the same layout end up on one image: the one that
+        /// publishes second sees the first one's.
+        #[test]
+        fn creators_racing_past_a_foreign_image_publish_once() {
+            if !libriscv_jit_rt::shared_rodata_supported() {
+                return;
+            }
+            let key = key(0x5eed_1000);
+            let ours = vec![1u8; 4096];
+            let (mut foreign, mut competitor) = (None, None);
+            // While the first creator makes its image, another program
+            // publishes one. Once the first has rejected that, a second
+            // creator of ours (which saw the foreign image from the start,
+            // so had nothing new to look at) publishes before it.
+            let first = create_image_with(&key, &ours, &mut || {
+                if foreign.is_none() {
+                    foreign = create_image(&key, &[2u8; 4096]);
+                } else if competitor.is_none() {
+                    competitor = create_image(&key, &ours);
+                }
+            })
+            .unwrap();
+            let (foreign, competitor) = (foreign.unwrap(), competitor.unwrap());
+            assert!(Arc::ptr_eq(&first, &competitor));
+            assert!(!Arc::ptr_eq(&first, &foreign));
+            assert_eq!(candidates(&key).len(), 2);
         }
     }
 }
