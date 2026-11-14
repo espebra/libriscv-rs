@@ -205,9 +205,11 @@ pub(super) struct PageTable {
     /// Arena pages in C++'s page table, a superset of the arena pages in
     /// `index`.
     arena: ArenaSet,
+    /// The arena pages in `index`: most arena pages have no entry, and a
+    /// lookup of one that misses the page cache needn't search `index`
+    /// (host copies into the arena, `memcpy`, go through the page table).
+    arena_indexed: ArenaSet,
     arena_pages: u64,
-    /// Entries of `index` that are arena pages.
-    arena_entries: usize,
     /// Pages with their own data (C++ `owned_pages_active`).
     owned: usize,
     /// Maximum number of page table entries (C++ `m_pages_max`).
@@ -231,8 +233,8 @@ impl PageTable {
             free_slots: Vec::new(),
             cache: empty_page_cache(),
             arena: ArenaSet::new(arena_pages),
+            arena_indexed: ArenaSet::new(arena_pages),
             arena_pages,
-            arena_entries: 0,
             owned: 0,
             pages_max,
             fault_limit,
@@ -277,6 +279,9 @@ impl PageTable {
 
     #[inline(never)]
     fn slot_of_uncached(&self, pageno: u64, cached: &AtomicUsize) -> Option<usize> {
+        if pageno < self.arena_pages && !self.arena_indexed.contains(pageno) {
+            return None;
+        }
         let slot = *self.index.get(&pageno)?;
         cached.store(slot.wrapping_add(1), Relaxed);
         Some(slot)
@@ -351,8 +356,8 @@ impl PageTable {
         };
         self.index.insert(pageno, slot);
         if pageno < self.arena_pages {
-            self.arena_entries += 1;
             self.arena.insert(pageno);
+            self.arena_indexed.insert(pageno);
         }
         slot
     }
@@ -372,7 +377,7 @@ impl PageTable {
             self.free_slots.push(slot);
         }
         if pageno < self.arena_pages {
-            self.arena_entries -= 1;
+            self.arena_indexed.remove(pageno);
         }
         true
     }
@@ -393,8 +398,8 @@ impl PageTable {
             free_slots,
             cache: empty_page_cache(),
             arena: ArenaSet::default(),
+            arena_indexed: ArenaSet::default(),
             arena_pages: 0,
-            arena_entries: 0,
             owned,
             pages_max: self.pages_max,
             fault_limit: self.fault_limit,
@@ -402,9 +407,31 @@ impl PageTable {
         }
     }
 
+    /// Tests: `arena_indexed` holds exactly the arena pages with an entry,
+    /// and lookups that miss the page cache agree with the index.
+    #[cfg(test)]
+    pub(super) fn check_arena_indexed(&self) {
+        for pageno in 0..self.arena_pages {
+            let indexed = self.index.contains_key(&pageno);
+            assert_eq!(
+                self.arena_indexed.contains(pageno),
+                indexed,
+                "page {pageno}"
+            );
+            let cached = self.cache.get(pageno as usize % PAGE_CACHE_SIZE).unwrap();
+            assert_eq!(
+                self.slot_of_uncached(pageno, cached),
+                self.index.get(&pageno).copied(),
+                "page {pageno}"
+            );
+        }
+        let in_arena = self.index.range(..self.arena_pages).count();
+        assert_eq!(self.arena_indexed.count(), in_arena);
+    }
+
     /// Number of pages in C++'s page table.
     fn active(&self) -> usize {
-        self.index.len() - self.arena_entries + self.arena.count()
+        self.index.len() - self.arena_indexed.count() + self.arena.count()
     }
 
     /// C++ `default_page_write` (`Page::make_writable`): give a

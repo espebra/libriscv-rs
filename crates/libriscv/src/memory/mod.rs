@@ -1554,6 +1554,34 @@ mod tests {
         assert!(start.elapsed().as_secs() < 4, "{:?}", start.elapsed());
     }
 
+    /// Arena pages get page table entries from their attributes and lose
+    /// them when freed; lookups that miss the page cache skip the index
+    /// for arena pages without one, which must agree with the index.
+    #[test]
+    fn arena_page_entries_are_tracked() {
+        const P: u64 = PAGE_SIZE;
+        let mut mem = empty_memory(MIB);
+        let read_only = PageAttributes {
+            write: false,
+            ..PageAttributes::default()
+        };
+        mem.paging.check_arena_indexed();
+        mem.set_page_attr(4 * P, 3 * P, read_only).unwrap();
+        mem.set_page_attr(100 * P, P, read_only).unwrap();
+        mem.write_u64(50 * P, 1).unwrap();
+        mem.paging.check_arena_indexed();
+        assert_eq!(mem.page_attributes(5 * P).unwrap(), read_only);
+        mem.free_pages(5 * P, P);
+        mem.paging.check_arena_indexed();
+        mem.set_page_attr(4 * P, 4 * P, PageAttributes::default())
+            .unwrap();
+        mem.memdiscard(100 * P, P, true).unwrap();
+        mem.paging.check_arena_indexed();
+        mem.memcpy(4 * P - 3, &[7; 3 * PAGE_SIZE as usize]).unwrap();
+        mem.paging.check_arena_indexed();
+        assert_eq!(mem.read_u8(6 * P).unwrap(), 7);
+    }
+
     /// The page cache shortcuts of the interpreter's paged loads and
     /// stores give what the page-table path gives, or leave it to it:
     /// loads of every kind of page (own, a fork's loaned, zero, unreadable,
