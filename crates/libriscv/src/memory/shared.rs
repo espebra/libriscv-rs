@@ -45,6 +45,15 @@ mod disabled {
         Vec::new()
     }
 
+    /// A vector can't hand pages back: the caller zeroes the bytes.
+    pub(crate) const fn zero_arena_pages(_: &mut Arena, _: usize, _: usize) -> bool {
+        false
+    }
+
+    pub(crate) const fn host_page_size() -> usize {
+        4096
+    }
+
     /// Nothing is ever shared.
     impl Memory {
         pub(crate) const fn prepare_shared_rodata(
@@ -83,6 +92,17 @@ mod enabled {
 
     pub(crate) const fn empty_arena() -> Arena {
         GuestArena::empty()
+    }
+
+    /// Zero arena bytes `[start, start + len)` by dropping their host
+    /// pages, see [`GuestArena::zero_pages`]; false if the caller has to
+    /// zero them instead.
+    pub(crate) fn zero_arena_pages(arena: &mut Arena, start: usize, len: usize) -> bool {
+        arena.zero_pages(start, len)
+    }
+
+    pub(crate) fn host_page_size() -> usize {
+        libriscv_jit_rt::host_page_size()
     }
 
     /// One read-only region of a program in guest memory (C++

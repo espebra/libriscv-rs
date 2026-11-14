@@ -7,7 +7,9 @@
 //! `[u8]` that the interpreter indexes and native code addresses from its
 //! base. [`GuestArena::attach`] maps a [`RodataImage`] over the start of it,
 //! so that machines loaded from the same program hold its text and rodata
-//! in host memory once.
+//! in host memory once. [`GuestArena::zero_pages`] hands pages back to the
+//! kernel (`madvise(MADV_DONTNEED)`, as C++ `memdiscard` does), which
+//! zeroes them without touching them.
 //!
 //! # Differences from C++
 //!
@@ -61,6 +63,9 @@ pub struct GuestArena {
     /// The mapping `ptr` points into (none for the empty arena), unmapped
     /// on drop, attached images included.
     map: Option<MmapMut>,
+    /// The length of the image attached at the start, 0 for none: pages
+    /// that [`GuestArena::zero_pages`] must not drop.
+    attached: usize,
 }
 
 // SAFETY: the arena exclusively owns its mapping, like a `Box<[u8]>`, and
@@ -87,6 +92,7 @@ impl GuestArena {
             ptr: NonNull::dangling(),
             len: 0,
             map: None,
+            attached: 0,
         }
     }
 
@@ -101,6 +107,7 @@ impl GuestArena {
             ptr,
             len: map.len(),
             map: Some(map),
+            attached: 0,
         })
     }
 
@@ -138,6 +145,7 @@ impl GuestArena {
         #[allow(unsafe_code)]
         let mapped = unsafe { sys::map_image_fixed(base, len, &image.file) };
         let Err(error) = mapped else {
+            self.attached = self.attached.max(len);
             return Ok(());
         };
         // SAFETY: as above, our own range, borrowed by nothing.
@@ -151,6 +159,61 @@ impl GuestArena {
             range.copy_from_slice(&view);
         }
         Err(error)
+    }
+}
+
+impl GuestArena {
+    /// Zero `[start, start + len)` by handing its pages back to the kernel
+    /// (`madvise(MADV_DONTNEED)`, what C++ `memdiscard` does to its
+    /// arena): the next read of each page gets a fresh zero page, and the
+    /// host memory behind them is released. Pages that were never touched
+    /// cost nothing, where writing (or even reading) them would fault
+    /// every one in.
+    ///
+    /// True when the range now reads as zeroes. False, with the arena
+    /// unchanged, when it can't be done this way and the caller has to
+    /// zero the bytes itself: not on Linux (elsewhere `MADV_DONTNEED` may
+    /// keep the contents), `start` or `len` not a multiple of the host
+    /// page size, the range not inside the arena, or overlapping an
+    /// attached image (its pages would read as the image again, not as
+    /// zeroes), or the call failing.
+    pub fn zero_pages(&mut self, start: usize, len: usize) -> bool {
+        let page = host_page_size();
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        if !cfg!(target_os = "linux")
+            || len == 0
+            || !start.is_multiple_of(page)
+            || !len.is_multiple_of(page)
+            || end > self.len
+            || start < self.attached
+        {
+            return false;
+        }
+        let Some(map) = self.map.as_ref() else {
+            return false;
+        };
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: `[start, end)` is whole pages of our own private
+            // anonymous mapping (checked above: `ptr` is the mapping's
+            // start, so memmap2 doesn't widen the range to align it), past
+            // any attached image, and `&mut self` means nothing borrows
+            // them. On Linux, such pages read as zeroes after
+            // `MADV_DONTNEED`, which is the effect wanted; the mapping
+            // itself, and so `ptr` and `len`, stay as they are.
+            #[allow(unsafe_code)]
+            let dropped = unsafe {
+                map.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, start, len)
+            };
+            dropped.is_ok()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = map;
+            false
+        }
     }
 }
 
@@ -452,6 +515,51 @@ mod tests {
         assert_eq!(arena[3 * 4096 + 4], 9);
         assert!(GuestArena::new(0).unwrap().is_empty());
         assert!(GuestArena::empty().is_empty());
+    }
+
+    #[test]
+    fn zero_pages_zeroes_whole_pages_on_linux() {
+        let page = host_page_size();
+        let mut arena = GuestArena::new(8 * page).unwrap();
+        arena.fill(7);
+        // Unaligned, empty, out of range: refused, nothing changes.
+        assert!(!arena.zero_pages(page + 1, page));
+        assert!(!arena.zero_pages(page, page - 1));
+        assert!(!arena.zero_pages(page, 0));
+        assert!(!arena.zero_pages(7 * page, 2 * page));
+        assert!(!arena.zero_pages(usize::MAX - page + 1, page));
+        assert!(arena.iter().all(|&b| b == 7));
+        let done = arena.zero_pages(2 * page, 3 * page);
+        assert_eq!(done, cfg!(target_os = "linux"));
+        if done {
+            assert!(arena[..2 * page].iter().all(|&b| b == 7));
+            assert!(arena[2 * page..5 * page].iter().all(|&b| b == 0));
+            assert!(arena[5 * page..].iter().all(|&b| b == 7));
+            // Still writable.
+            arena[3 * page] = 1;
+            assert_eq!(arena[3 * page], 1);
+        }
+        assert!(!GuestArena::empty().zero_pages(0, page));
+    }
+
+    #[test]
+    fn zero_pages_leaves_an_attached_image_alone() {
+        if !shared_rodata_supported() {
+            return;
+        }
+        let page = host_page_size();
+        let image = RodataImage::new(&vec![5u8; 2 * page]).unwrap();
+        let mut arena = GuestArena::new(6 * page).unwrap();
+        arena.attach(&image).unwrap();
+        arena[0] = 9; // a private copy of the first image page
+        assert!(!arena.zero_pages(0, page));
+        assert!(!arena.zero_pages(page, 2 * page));
+        assert_eq!(arena[0], 9);
+        assert!(arena[page..2 * page].iter().all(|&b| b == 5));
+        arena[3 * page] = 4;
+        assert!(arena.zero_pages(2 * page, 2 * page));
+        assert_eq!(arena[3 * page], 0);
+        assert!(arena[1..2 * page].iter().all(|&b| b == 5) && arena[0] == 9);
     }
 
     #[test]

@@ -1399,6 +1399,17 @@ one contiguous `[u8]`, so the interpreter's `arena_read`/`arena_write`,
 the JIT's base-pointer addressing and AOT code are untouched, and the cost
 is all at machine creation.
 
+The mapping also lets a discard of the arena (`memdiscard`: `madvise
+(MADV_DONTNEED)`, anonymous `mmap`, `munmap`) do what C++ does: hand whole
+host pages back to the kernel (`GuestArena::zero_pages`, Linux only,
+never over an attached image, whose pages would read as the image again)
+instead of zeroing them by hand, for ranges of 256 KiB or more. The
+`Vec<u8>` arena (no `jit` feature) can't, so it scans for non-zero 4 KiB
+chunks, and reading untouched pages faults each one in: Go guests discard
+large ranges over a hundred times at startup, which makes a Go hello world
+take about 370 ms there (184k page faults), against about 12 ms with the
+feature or in C++.
+
 Differences from C++:
 
 - **The image is mapped copy-on-write** (`PROT_READ | PROT_WRITE`,

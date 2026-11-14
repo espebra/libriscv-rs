@@ -1526,6 +1526,60 @@ mod tests {
         assert_eq!(mem.read_u8(MIB + 3).unwrap(), 0);
     }
 
+    /// Discarding large arena ranges zeroes exactly the range, edges not
+    /// on page boundaries included, whether the host pages are dropped
+    /// (the `jit` feature's mapping, on Linux) or written.
+    #[test]
+    fn discarding_a_large_arena_range_zeroes_exactly_it() {
+        let mut mem = empty_memory(16 * MIB);
+        let (start, len) = (MIB + 123, 5 * MIB + 77);
+        let marks = [
+            MIB,
+            start - 1,
+            start,
+            start + 4095,
+            2 * MIB,
+            start + len / 2,
+            start + len - 1,
+            start + len,
+            15 * MIB,
+        ];
+        for &a in &marks {
+            mem.write_u8(a, 0xA5).unwrap();
+        }
+        mem.memdiscard(start, len, true).unwrap();
+        for &a in &marks {
+            let inside = (start..start + len).contains(&a);
+            assert_eq!(
+                mem.read_u8(a).unwrap(),
+                if inside { 0 } else { 0xA5 },
+                "{a:#x}"
+            );
+        }
+        // Writable again afterwards.
+        mem.write_u8(start + 4096, 1).unwrap();
+        assert_eq!(mem.read_u8(start + 4096).unwrap(), 1);
+    }
+
+    /// Go guests map and unmap large ranges over a hundred times at
+    /// startup (each one a discard); with the arena's pages handed back to
+    /// the kernel that costs no more than in C++. Scanning them instead
+    /// faulted in every untouched page: 96% of a hello world.
+    #[cfg(all(feature = "jit", target_os = "linux"))]
+    #[test]
+    fn discarding_large_ranges_repeatedly_is_fast() {
+        // rvlinux's default 4000 MiB arena (reserved, not committed).
+        let mut mem = empty_memory(4000 * MIB);
+        let start = std::time::Instant::now();
+        for _ in 0..3 {
+            for i in 0..60 {
+                mem.memdiscard(MIB + i * 64 * MIB, 64 * MIB, true).unwrap();
+            }
+        }
+        let elapsed = start.elapsed();
+        assert!(elapsed.as_millis() < 300, "{elapsed:?}");
+    }
+
     /// `set_page_attr` changes runs of existing pages through the index;
     /// it must leave every page, the page count and any failure as C++'s
     /// page-at-a-time loop does: gaps, arena pages, copy-on-write pages,
