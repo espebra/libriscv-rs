@@ -544,16 +544,20 @@ impl Memory {
 
     /// Port of `Memory::exec_segment_for`.
     pub fn exec_segment_for(&self, vaddr: u64) -> Option<Arc<DecodedSegment>> {
+        self.exec_segment_ref(vaddr).cloned()
+    }
+
+    /// [`exec_segment_for`](Self::exec_segment_for) without taking a
+    /// reference: the caller clones only what it keeps (each clone and
+    /// drop is an atomic operation, and switching segments is on every
+    /// VM call's path).
+    pub(crate) fn exec_segment_ref(&self, vaddr: u64) -> Option<&Arc<DecodedSegment>> {
         if let Some(main) = &self.main_exec
             && main.is_within(vaddr, 2)
         {
-            return Some(Arc::clone(main));
+            return Some(main);
         }
-        self.exec
-            .iter()
-            .flatten()
-            .find(|s| s.is_within(vaddr, 2))
-            .cloned()
+        self.exec.iter().flatten().find(|s| s.is_within(vaddr, 2))
     }
 
     /// Number of non-main execute segment slots (C++ `execute_segments_count`).

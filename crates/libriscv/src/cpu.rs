@@ -147,15 +147,17 @@ impl Machine {
     /// FENCE.I-style self-modification) becomes executable. Anything else
     /// is an execute fault. Returns the PC to continue at.
     pub(crate) fn next_execute_segment(&mut self, pc: u64) -> Result<u64> {
-        let found = self.memory.exec_segment_for(pc);
-        if let Some(segment) = &found
+        if let Some(segment) = self.memory.exec_segment_ref(pc)
             && !segment.is_stale()
         {
-            self.cpu.exec = Arc::clone(segment);
+            if !Arc::ptr_eq(segment, &self.cpu.exec) {
+                self.cpu.exec = Arc::clone(segment);
+            }
             // Reached a usable segment, reset the no-progress guard.
             self.cpu.stale_restart_pc = u64::MAX;
             return Ok(pc);
         }
+        let found = self.memory.exec_segment_for(pc);
         // Read-fault handlers could be reading PC.
         self.cpu.regs.pc = pc;
         self.cpu.exec = found
