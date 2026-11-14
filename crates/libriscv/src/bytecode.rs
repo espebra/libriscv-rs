@@ -420,7 +420,7 @@ pub(crate) extern "rust-preserve-none" fn auipc(
 /// everything else goes through `$slow`, which uses the page table and
 /// raises faults.
 macro_rules! loads {
-    ($($(#[$attr:meta])* $name:ident, $slow:ident, $step:expr, $n:literal, |$m:ident, $rd:ident, $b:ident| $set:expr;)*) => {$(
+    ($($(#[$attr:meta])* $name:ident, $cached:ident, $slow:ident, $step:expr, $n:literal, |$m:ident, $rd:ident, $b:ident| $set:expr;)*) => {$(
         $(#[$attr])*
         #[rustc_align(64)]
         pub(crate) extern "rust-preserve-none" fn $name(
@@ -435,6 +435,29 @@ macro_rules! loads {
             let fi = FasterItype(ins);
             let addr = reg($m, fi.rs2()).wrapping_add(fi.signed_imm() as u64);
             let Some($b) = $m.memory.arena_read::<$n>(addr) else {
+                become $cached(exec, cache, i, $m, c, ins, pc)
+            };
+            let $rd = fi.rs1();
+            $set;
+            execute!(exec, cache, i + $step, $m, pc, c)
+        }
+
+        /// Outside the arena: a page cache hit, without the calls (and
+        /// so the stack frame) of the full page-table path in `$slow`.
+        #[rustc_align(64)]
+        #[inline(never)]
+        extern "rust-preserve-none" fn $cached(
+            exec: &DecodedSegment,
+            cache: &[DecoderEntry],
+            i: usize,
+            $m: &mut Machine,
+            c: Counter,
+            ins: u32,
+            pc: u64,
+        ) -> Exit {
+            let fi = FasterItype(ins);
+            let addr = reg($m, fi.rs2()).wrapping_add(fi.signed_imm() as u64);
+            let Some($b) = $m.memory.read_cached::<$n>(addr) else {
                 become $slow(exec, cache, i, $m, c, ins, pc)
             };
             let $rd = fi.rs1();
@@ -468,38 +491,38 @@ macro_rules! loads {
 
 loads! {
     /// C++ `RV32I_BC_LDB`
-    ldb, ldb_slow, STEP, 1, |m, rd, b| set(m, rd, b[0] as i8 as i64 as u64);
+    ldb, ldb_cached, ldb_slow, STEP, 1, |m, rd, b| set(m, rd, b[0] as i8 as i64 as u64);
     /// C++ `RV32I_BC_LDBU`
-    ldbu, ldbu_slow, STEP, 1, |m, rd, b| set(m, rd, u64::from(b[0]));
+    ldbu, ldbu_cached, ldbu_slow, STEP, 1, |m, rd, b| set(m, rd, u64::from(b[0]));
     /// C++ `RV32I_BC_LDH`
-    ldh, ldh_slow, STEP, 2, |m, rd, b| set(m, rd, i16::from_le_bytes(b) as i64 as u64);
+    ldh, ldh_cached, ldh_slow, STEP, 2, |m, rd, b| set(m, rd, i16::from_le_bytes(b) as i64 as u64);
     /// C++ `RV32I_BC_LDHU`
-    ldhu, ldhu_slow, STEP, 2, |m, rd, b| set(m, rd, u64::from(u16::from_le_bytes(b)));
+    ldhu, ldhu_cached, ldhu_slow, STEP, 2, |m, rd, b| set(m, rd, u64::from(u16::from_le_bytes(b)));
     /// C++ `RV32I_BC_LDW`
-    ldw, ldw_slow, STEP, 4, |m, rd, b| set(m, rd, sext32(u32::from_le_bytes(b)));
+    ldw, ldw_cached, ldw_slow, STEP, 4, |m, rd, b| set(m, rd, sext32(u32::from_le_bytes(b)));
     /// C++ `RV32I_BC_LDWU`
-    ldwu, ldwu_slow, STEP, 4, |m, rd, b| set(m, rd, u64::from(u32::from_le_bytes(b)));
+    ldwu, ldwu_cached, ldwu_slow, STEP, 4, |m, rd, b| set(m, rd, u64::from(u32::from_le_bytes(b)));
     /// C++ `RV32I_BC_LDD`
-    ldd, ldd_slow, STEP, 8, |m, rd, b| set(m, rd, u64::from_le_bytes(b));
+    ldd, ldd_cached, ldd_slow, STEP, 8, |m, rd, b| set(m, rd, u64::from_le_bytes(b));
     /// C++ `RV32C_BC_LDW` (C.LW, C.LWSP)
-    c_ldw, c_ldw_slow, 1, 4, |m, rd, b| set(m, rd, sext32(u32::from_le_bytes(b)));
+    c_ldw, c_ldw_cached, c_ldw_slow, 1, 4, |m, rd, b| set(m, rd, sext32(u32::from_le_bytes(b)));
     /// C++ `RV32C_BC_LDD` (C.LDSP, and C.LD, which C++ leaves to
     /// `RV32C_BC_FUNCTION` even though its rewriter supports it)
-    c_ldd, c_ldd_slow, 1, 8, |m, rd, b| set(m, rd, u64::from_le_bytes(b));
+    c_ldd, c_ldd_cached, c_ldd_slow, 1, 8, |m, rd, b| set(m, rd, u64::from_le_bytes(b));
 }
 
 #[cfg(feature = "ext-f")]
 loads! {
     /// C++ `RV32F_BC_FLW`
-    flw, flw_slow, STEP, 4, |m, rd, b| crate::isa::rvfd::load_u32(m, rd, u32::from_le_bytes(b));
+    flw, flw_cached, flw_slow, STEP, 4, |m, rd, b| crate::isa::rvfd::load_u32(m, rd, u32::from_le_bytes(b));
     /// C++ `RV32F_BC_FLD`
-    fld, fld_slow, STEP, 8, |m, rd, b| m.cpu.regs.set_fp_bits(rd, u64::from_le_bytes(b));
+    fld, fld_cached, fld_slow, STEP, 8, |m, rd, b| m.cpu.regs.set_fp_bits(rd, u64::from_le_bytes(b));
 }
 
 /// Stores: `write(rs1 + imm, rs2)` (C++ `RV32I_BC_ST*`, `RV32C_BC_ST*`,
 /// `RV32F_BC_FS*`), with a cold page-table handler like [`loads!`].
 macro_rules! stores {
-    ($($(#[$attr:meta])* $name:ident, $slow:ident, $step:expr, |$m:ident, $rs2:ident| $value:expr;)*) => {$(
+    ($($(#[$attr:meta])* $name:ident, $cached:ident, $slow:ident, $step:expr, |$m:ident, $rs2:ident| $value:expr;)*) => {$(
         $(#[$attr])*
         #[rustc_align(64)]
         pub(crate) extern "rust-preserve-none" fn $name(
@@ -516,6 +539,29 @@ macro_rules! stores {
             let $rs2 = fi.rs2();
             let value = $value;
             if !$m.memory.arena_write(addr, value) {
+                become $cached(exec, cache, i, $m, c, ins, pc)
+            }
+            execute!(exec, cache, i + $step, $m, pc, c)
+        }
+
+        /// Outside the arena: a page cache hit on a page of its own, like
+        /// the loads' `$cached`.
+        #[rustc_align(64)]
+        #[inline(never)]
+        extern "rust-preserve-none" fn $cached(
+            exec: &DecodedSegment,
+            cache: &[DecoderEntry],
+            i: usize,
+            $m: &mut Machine,
+            c: Counter,
+            ins: u32,
+            pc: u64,
+        ) -> Exit {
+            let fi = FasterItype(ins);
+            let addr = reg($m, fi.rs1()).wrapping_add(fi.signed_imm() as u64);
+            let $rs2 = fi.rs2();
+            let value = $value;
+            if !$m.memory.write_cached(addr, value) {
                 become $slow(exec, cache, i, $m, c, ins, pc)
             }
             execute!(exec, cache, i + $step, $m, pc, c)
@@ -546,25 +592,25 @@ macro_rules! stores {
 
 stores! {
     /// C++ `RV32I_BC_STB`
-    stb, stb_slow, STEP, |m, rs2| (reg(m, rs2) as u8).to_le_bytes();
+    stb, stb_cached, stb_slow, STEP, |m, rs2| (reg(m, rs2) as u8).to_le_bytes();
     /// C++ `RV32I_BC_STH`
-    sth, sth_slow, STEP, |m, rs2| (reg(m, rs2) as u16).to_le_bytes();
+    sth, sth_cached, sth_slow, STEP, |m, rs2| (reg(m, rs2) as u16).to_le_bytes();
     /// C++ `RV32I_BC_STW`
-    stw, stw_slow, STEP, |m, rs2| (reg(m, rs2) as u32).to_le_bytes();
+    stw, stw_cached, stw_slow, STEP, |m, rs2| (reg(m, rs2) as u32).to_le_bytes();
     /// C++ `RV32I_BC_STD`
-    std, std_slow, STEP, |m, rs2| reg(m, rs2).to_le_bytes();
+    std, std_cached, std_slow, STEP, |m, rs2| reg(m, rs2).to_le_bytes();
     /// C++ `RV32C_BC_STW` (C.SW, C.SWSP)
-    c_stw, c_stw_slow, 1, |m, rs2| (reg(m, rs2) as u32).to_le_bytes();
+    c_stw, c_stw_cached, c_stw_slow, 1, |m, rs2| (reg(m, rs2) as u32).to_le_bytes();
     /// C++ `RV32C_BC_STD` (C.SD, C.SDSP)
-    c_std, c_std_slow, 1, |m, rs2| reg(m, rs2).to_le_bytes();
+    c_std, c_std_cached, c_std_slow, 1, |m, rs2| reg(m, rs2).to_le_bytes();
 }
 
 #[cfg(feature = "ext-f")]
 stores! {
     /// C++ `RV32F_BC_FSW`
-    fsw, fsw_slow, STEP, |m, rs2| (m.cpu.regs.fp_bits(rs2) as u32).to_le_bytes();
+    fsw, fsw_cached, fsw_slow, STEP, |m, rs2| (m.cpu.regs.fp_bits(rs2) as u32).to_le_bytes();
     /// C++ `RV32F_BC_FSD`
-    fsd, fsd_slow, STEP, |m, rs2| m.cpu.regs.fp_bits(rs2).to_le_bytes();
+    fsd, fsd_cached, fsd_slow, STEP, |m, rs2| m.cpu.regs.fp_bits(rs2).to_le_bytes();
 }
 
 /// FADD/FSUB/FMUL/FDIV (C++ `RV32F_BC_F*`). The rewriter only picks these

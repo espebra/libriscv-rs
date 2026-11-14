@@ -214,7 +214,11 @@ interpreter's speed comes from:
   the pre-decoded operands. They never return a `Result`: the only fallible
   ones, loads and stores, read the flat arena inline (`Memory::arena_read`,
   which can't fail) and tail-call a cold `*_slow` handler for the page
-  table and faults. C++ gets the same effect from exceptions.
+  table and faults. C++ gets the same effect from exceptions. In between,
+  a `*_cached` handler serves page cache hits outside the arena
+  (`Memory::read_cached`/`write_cached`, stores only to unshared pages of
+  their own) without calls, so it needs no stack frame: every load and
+  store of a machine without an arena (forks) goes there.
 - Slow paths (`RV32I_BC_FUNCTION`, `RV32C_BC_FUNCTION`, `FUNCBLOCK`) keep
   the original instruction and run the precise handler, as in C++.
 

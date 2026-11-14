@@ -249,6 +249,20 @@ impl PageTable {
         self.index.contains_key(&pageno)
     }
 
+    /// The slot of page `pageno` if the page cache holds it ([`slot_of`]
+    /// without the index).
+    ///
+    /// [`slot_of`]: Self::slot_of
+    #[inline(always)]
+    fn cached_slot(&self, pageno: u64) -> Option<usize> {
+        let cached = self.cache.get(pageno as usize % PAGE_CACHE_SIZE)?;
+        let slot = cached.load(Relaxed).wrapping_sub(1);
+        self.slots
+            .get(slot)
+            .is_some_and(|e| e.pageno == pageno)
+            .then_some(slot)
+    }
+
     /// The slot of page `pageno`: the page cache, else the index (which
     /// then fills the cache).
     #[inline(always)]
@@ -705,6 +719,60 @@ impl Memory {
             return Ok(*src);
         }
         self.read_paged(addr)
+    }
+
+    /// [`read_slow`](Self::read_slow) where the page cache holds the page:
+    /// the same bytes, or `None` to leave it to `read_slow` (a page cache
+    /// miss, an unreadable page, a load across pages). It makes no calls,
+    /// so the interpreter's paged-load handlers need no stack frame for it
+    /// (every load of a machine without an arena).
+    #[inline(always)]
+    pub(crate) fn read_cached<const N: usize>(&self, addr: u64) -> Option<[u8; N]> {
+        let pageno = addr / PAGE_SIZE;
+        let off = (addr & PAGE_MASK) as usize;
+        let page = &self
+            .paging
+            .slots
+            .get(self.paging.cached_slot(pageno)?)?
+            .page;
+        if !page.attr.read {
+            return None;
+        }
+        self.page_bytes(pageno, &page.data)
+            .get(off..)?
+            .first_chunk::<N>()
+            .copied()
+    }
+
+    /// [`write_slow`](Self::write_slow) where the page cache holds a
+    /// writable page with bytes of its own that no fork shares: true if
+    /// the value was written, false to leave it to `write_slow` (which
+    /// also copies shared bytes, creates pages and raises faults). No
+    /// calls, like [`read_cached`](Self::read_cached).
+    #[inline(always)]
+    pub(crate) fn write_cached<const N: usize>(&mut self, addr: u64, value: [u8; N]) -> bool {
+        let pageno = addr / PAGE_SIZE;
+        let off = (addr & PAGE_MASK) as usize;
+        let Some(slot) = self.paging.cached_slot(pageno) else {
+            return false;
+        };
+        let Some(entry) = self.paging.slots.get_mut(slot) else {
+            return false;
+        };
+        if !entry.page.attr.write {
+            return false;
+        }
+        let PageData::Owned(data) = &mut entry.page.data else {
+            return false;
+        };
+        let Some(dst) = Arc::get_mut(data)
+            .and_then(|d| d.get_mut(off..))
+            .and_then(|d| d.first_chunk_mut::<N>())
+        else {
+            return false;
+        };
+        *dst = value;
+        true
     }
 
     /// A load from a page without an entry, an unreadable page, or across

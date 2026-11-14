@@ -1554,6 +1554,83 @@ mod tests {
         assert!(start.elapsed().as_secs() < 4, "{:?}", start.elapsed());
     }
 
+    /// The page cache shortcuts of the interpreter's paged loads and
+    /// stores give what the page-table path gives, or leave it to it:
+    /// loads of every kind of page (own, a fork's loaned, zero, unreadable,
+    /// across pages), and stores only to writable pages of their own that
+    /// no fork shares.
+    #[test]
+    fn cached_page_accesses_match_the_page_table_path() {
+        const P: u64 = PAGE_SIZE;
+        let options = MachineOptions {
+            memory_max: MIB,
+            use_memory_arena: false,
+            ..Default::default()
+        };
+        let mut mem = Memory::new(Arc::from(Vec::new()), &options).unwrap().0;
+        let base = 0x10_0000;
+        for page in 0..4 {
+            mem.write_u64(base + page * P + 8, 0x1111 * (page + 1))
+                .unwrap();
+        }
+        let none = PageAttributes {
+            read: false,
+            write: false,
+            exec: false,
+            ..PageAttributes::default()
+        };
+        let read_only = PageAttributes {
+            write: false,
+            ..PageAttributes::default()
+        };
+        mem.set_page_attr(base + 2 * P, P, none).unwrap();
+        mem.set_page_attr(base + 3 * P, P, read_only).unwrap();
+        let mut fork = mem.fork(&options).unwrap();
+        let addrs = [
+            base + 8,
+            base + P - 3,     // across into the next page
+            base + P + 8,     // own (loaned in the fork)
+            base + 2 * P + 8, // unreadable
+            base + 3 * P + 8, // read-only
+            base + 9 * P,     // no entry: the zero page
+        ];
+        for m in [&mut mem, &mut fork] {
+            for &addr in &addrs {
+                let slow = m.read_slow::<8>(addr).map_err(|e| e.kind);
+                // read_slow filled the page cache (where there is a page).
+                let cached = m.read_cached::<8>(addr);
+                if let Some(v) = cached {
+                    assert_eq!(Ok(v), slow, "{addr:#x}");
+                }
+                let hits = addr == base + 8 || addr == base + P + 8 || addr == base + 3 * P + 8;
+                assert_eq!(cached.is_some(), hits, "{addr:#x}");
+            }
+        }
+        // Stores: the fork's pages are shared with mem until written, on
+        // both sides (mem's own bytes are loaned to the fork).
+        for &addr in &addrs {
+            assert!(!fork.write_cached(addr, [7; 8]), "{addr:#x}");
+            assert!(!mem.write_cached(addr, [7; 8]), "{addr:#x}");
+        }
+        assert_eq!(fork.read_u64(base + P + 8).unwrap(), 0x2222);
+        fork.write_slow(base + 8, [1; 8]).unwrap(); // copies the page
+        assert!(fork.write_cached(base + 16, [2; 8]));
+        assert_eq!(fork.read_u64(base + 16).unwrap(), 0x0202_0202_0202_0202);
+        // mem's page is its own again (the fork copied), but cold.
+        assert!(!mem.write_cached(base + 3 * P + 8, [3; 8])); // read-only
+        mem.write_slow(base + 8, [4; 8]).unwrap();
+        assert!(mem.write_cached(base + 24, [5; 8]));
+        assert_eq!(mem.read_u64(base + 24).unwrap(), 0x0505_0505_0505_0505);
+        assert_eq!(fork.read_u64(base + 24).unwrap(), 0);
+        assert_eq!(mem.read_u64(base + P + 8).unwrap(), 0x2222);
+        // Without the fork, mem's pages are its own: only the attributes
+        // decide.
+        drop(fork);
+        assert!(mem.write_cached(base + P + 16, [6; 8]));
+        assert!(!mem.write_cached(base + 3 * P + 8, [6; 8])); // read-only
+        assert_eq!(mem.read_u64(base + 3 * P + 8).unwrap(), 0x4444);
+    }
+
     /// The native memcpy outside the arena copies a page-bounded chunk at
     /// a time; it must leave memory, faults and created pages exactly as
     /// C++'s loop of loads and stores (`memcpy_within_elementwise`) does.
