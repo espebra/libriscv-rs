@@ -16,7 +16,7 @@ mod aot_embed {
     include!(concat!(env!("OUT_DIR"), "/aot_embed.rs"));
 }
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Debug, Default)]
@@ -251,13 +251,20 @@ fn main() -> ExitCode {
     let mut guest_args = vec![args.program.to_string_lossy().into_owned()];
     guest_args.extend(args.guest_args.iter().cloned());
     let mut is_dynamic = false;
+    // The dynamic linker run is one of the system's (not a file the
+    // program named): its code may be saved to the JIT cache directory.
+    let mut system_linker = false;
     if let Some(interp) = libriscv::elf_interpreter(&binary) {
         // A dynamic executable: run its dynamic linker instead, which maps
         // the program and its libraries at runtime, with the program as
         // its first argument (C++ `main`).
         let interp_path = interp.trim_end_matches('\0');
-        binary = match std::fs::read(interp_path).or_else(|_| std::fs::read(DYNAMIC_LINKER)) {
-            Ok(b) => b,
+        let read = match std::fs::read(interp_path) {
+            Ok(b) => Ok((b, is_system_library(Path::new(interp_path)))),
+            Err(_) => std::fs::read(DYNAMIC_LINKER).map(|b| (b, true)),
+        };
+        (binary, system_linker) = match read {
+            Ok(read) => read,
             Err(e) => {
                 eprintln!("Could not read the dynamic linker {interp_path}: {e}");
                 return ExitCode::FAILURE;
@@ -313,6 +320,8 @@ fn main() -> ExitCode {
     #[cfg(feature = "jit")]
     let jit_cache_output = (args.jit_save_object.is_some() || args.jit_save_shared.is_some())
         .then(libriscv::jit_cache::JitCacheOutput::new);
+    #[cfg(not(feature = "jit"))]
+    let _ = system_linker;
     let options = libriscv::MachineOptions {
         memory_max: args.memory_mib.map_or(DEFAULT_MEMORY, |m| m << 20),
         verbose_loader: args.verbose,
@@ -329,7 +338,7 @@ fn main() -> ExitCode {
         #[cfg(feature = "jit")]
         jit_cache_output: jit_cache_output.clone(),
         #[cfg(feature = "jit")]
-        jit_cache_dir: jit_cache_dir(&args, is_dynamic),
+        jit_cache_dir: jit_cache_dir(&args, is_dynamic, system_linker),
         aot: !args.no_aot,
         #[cfg(feature = "aot")]
         aot_output: aot_output.clone(),
@@ -451,9 +460,17 @@ fn main() -> ExitCode {
 /// The JIT cache directory for a dynamic executable: the code of the
 /// dynamic linker (the initial segment) and of the pinned libraries is
 /// the same in every program, so the JIT saves it the first time and uses
-/// it from then on. The program's own code is never cached.
+/// it from then on. The program's own code is never cached, and neither is
+/// a dynamic linker the program chose (`system_linker` false: its
+/// `PT_INTERP` named a file outside the system's library directory) nor
+/// anything the program wrote into the pinned slots (libriscv saves only
+/// segments whose bytes are those of the pinned file mapped there).
 #[cfg(feature = "jit")]
-fn jit_cache_dir(args: &CliArgs, is_dynamic: bool) -> Option<libriscv::jit_cache::CacheDir> {
+fn jit_cache_dir(
+    args: &CliArgs,
+    is_dynamic: bool,
+    system_linker: bool,
+) -> Option<libriscv::jit_cache::CacheDir> {
     if !is_dynamic || !args.jit || args.no_jit_cache {
         return None;
     }
@@ -467,7 +484,7 @@ fn jit_cache_dir(args: &CliArgs, is_dynamic: bool) -> Option<libriscv::jit_cache
     let pinned_end = LIBRARY_PIN_BASE + GUEST_LIBS.len() as u64 * LIBRARY_PIN_SLOT;
     Some(libriscv::jit_cache::CacheDir {
         path,
-        initial_segment: true,
+        initial_segment: system_linker,
         ranges: std::iter::once(LIBRARY_PIN_BASE..pinned_end).collect(),
     })
 }
@@ -597,6 +614,18 @@ fn pinned_libraries() -> Vec<(String, u64)> {
 
 const SANDBOX_LIBDIR: &str = "/lib/riscv64-linux-gnu/";
 const REAL_LIBDIR: &str = "/usr/riscv64-linux-gnu/lib/";
+
+/// True if `path` is a file in the system's RISC-V library directory
+/// (`REAL_LIBDIR`, where `DYNAMIC_LINKER` is), symbolic links resolved.
+fn is_system_library(path: &Path) -> bool {
+    let (Ok(path), Ok(libdir)) = (
+        std::fs::canonicalize(path),
+        std::fs::canonicalize(REAL_LIBDIR),
+    ) else {
+        return false;
+    };
+    path.parent() == Some(libdir.as_path())
+}
 
 /// The Linux environment of the C++ emulator (`full_linux_guest`): initial
 /// stack with argv/env/auxv, Linux system calls with a sandboxed file

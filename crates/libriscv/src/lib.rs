@@ -92,8 +92,8 @@ mod jit;
 #[cfg(feature = "jit")]
 pub mod jit_cache {
     pub use crate::jit::cache::{
-        CacheDir, JitCacheOutput, load_shared_object, pending_saves, registered_segments,
-        wait_for_saves,
+        CacheDir, JitCacheOutput, MAX_DIR_FILES, MAX_SAVE_BYTES, MAX_SAVES, load_shared_object,
+        pending_saves, registered_segments, wait_for_saves,
     };
 }
 mod linux;

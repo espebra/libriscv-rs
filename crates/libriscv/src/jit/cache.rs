@@ -30,14 +30,29 @@
 //! relocations against the C library's functions. The metadata is
 //! little-endian `u64`s: [`META_MAGIC`], the key (see [`NativeKey::words`]),
 //! the trampoline offset, the entry count and the entries (`u32`, see
-//! [`Image::entries`]), then the patch count and the patched decoder
-//! indices (`u32`).
+//! [`Image::entries`]), the patch count and the patched decoder
+//! indices (`u32`), then the length and bytes of the guest code the unit
+//! was compiled from.
+//!
+//! # Trust
+//!
+//! The key's hashes tell segments apart; they are not cryptographic and a
+//! guest can forge segments that collide with any other. So cached code is
+//! only installed for a segment whose bytes are exactly the ones it was
+//! compiled from, which every unit stores: whatever wrote it, its code then
+//! does what the JIT would have compiled for the segment. A [`CacheDir`]
+//! only saves segments whose bytes come from files the host chose (see
+//! there), at most [`MAX_SAVES`] files and [`MAX_SAVE_BYTES`] per process,
+//! and only uses directories and files the process's user owns and nobody
+//! else can write to.
 
 use std::collections::{HashMap, HashSet};
-use std::io;
+use std::fs::{DirBuilder, OpenOptions, Permissions};
+use std::io::{self, Write};
 use std::ops::Range;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use cranelift_codegen::ir::LibCall;
@@ -49,8 +64,9 @@ use libriscv_jit_rt::{
 use super::emit::{Compiled, Image, build_fingerprint, libcall_symbol};
 use crate::codegen::NativeKey;
 
-/// First word of a unit's metadata ("RVJITM01").
-const META_MAGIC: u64 = u64::from_le_bytes(*b"RVJITM01");
+/// First word of a unit's metadata ("RVJITM02"; units without their guest
+/// code, "RVJITM01", are ignored).
+const META_MAGIC: u64 = u64::from_le_bytes(*b"RVJITM02");
 
 /// What cached code is looked up by: everything the code compiled for a
 /// segment depends on, with [`build_fingerprint`] as its build.
@@ -98,8 +114,8 @@ impl Reader<'_> {
     }
 }
 
-/// The metadata of `image` for `key`.
-fn metadata(key: &CacheKey, image: &Image) -> Option<Vec<u8>> {
+/// The metadata of `image`, compiled from the guest code `code` for `key`.
+fn metadata(key: &CacheKey, image: &Image, code: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(&META_MAGIC.to_le_bytes());
     write_key(key, &mut out);
@@ -112,6 +128,8 @@ fn metadata(key: &CacheKey, image: &Image) -> Option<Vec<u8>> {
     for &p in &image.patch {
         out.extend_from_slice(&u32::try_from(p).ok()?.to_le_bytes());
     }
+    out.extend_from_slice(&(code.len() as u64).to_le_bytes());
+    out.extend_from_slice(code);
     Some(out)
 }
 
@@ -121,6 +139,17 @@ struct Meta {
     trampoline: usize,
     entries: Vec<u32>,
     patch: Vec<usize>,
+    /// The guest code the unit was compiled from.
+    code: Vec<u8>,
+}
+
+impl Meta {
+    /// True if the unit was compiled from exactly `code`, a segment with
+    /// `cache_len` decoder entries: only then is it the code the JIT would
+    /// compile for the segment. (The key's hashes alone can be forged.)
+    fn fits(&self, code: &[u8], cache_len: usize) -> bool {
+        self.entries.len() == cache_len && self.code == code
+    }
 }
 
 /// A segment's cached code, ready to be entered.
@@ -144,6 +173,11 @@ fn parse(meta: &[u8]) -> Option<(CacheKey, Meta)> {
     let patch = (0..n)
         .map(|_| r.u32().map(|p| p as usize))
         .collect::<Option<Vec<_>>>()?;
+    let n = usize::try_from(r.u64()?).ok()?;
+    let code = r.take(n)?.to_vec();
+    if code.len() as u64 != key.len || !r.0.is_empty() {
+        return None;
+    }
     // Every patched entry must have a function.
     if patch
         .iter()
@@ -157,6 +191,7 @@ fn parse(meta: &[u8]) -> Option<(CacheKey, Meta)> {
             trampoline,
             entries,
             patch,
+            code,
         },
     ))
 }
@@ -166,7 +201,9 @@ fn parse(meta: &[u8]) -> Option<(CacheKey, Meta)> {
 struct Registry {
     /// The program's embedded code has been added.
     embedded: bool,
-    units: HashMap<CacheKey, Entry>,
+    /// Units with the same key but other code (at most one of them can
+    /// be the segment's) are all kept: the segment's code picks one.
+    units: HashMap<CacheKey, Vec<Entry>>,
 }
 
 static REGISTRY: Mutex<Option<Registry>> = Mutex::new(None);
@@ -184,16 +221,17 @@ fn registry() -> MutexGuard<'static, Option<Registry>> {
     guard
 }
 
-/// Add `units` to the registry, keeping existing code for a key (as C++
-/// does). Returns the number of units added.
+/// Add `units` to the registry, keeping existing code for a key and
+/// guest code (as C++ does). Returns the number of units added.
 fn add(registry: &mut Registry, units: Vec<CachedUnit>) -> usize {
     let mut added = 0;
     for unit in units {
         let Some((key, meta)) = parse(&unit.meta) else {
             continue;
         };
-        if let std::collections::hash_map::Entry::Vacant(v) = registry.units.entry(key) {
-            v.insert(Entry {
+        let same_key = registry.units.entry(key).or_default();
+        if !same_key.iter().any(|e| e.meta.code == meta.code) {
+            same_key.push(Entry {
                 meta,
                 code: unit.code,
             });
@@ -213,18 +251,21 @@ pub(crate) fn any() -> bool {
     HAS_UNITS.load(Ordering::Acquire)
 }
 
-/// The cached code for `key`, for a segment with `cache_len` decoder
-/// entries, mapped and ready to install.
-pub(crate) fn lookup(key: &CacheKey, cache_len: usize) -> Option<Compiled> {
+/// The cached code for `key`, for the segment of guest code `code` with
+/// `cache_len` decoder entries, mapped and ready to install. Only code
+/// compiled from exactly `code` is used.
+pub(crate) fn lookup(key: &CacheKey, code: &[u8], cache_len: usize) -> Option<Compiled> {
     if !HAS_UNITS.load(Ordering::Acquire) {
         return None;
     }
     let guard = registry();
-    let entry = guard.as_ref()?.units.get(key)?;
+    let entry = guard
+        .as_ref()?
+        .units
+        .get(key)?
+        .iter()
+        .find(|e| e.meta.fits(code, cache_len))?;
     let meta = &entry.meta;
-    if meta.entries.len() != cache_len {
-        return None;
-    }
     let code = CodeMemory::linked(
         entry.code.clone(),
         meta.trampoline,
@@ -257,7 +298,9 @@ pub fn load_shared_object(path: impl AsRef<Path>) -> io::Result<usize> {
 /// The number of segments with cached code in the registry: those
 /// embedded in the program plus those from loaded shared objects.
 pub fn registered_segments() -> usize {
-    registry().as_ref().map_or(0, |r| r.units.len())
+    registry()
+        .as_ref()
+        .map_or(0, |r| r.units.values().map(Vec::len).sum())
 }
 
 /// A directory of cached JIT code that machines use and fill by
@@ -274,26 +317,81 @@ pub fn registered_segments() -> usize {
 /// file for every build. Files are kept per build of the JIT (a
 /// subdirectory named after its fingerprint); nothing is ever removed.
 ///
-/// Loading a shared object runs native code from it: only use a directory
-/// that nobody else can write to.
+/// Guest code can't be trusted to pick what is saved, so a segment is
+/// only saved if its bytes came from a file the host chose: the initial
+/// segment with [`initial_segment`](Self::initial_segment), or a segment
+/// in [`ranges`](Self::ranges) whose bytes are those of one of
+/// `FileDescriptors::pinned_mappings`' files, mapped there by `mmap`
+/// (the file is read again to compare). Never a segment rebuilt from
+/// changed code. A process saves at most [`MAX_SAVES`] files
+/// ([`MAX_SAVE_BYTES`] in all), and none to a build subdirectory that
+/// already has [`MAX_DIR_FILES`] entries. Cached code is only used for a
+/// segment with the very bytes it was compiled from.
+///
+/// Loading a shared object runs native code from it: the directory, its
+/// build subdirectory and the file must belong to the process's
+/// (effective) user and not be writable by group or others, or nothing is
+/// loaded from or saved to them. Directories it creates get mode 0700.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheDir {
     pub path: PathBuf,
     /// Cache the machine's initial execute segment (the one created from
-    /// the ELF program the machine was created with).
+    /// the ELF program the machine was created with). Only for a program
+    /// the host chose, not one a guest can name (like an ELF's
+    /// `PT_INTERP`).
     pub initial_segment: bool,
     /// Cache the segments lying entirely inside one of these address
-    /// ranges.
+    /// ranges (saved only if their bytes come from a pinned file, see
+    /// above).
     pub ranges: Vec<Range<u64>>,
 }
 
+/// The most cache files one process writes to [`CacheDir`]s: a guest
+/// that keeps creating segments must not fill the disk (nor run the
+/// linker for each). `rvlinux` needs one for the dynamic linker and one
+/// per pinned library it uses.
+pub const MAX_SAVES: usize = 32;
+/// The most bytes (native code plus the guest code stored with it) one
+/// process saves to [`CacheDir`]s. `libc.so`'s native code is about 36 MB.
+pub const MAX_SAVE_BYTES: u64 = 512 << 20;
+/// A [`CacheDir`]'s build subdirectory with this many entries gets no more
+/// files.
+pub const MAX_DIR_FILES: usize = 256;
+
+/// Files saved, and their bytes, by this process (for [`MAX_SAVES`] and
+/// [`MAX_SAVE_BYTES`]).
+static SAVED: Mutex<(usize, u64)> = Mutex::new((0, 0));
+
+/// True if this process may still save a file to a [`CacheDir`].
+pub(crate) fn may_save() -> bool {
+    SAVED.lock().unwrap_or_else(PoisonError::into_inner).0 < MAX_SAVES
+}
+
+/// Count a save of `bytes` against the limits; false (counting nothing)
+/// if over them.
+fn reserve_save(bytes: u64) -> bool {
+    let mut saved = SAVED.lock().unwrap_or_else(PoisonError::into_inner);
+    let total = saved.1.saturating_add(bytes);
+    if saved.0 >= MAX_SAVES || total > MAX_SAVE_BYTES {
+        return false;
+    }
+    *saved = (saved.0 + 1, total);
+    true
+}
+
 impl CacheDir {
-    /// True if the segment of `len` bytes at `vaddr` is cached here.
+    /// True if the segment of `len` bytes at `vaddr` is looked up here.
+    /// (Saving it takes more, see the type's documentation.)
     pub(crate) fn covers(&self, vaddr: u64, len: u64, initial: bool) -> bool {
-        (initial && self.initial_segment)
-            || vaddr
-                .checked_add(len)
-                .is_some_and(|end| self.ranges.iter().any(|r| r.start <= vaddr && end <= r.end))
+        (initial && self.initial_segment) || self.in_ranges(vaddr, len)
+    }
+
+    /// True if the segment of `len` bytes at `vaddr` lies in one of
+    /// [`ranges`](Self::ranges).
+    pub(crate) fn in_ranges(&self, vaddr: u64, len: u64) -> bool {
+        vaddr
+            .checked_add(len)
+            .is_some_and(|end| self.ranges.iter().any(|r| r.start <= vaddr && end <= r.end))
     }
 
     /// The file holding the code for `key`.
@@ -307,11 +405,121 @@ impl CacheDir {
     }
 }
 
+fn untrusted(path: &Path, why: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("{} {why}", path.display()),
+    )
+}
+
+/// Ok if `meta` (of `path`) belongs to this process's user and nobody
+/// else can write to it.
+fn check_private(path: &Path, meta: &std::fs::Metadata) -> io::Result<()> {
+    if meta.uid() != libriscv_jit_rt::effective_uid() {
+        return Err(untrusted(path, "is owned by another user"));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(untrusted(path, "is writable by group or others"));
+    }
+    Ok(())
+}
+
+/// Ok if the cache file `file` (`<dir>/<build>/<name>`), its build
+/// subdirectory and its cache directory are private to this process's
+/// user (see [`check_private`]). Only the cache directory may be a
+/// symbolic link; with `file_too` false, `file` needn't exist.
+fn check_cache_path(file: &Path, file_too: bool) -> io::Result<()> {
+    let build = file
+        .parent()
+        .ok_or_else(|| untrusted(file, "has no directory"))?;
+    let root = build
+        .parent()
+        .ok_or_else(|| untrusted(build, "has no parent"))?;
+    let meta = std::fs::metadata(root)?;
+    if !meta.is_dir() {
+        return Err(untrusted(root, "is not a directory"));
+    }
+    check_private(root, &meta)?;
+    let meta = std::fs::symlink_metadata(build)?;
+    if !meta.is_dir() {
+        return Err(untrusted(build, "is not a directory"));
+    }
+    check_private(build, &meta)?;
+    if file_too {
+        let meta = std::fs::symlink_metadata(file)?;
+        if !meta.is_file() {
+            return Err(untrusted(file, "is not a regular file"));
+        }
+        check_private(file, &meta)?;
+    }
+    Ok(())
+}
+
+/// Create `dir` and its missing parents with mode 0700.
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    DirBuilder::new().recursive(true).mode(0o700).create(dir)
+}
+
+/// A hard to guess number, different on each call: names of temporary
+/// files nobody can plant in advance.
+fn unpredictable() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    static N: AtomicU64 = AtomicU64::new(0);
+    // Randomly keyed by the standard library (from the OS).
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(N.fetch_add(1, Ordering::Relaxed));
+    h.write_u32(std::process::id());
+    if let Ok(t) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        h.write_u128(t.as_nanos());
+    }
+    h.finish()
+}
+
+/// A directory of this process's own, with mode 0700 and an unpredictable
+/// name, created inside `parent` (never an existing one) and removed with
+/// what's in it when dropped. Temporary files go in it: nobody else can
+/// plant files or symbolic links there.
+#[derive(Debug)]
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(parent: &Path) -> io::Result<Self> {
+        let mut last = None;
+        for _ in 0..8 {
+            let path = parent.join(format!(".libriscv-tmp-{:016x}", unpredictable()));
+            match DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| io::Error::from(io::ErrorKind::AlreadyExists)))
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Write `data` to the new file `path` (`O_CREAT | O_EXCL`: never an
+/// existing file or a symbolic link), with mode 0600.
+fn write_new(path: &Path, data: &[u8]) -> io::Result<()> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(data)
+}
+
 /// The cache files this process has tried loading (once each).
 static LOADED_FILES: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
 
-/// Load the cache file `file` into the registry, if it exists and this
-/// process hasn't tried before.
+/// Load the cache file `file` into the registry, if it exists, this
+/// process hasn't tried before, and it and its directories are private to
+/// this process's user.
 pub(crate) fn load_file(file: &Path, verbose: bool) {
     if !file.exists() {
         return;
@@ -325,7 +533,8 @@ pub(crate) fn load_file(file: &Path, verbose: bool) {
             return;
         }
     }
-    match load_shared_object(file) {
+    let loaded = check_cache_path(file, true).and_then(|()| load_shared_object(file));
+    match loaded {
         Ok(n) if verbose => eprintln!(
             "libriscv: Loaded cached JIT code for {n} segments from {}",
             file.display()
@@ -339,26 +548,13 @@ pub(crate) fn load_file(file: &Path, verbose: bool) {
     }
 }
 
-/// Write `image`, compiled for `key`, to the cache file `file`. Written
-/// to a temporary name first and renamed, so other processes never see a
+/// Write `image`, compiled from the guest code `code` for `key`, to the
+/// cache file `file`, within the limits on saves ([`MAX_SAVES`],
+/// [`MAX_SAVE_BYTES`], [`MAX_DIR_FILES`]). Linked in a private temporary
+/// directory and renamed into place, so other processes never see a
 /// partial file.
-pub(crate) fn save_file(key: CacheKey, image: &Image, file: &Path, verbose: bool) {
-    static N: AtomicUsize = AtomicUsize::new(0);
-    let output = JitCacheOutput::new();
-    output.record(key, image);
-    let mut tmp = file.as_os_str().to_owned();
-    tmp.push(format!(
-        ".{}-{}.tmp",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    let tmp = PathBuf::from(tmp);
-    let saved = file
-        .parent()
-        .map_or(Ok(()), std::fs::create_dir_all)
-        .and_then(|()| output.write_shared_object(&tmp))
-        .and_then(|()| std::fs::rename(&tmp, file));
-    match saved {
+pub(crate) fn save_file(key: CacheKey, image: &Image, code: &[u8], file: &Path, verbose: bool) {
+    match try_save_file(key, image, code, file) {
         Ok(()) if verbose => eprintln!(
             "libriscv: Saved JIT code for the segment at 0x{:X} to {}",
             key.vaddr,
@@ -366,12 +562,40 @@ pub(crate) fn save_file(key: CacheKey, image: &Image, file: &Path, verbose: bool
         ),
         Ok(()) => {}
         Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
             if verbose {
                 eprintln!("libriscv: Could not save {}: {e}", file.display());
             }
         }
     }
+}
+
+fn try_save_file(key: CacheKey, image: &Image, code: &[u8], file: &Path) -> io::Result<()> {
+    let dir = file
+        .parent()
+        .ok_or_else(|| untrusted(file, "has no directory"))?;
+    let bytes = (image.bytes.len() as u64).saturating_add(code.len() as u64);
+    if !reserve_save(bytes) {
+        return Err(io::Error::other(format!(
+            "this process has saved the most it may ({MAX_SAVES} files, {MAX_SAVE_BYTES} bytes)"
+        )));
+    }
+    create_private_dir(dir)?;
+    check_cache_path(file, false)?;
+    if std::fs::read_dir(dir)?.take(MAX_DIR_FILES).count() >= MAX_DIR_FILES {
+        return Err(io::Error::other(format!(
+            "{} has {MAX_DIR_FILES} entries already",
+            dir.display()
+        )));
+    }
+    let output = JitCacheOutput::new();
+    output.record(key, image, code);
+    let tmp = TempDir::new(dir)?;
+    let so = tmp.0.join("unit.so");
+    output.link_shared_object(&tmp.0, &so)?;
+    std::fs::set_permissions(&so, Permissions::from_mode(0o600))?;
+    // Replaces whatever is at `file`, a symbolic link too, never
+    // following it.
+    std::fs::rename(&so, file)
 }
 
 /// Cache files being written by background compilations.
@@ -413,6 +637,15 @@ pub fn wait_for_saves() {
     }
 }
 
+/// A segment's code as the JIT compiled it, with the guest code it was
+/// compiled from.
+#[derive(Debug)]
+struct Unit {
+    key: CacheKey,
+    image: Image,
+    code: Vec<u8>,
+}
+
 /// Collects the code the JIT compiles, to save it with
 /// [`write_object`](Self::write_object) or
 /// [`write_shared_object`](Self::write_shared_object) (see
@@ -422,7 +655,7 @@ pub fn wait_for_saves() {
 /// ([`Machine::wait_for_jit`](crate::Machine::wait_for_jit)) before writing.
 #[derive(Debug, Clone, Default)]
 pub struct JitCacheOutput {
-    units: Arc<Mutex<Vec<(CacheKey, Image)>>>,
+    units: Arc<Mutex<Vec<Unit>>>,
 }
 
 impl PartialEq for JitCacheOutput {
@@ -437,7 +670,7 @@ impl JitCacheOutput {
         Self::default()
     }
 
-    fn units(&self) -> MutexGuard<'_, Vec<(CacheKey, Image)>> {
+    fn units(&self) -> MutexGuard<'_, Vec<Unit>> {
         self.units.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -450,11 +683,16 @@ impl JitCacheOutput {
         self.units().is_empty()
     }
 
-    /// Record `image`, compiled for `key` (once per key).
-    pub(crate) fn record(&self, key: CacheKey, image: &Image) {
+    /// Record `image`, compiled from the guest code `code` for `key` (once
+    /// per key and code).
+    pub(crate) fn record(&self, key: CacheKey, image: &Image, code: &[u8]) {
         let mut units = self.units();
-        if !units.iter().any(|(k, _)| *k == key) {
-            units.push((key, image.clone()));
+        if !units.iter().any(|u| u.key == key && u.code == code) {
+            units.push(Unit {
+                key,
+                image: image.clone(),
+                code: code.to_vec(),
+            });
         }
     }
 
@@ -474,13 +712,23 @@ impl JitCacheOutput {
 
     /// Write the recorded code as a shared object, for
     /// [`load_shared_object`]. Links the object with the system C compiler
-    /// driver (`$CC`, else `cc`) and `libm` (for libcalls).
+    /// driver (`$CC`, else `cc`) and `libm` (for libcalls). The object is
+    /// written to a private temporary directory next to `path`.
     pub fn write_shared_object(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let path = path.as_ref();
-        let mut object = path.as_os_str().to_owned();
-        object.push(".tmp.o");
-        let object = std::path::PathBuf::from(object);
-        self.write_object(&object)?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let tmp = TempDir::new(parent)?;
+        self.link_shared_object(&tmp.0, path)
+    }
+
+    /// [`write_shared_object`](Self::write_shared_object) to `path`, with
+    /// the object in the private directory `tmp` (a [`TempDir`]).
+    fn link_shared_object(&self, tmp: &Path, path: &Path) -> io::Result<()> {
+        let object = tmp.join("unit.o");
+        write_new(&object, &self.object()?)?;
         let cc = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
         let status = std::process::Command::new(&cc)
             .args(["-shared", "-nostdlib", "-Wl,-z,noexecstack", "-o"])
@@ -543,7 +791,7 @@ fn invalid_data(what: &str) -> io::Error {
 
 /// Lay out `units` as an ELF relocatable object; see the module
 /// documentation.
-fn write_elf(units: &[(CacheKey, Image)]) -> io::Result<Vec<u8>> {
+fn write_elf(units: &[Unit]) -> io::Result<Vec<u8>> {
     if units.is_empty() {
         return Err(invalid_data("no compiled code to write"));
     }
@@ -559,7 +807,12 @@ fn write_elf(units: &[(CacheKey, Image)]) -> io::Result<Vec<u8>> {
     let mut records = Vec::new();
     let mut records_rela: Vec<Rela> = Vec::new();
     let mut libcalls: Vec<LibCall> = Vec::new();
-    for (key, image) in units {
+    for Unit {
+        key,
+        image,
+        code: guest,
+    } in units
+    {
         text.resize(text.len().next_multiple_of(64), 0);
         let code = text.len() as u64;
         text.extend_from_slice(&image.bytes);
@@ -580,7 +833,7 @@ fn write_elf(units: &[(CacheKey, Image)]) -> io::Result<Vec<u8>> {
             ));
         }
         meta.resize(meta.len().next_multiple_of(8), 0);
-        let m = metadata(key, image).ok_or_else(|| invalid_data("segment too large"))?;
+        let m = metadata(key, image, guest).ok_or_else(|| invalid_data("segment too large"))?;
         let meta_at = meta.len() as u64;
         meta.extend_from_slice(&m);
         let record = records.len() as u64;
@@ -776,9 +1029,8 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn metadata_round_trips_and_truncation_is_refused() {
-        let key = CacheKey {
+    fn key() -> CacheKey {
+        CacheKey {
             build: 1,
             vaddr: 0x10000,
             len: 64,
@@ -793,30 +1045,187 @@ mod tests {
                 unlimited: false,
                 unguarded: false,
             },
-        };
-        let image = Image {
+        }
+    }
+
+    fn image(key: &CacheKey) -> Image {
+        Image {
             bytes: vec![0xC3; 16],
             trampoline: 8,
             entries: vec![CodeMemory::NO_ENTRY, 0, CodeMemory::NO_ENTRY, 4],
             patch: vec![1, 3],
             libcalls: Vec::new(),
             layout: key.layout,
-        };
-        let meta = metadata(&key, &image).unwrap();
+        }
+    }
+
+    /// 64 bytes of guest code (the key's length).
+    fn guest_code() -> Vec<u8> {
+        (0..64u8).collect()
+    }
+
+    #[test]
+    fn metadata_round_trips_and_truncation_is_refused() {
+        let key = key();
+        let image = image(&key);
+        let code = guest_code();
+        let meta = metadata(&key, &image, &code).unwrap();
         let (k, m) = parse(&meta).unwrap();
         assert_eq!(k, key);
         let expected = Meta {
             trampoline: 8,
             entries: image.entries.clone(),
             patch: image.patch.clone(),
+            code: code.clone(),
         };
         assert_eq!(m, expected);
         for n in 0..meta.len() {
             assert!(parse(&meta[..n]).is_none(), "{n}");
         }
+        // Trailing bytes.
+        let mut long = meta.clone();
+        long.push(0);
+        assert!(parse(&long).is_none());
         // A patched entry without a function.
         let mut bad = image.clone();
         bad.patch = vec![2];
-        assert!(parse(&metadata(&key, &bad).unwrap()).is_none());
+        assert!(parse(&metadata(&key, &bad, &code).unwrap()).is_none());
+        // Guest code of another length than the key's.
+        assert!(parse(&metadata(&key, &image, &code[..60]).unwrap()).is_none());
+        // Units of the first format (without the guest code).
+        let mut old = meta.clone();
+        old[..8].copy_from_slice(b"RVJITM01");
+        assert!(parse(&old).is_none());
+    }
+
+    /// The key's CRC32-C and hash can be forged (see
+    /// `decoder_cache::tests::forge_collision`): a unit is only used for
+    /// a segment with exactly the bytes it was compiled from, whatever its
+    /// key says.
+    #[test]
+    fn cached_code_is_only_used_for_the_code_it_was_compiled_from() {
+        let key = key();
+        let image = image(&key);
+        let code = guest_code();
+        let (_, meta) = parse(&metadata(&key, &image, &code).unwrap()).unwrap();
+        assert!(meta.fits(&code, image.entries.len()));
+        let mut forged = code.clone();
+        forged[17] ^= 0x40;
+        assert!(!meta.fits(&forged, image.entries.len()));
+        assert!(!meta.fits(&code[..60], image.entries.len()));
+        assert!(!meta.fits(&code, image.entries.len() + 1));
+    }
+
+    #[test]
+    fn saves_are_limited() {
+        let mut saved = SAVED.lock().unwrap_or_else(PoisonError::into_inner);
+        let before = *saved;
+        *saved = (0, 0);
+        drop(saved);
+        assert!(may_save());
+        assert!(!reserve_save(MAX_SAVE_BYTES + 1));
+        assert!(reserve_save(MAX_SAVE_BYTES - 10));
+        assert!(!reserve_save(11));
+        assert!(reserve_save(10));
+        *SAVED.lock().unwrap() = (MAX_SAVES - 1, 0);
+        assert!(may_save());
+        assert!(reserve_save(0));
+        assert!(!may_save());
+        assert!(!reserve_save(0));
+        *SAVED.lock().unwrap() = before;
+    }
+
+    /// A fresh directory for `test` in the system's temporary directory,
+    /// created with `mode`.
+    fn scratch(test: &str, mode: u32) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "libriscv-jit-cache-{test}-{}-{:x}",
+            std::process::id(),
+            unpredictable()
+        ));
+        DirBuilder::new().mode(mode).create(&dir).unwrap();
+        std::fs::set_permissions(&dir, Permissions::from_mode(mode)).unwrap();
+        dir
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Cache files are only loaded from (and saved to) directories and
+    /// files of this user that nobody else can write to.
+    #[test]
+    fn cache_paths_must_be_private() {
+        let root = scratch("private", 0o700);
+        let build = root.join("0123456789abcdef");
+        create_private_dir(&build).unwrap();
+        assert_eq!(std::fs::metadata(&build).unwrap().mode() & 0o777, 0o700);
+        let file = build.join("10000-0123456789abcdef.so");
+        // Saving needs no file yet; loading does.
+        check_cache_path(&file, false).unwrap();
+        assert!(check_cache_path(&file, true).is_err());
+        write_new(&file, b"code").unwrap();
+        check_cache_path(&file, true).unwrap();
+
+        set_mode(&file, 0o620);
+        assert!(check_cache_path(&file, true).is_err());
+        set_mode(&file, 0o602);
+        assert!(check_cache_path(&file, true).is_err());
+        set_mode(&file, 0o644);
+        check_cache_path(&file, true).unwrap();
+
+        set_mode(&build, 0o770);
+        assert!(check_cache_path(&file, true).is_err());
+        assert!(check_cache_path(&file, false).is_err());
+        set_mode(&build, 0o755);
+        check_cache_path(&file, true).unwrap();
+
+        set_mode(&root, 0o777);
+        assert!(check_cache_path(&file, true).is_err());
+        assert!(check_cache_path(&file, false).is_err());
+        set_mode(&root, 0o1777);
+        assert!(check_cache_path(&file, true).is_err());
+        set_mode(&root, 0o700);
+
+        // A symbolic link in place of the file or the build directory.
+        let elsewhere = root.join("elsewhere.so");
+        write_new(&elsewhere, b"code").unwrap();
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &file).unwrap();
+        assert!(check_cache_path(&file, true).is_err());
+        std::fs::remove_file(&file).unwrap();
+        std::fs::remove_dir(&build).unwrap();
+        std::os::unix::fs::symlink(&root, &build).unwrap();
+        assert!(check_cache_path(&file, false).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Temporary files never reuse an existing name, nor follow a
+    /// symbolic link planted in their place.
+    #[test]
+    fn temporary_files_are_new() {
+        let root = scratch("temp", 0o700);
+        let victim = root.join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let planted = root.join("planted");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        assert!(write_new(&planted, b"overwritten").is_err());
+        assert!(write_new(&victim, b"overwritten").is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        let new = root.join("new");
+        write_new(&new, b"data").unwrap();
+        assert_eq!(std::fs::metadata(&new).unwrap().mode() & 0o777, 0o600);
+
+        // Private temporary directories, each new, removed when dropped.
+        let a = TempDir::new(&root).unwrap();
+        let b = TempDir::new(&root).unwrap();
+        assert_ne!(a.0, b.0);
+        assert_eq!(std::fs::metadata(&a.0).unwrap().mode() & 0o777, 0o700);
+        write_new(&a.0.join("unit.o"), b"object").unwrap();
+        let path = a.0.clone();
+        drop(a);
+        assert!(!path.exists());
+        drop(b);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

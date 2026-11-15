@@ -52,6 +52,45 @@ pub(crate) const fn protection_fault(addr: u64) -> MachineError {
     MachineError::trigger(ExceptionKind::ProtectionFault, addr)
 }
 
+/// A host file of `FileDescriptors::pinned_mappings` mapped into guest
+/// memory: `len` bytes at `vaddr`, from `offset` in the file at `path`.
+/// What the guest did with the memory since is not tracked: a segment's
+/// bytes are compared with the file's ([`Memory::came_from_pinned_file`]).
+#[cfg(feature = "jit")]
+#[derive(Debug, Clone)]
+pub(crate) struct PinnedFileMapping {
+    pub vaddr: u64,
+    pub len: u64,
+    pub path: String,
+    pub offset: u64,
+}
+
+/// The most [`PinnedFileMapping`]s a machine remembers (the oldest are
+/// forgotten): a few per library is what a dynamic linker maps.
+#[cfg(feature = "jit")]
+const MAX_PINNED_FILE_MAPPINGS: usize = 64;
+
+/// True if the file at `path` holds exactly `code` at `offset`.
+#[cfg(feature = "jit")]
+fn file_holds(path: &str, offset: u64, code: &[u8]) -> bool {
+    use std::os::unix::fs::FileExt;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = vec![0u8; code.len().min(1 << 16)];
+    let mut pos = offset;
+    for chunk in code.chunks(buf.len().max(1)) {
+        let Some(buf) = buf.get_mut(..chunk.len()) else {
+            return false;
+        };
+        if file.read_exact_at(buf, pos).is_err() || buf != chunk {
+            return false;
+        }
+        pos = pos.wrapping_add(chunk.len() as u64);
+    }
+    true
+}
+
 /// Guest memory: the flat arena, the page table, the program layout and the
 /// execute segments.
 #[derive(Debug)]
@@ -126,6 +165,10 @@ pub struct Memory {
     /// Use and fill a directory of cached code (`MachineOptions::jit_cache_dir`).
     #[cfg(feature = "jit")]
     jit_cache_dir: Option<crate::jit::cache::CacheDir>,
+    /// Pinned host files mapped into guest memory (newest last): where the
+    /// segments a [`CacheDir`](crate::jit_cache::CacheDir) saves come from.
+    #[cfg(feature = "jit")]
+    pinned_files: Vec<PinnedFileMapping>,
     /// `MachineOptions::verbose_loader`, for the JIT cache and translations.
     #[cfg(any(feature = "jit", feature = "aot"))]
     jit_verbose: bool,
@@ -296,6 +339,8 @@ impl Memory {
             jit_cache_output: options.jit_cache_output.clone(),
             #[cfg(feature = "jit")]
             jit_cache_dir: options.jit_cache_dir.clone(),
+            #[cfg(feature = "jit")]
+            pinned_files: Vec::new(),
             #[cfg(any(feature = "jit", feature = "aot"))]
             jit_verbose: options.verbose_loader,
             #[cfg(feature = "aot")]
@@ -381,6 +426,8 @@ impl Memory {
             jit_cache_output: options.jit_cache_output.clone(),
             #[cfg(feature = "jit")]
             jit_cache_dir: options.jit_cache_dir.clone(),
+            #[cfg(feature = "jit")]
+            pinned_files: self.pinned_files.clone(),
             #[cfg(any(feature = "jit", feature = "aot"))]
             jit_verbose: options.verbose_loader,
             #[cfg(feature = "aot")]
@@ -569,6 +616,66 @@ impl Memory {
         self.exec.iter().flatten().find(|s| s.is_within(vaddr, 2))
     }
 
+    /// Remember that `len` bytes at `vaddr` were read from `offset` in the
+    /// pinned host file at `path` (by `mmap`).
+    #[cfg(feature = "jit")]
+    pub(crate) fn record_pinned_file(&mut self, vaddr: u64, len: u64, path: &str, offset: u64) {
+        if self.pinned_files.len() >= MAX_PINNED_FILE_MAPPINGS {
+            self.pinned_files.remove(0);
+        }
+        self.pinned_files.push(PinnedFileMapping {
+            vaddr,
+            len,
+            path: path.to_owned(),
+            offset,
+        });
+    }
+
+    /// True if `code`, a segment at `vaddr`, is exactly what lies there in
+    /// a pinned host file mapped over it: then its bytes came from a file
+    /// the host chose, whatever the guest did since. Reads the file.
+    #[cfg(feature = "jit")]
+    pub(crate) fn came_from_pinned_file(&self, vaddr: u64, code: &[u8]) -> bool {
+        let len = code.len() as u64;
+        let end = vaddr.saturating_add(len);
+        // Only the latest mapping there counts (it replaced the others):
+        // one file read per segment at most.
+        let Some(m) = self
+            .pinned_files
+            .iter()
+            .rev()
+            .find(|m| m.vaddr < end && vaddr < m.vaddr.saturating_add(m.len))
+        else {
+            return false;
+        };
+        vaddr
+            .checked_sub(m.vaddr)
+            .filter(|&skip| skip.checked_add(len).is_some_and(|end| end <= m.len))
+            .and_then(|skip| m.offset.checked_add(skip))
+            .is_some_and(|offset| file_holds(&m.path, offset, code))
+    }
+
+    /// True if the segment `code` at `vaddr` (the program's `initial`
+    /// one, or a `rebuilt` one) is saved to the cache directory `dir` once
+    /// compiled: only if its bytes came from a file the host chose, see
+    /// [`CacheDir`](crate::jit_cache::CacheDir).
+    #[cfg(feature = "jit")]
+    pub(crate) fn saves_to_cache_dir(
+        &self,
+        dir: &crate::jit::cache::CacheDir,
+        vaddr: u64,
+        code: &[u8],
+        initial: bool,
+        rebuilt: bool,
+    ) -> bool {
+        !rebuilt
+            && self.patches.ebreak_locations.is_empty()
+            && crate::jit::cache::may_save()
+            && ((initial && dir.initial_segment)
+                || (dir.in_ranges(vaddr, code.len() as u64)
+                    && self.came_from_pinned_file(vaddr, code)))
+    }
+
     /// Number of non-main execute segment slots (C++ `execute_segments_count`).
     pub fn execute_segments_count(&self) -> usize {
         self.exec.len()
@@ -616,17 +723,27 @@ impl Memory {
         #[cfg(all(feature = "jit", not(feature = "aot")))]
         let (aot_saving, aot_lookup) = (false, false);
         // A segment of the cache directory is looked up there, and saved
-        // there if the JIT compiles it.
+        // there if the JIT compiles it and its bytes came from a file the
+        // host chose: the program (`initial_segment`), or a pinned file
+        // mapped over it (`ranges`). Not guest-written code, which could
+        // otherwise take any segment's place (the key can be forged), nor
+        // a rebuild (FENCE.I) or anything past the limit on saves.
         #[cfg(feature = "jit")]
-        let (jit_saving, jit_lookup, cache_dir) = {
+        let (jit_saving, jit_lookup, cache_dir, dir_save) = {
             let saving = jit && self.jit_cache_output.is_some();
-            let dir = self.jit_cache_dir.as_ref().filter(|d| {
-                jit && self.jit_cache && !saving && d.covers(vaddr, code.len() as u64, initial)
+            let len = code.len() as u64;
+            let dir = self
+                .jit_cache_dir
+                .as_ref()
+                .filter(|d| jit && self.jit_cache && !saving && d.covers(vaddr, len, initial));
+            let dir_save = dir.is_some_and(|d| {
+                self.saves_to_cache_dir(d, vaddr, code, initial, rebuilt_from.is_some())
             });
             (
                 saving,
                 self.jit_cache && !saving && (dir.is_some() || crate::jit::cache::any()),
                 dir,
+                dir_save,
             )
         };
         #[cfg(all(feature = "aot", not(feature = "jit")))]
@@ -659,7 +776,7 @@ impl Memory {
             (lookup, found, save)
         };
         #[cfg(feature = "jit")]
-        let (cache_key, save) = {
+        let (cache_key, save, cache_file) = {
             let key = native_key
                 .filter(|_| jit_saving || jit_lookup)
                 .and_then(crate::jit::cache::cache_key);
@@ -671,15 +788,15 @@ impl Memory {
                     file: None,
                     verbose,
                 }),
-                (_, Some(key)) if file.is_some() => Some(crate::jit::Save {
+                (_, Some(key)) if dir_save && file.is_some() => Some(crate::jit::Save {
                     key,
                     output: None,
-                    file,
+                    file: file.clone(),
                     verbose,
                 }),
                 _ => None,
             };
-            (key.filter(|_| jit_lookup), save)
+            (key.filter(|_| jit_lookup), save, file)
         };
         let build = |shared| {
             let mut segment = DecodedSegment::new(code, vaddr, execute_only, crc32c, shared)?;
@@ -709,10 +826,10 @@ impl Memory {
             #[cfg(feature = "jit")]
             let cached = match cache_key.filter(|_| !translated) {
                 Some(key) => {
-                    if let Some(file) = save.as_ref().and_then(|s| s.file.as_deref()) {
+                    if let Some(file) = &cache_file {
                         crate::jit::cache::load_file(file, verbose);
                     }
-                    let compiled = crate::jit::cache::lookup(&key, segment.cache.len());
+                    let compiled = crate::jit::cache::lookup(&key, code, segment.cache.len());
                     if verbose {
                         let found = if compiled.is_some() { "Found" } else { "No" };
                         eprintln!(

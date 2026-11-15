@@ -729,10 +729,17 @@ code generator's sources (`jit/{emit,mod}.rs` and `codegen::SHARED_SOURCES`:
 `bytecode.rs`, `instruction.rs`, `native/libc.rs`). The key type,
 `codegen::NativeKey`, is the one translations use; the code is hashed once
 per segment for both. So code from another build, CPU or arena size is skipped,
-not run (`verbose_loader` reports hits and misses). That protects against
-accidents, not malice: loading a shared object or linking an object runs
-its code, like any native library. Segments with breakpoints are never
-cached. Loading a static glibc C++ program's 20 MB of code takes 0.14 s,
+not run (`verbose_loader` reports hits and misses). The key's CRC32-C and
+FNV hash tell segments apart but are forgeable in milliseconds (CRC32-C is
+linear, the FNV step invertible), so each unit's metadata (format
+`RVJITM02`; `RVJITM01` units are ignored) also stores the guest code it
+was compiled from, and a unit is only installed for a segment with exactly
+those bytes (`Meta::fits`, as `shared_segment` compares bytes for the
+in-process cache). That covers the cache directory, `--jit-load` and
+embedded units alike; units with one key but different code are all kept
+in the registry and the segment's bytes pick one. Loading a shared object
+or linking an object still runs its code, like any native library: only
+load files you would run. Segments with breakpoints are never cached. Loading a static glibc C++ program's 20 MB of code takes 0.14 s,
 against 12 s to compile it (debug build). Tests: `libriscv`'s
 `tests/jit_cache.rs` (two segments, library API), the
 `saved_libcalls_match_the_interpreter` unit test (baseline x86-64, libcalls
@@ -748,15 +755,44 @@ it): `MachineOptions::jit_cache_dir` (a `jit_cache::CacheDir`: a path,
 whether it covers the initial segment, and address ranges). With `jit`,
 each segment it covers is looked up in
 `<dir>/<build fingerprint>/<vaddr>-<key hash>.so` (`dlopen`ed once per
-process), and if the JIT compiles it, written there (`write_shared_object`
-to a temporary name, then renamed, so concurrent processes are fine).
+process), and if the JIT compiles it, written there (linked in a private
+temporary directory, mode 0700 and an unpredictable name, the object
+written with `create_new`, then renamed into place, so concurrent
+processes are fine and nobody can plant a file or symlink in the way).
+**Trust** (security review, finding 1: a guest could save its own code
+under a system library's forged key, and later runs would execute it in
+place of the library): a segment is only *saved* if its bytes came from a
+file the host chose: the initial segment when `CacheDir::initial_segment`
+says so, or a segment in `ranges` whose bytes are exactly those of a
+`FileDescriptors::pinned_mappings` file mapped over it (`mmap` records
+each pinned-file mapping in `Memory`, the last 64; at segment creation
+the file is read again and compared, `Memory::came_from_pinned_file`, so
+guest writes after the mapping are caught without tracking them). Never
+a rebuilt segment (`rebuilt_from`). Looking up is still by address range
+(safe: bytes are compared). A process saves at most `MAX_SAVES` (32)
+files and `MAX_SAVE_BYTES` (512 MiB), and nothing to a build subdirectory
+holding `MAX_DIR_FILES` (256) entries. Directories are created with mode
+0700, and the cache directory, its build subdirectory and each file must
+be owned by the effective user (`libriscv_jit_rt::effective_uid`, a
+`safe` `geteuid` declaration) and not writable by group or others, or
+nothing is loaded from or saved to them; the build subdirectory and file
+must not be symlinks. Tests: the unit tests in `jit/cache.rs`
+(`cached_code_is_only_used_for_the_code_it_was_compiled_from`,
+`cache_paths_must_be_private`, `temporary_files_are_new`,
+`saves_are_limited`), `mman.rs`'s
+`only_code_from_pinned_files_is_saved_to_the_cache_dir`, and
+`tests/jit_cache_integrity.rs` (x86-64 Linux: a shared object with a
+forged key is not used; code given to `init_execute_area` in a cache
+range is not saved).
 The write is part of the compilation, also in the background; such
 compilations are counted, and `jit_cache::wait_for_saves` waits for them,
 since background threads don't keep a process alive. Unlike saving to a
 `JitCacheOutput`, it doesn't stop a machine from sharing segments.
 Nothing is ever deleted (a new build gets a new subdirectory).
 `rvlinux`'s JIT (on by default) uses it for dynamic executables: the dynamic linker (the
-initial segment) and the pinned library slots (see "Execute segments
+initial segment, only if it is the system's: `PT_INTERP` resolving to a
+file in `/usr/riscv64-linux-gnu/lib/`, or the fallback `DYNAMIC_LINKER`)
+and the pinned library slots (see "Execute segments
 from pages" under memory), never the program, in
 `--jit-cache-dir`, else `$XDG_CACHE_HOME/rvlinux/jit` or
 `~/.cache/rvlinux/jit`. `--no-jit-cache` turns it off. The first run

@@ -117,6 +117,23 @@ fn pinned_address(m: &mut Machine, vfd: i32, length: u64) -> Option<u64> {
     })
 }
 
+/// If file `vfd` is one of the pinned files, remember that it was mapped
+/// at `dst` (`length` bytes from `offset`): segments there whose bytes are
+/// the file's may be saved to the JIT cache directory
+/// ([`CacheDir`](crate::jit_cache::CacheDir)), at any address.
+#[cfg(feature = "jit")]
+fn record_pinned_file(m: &mut Machine, vfd: i32, dst: u64, length: u64, offset: u64) {
+    let Some(fds) = m.fds.as_deref_mut() else {
+        return;
+    };
+    let Some(path) = fds.get(vfd).map(|f| f.path.clone()) else {
+        return;
+    };
+    if fds.pinned_mappings.iter().any(|(p, _)| *p == path) {
+        m.memory.record_pinned_file(dst, length, &path, offset);
+    }
+}
+
 pub(super) fn syscall_mmap(m: &mut Machine) -> Result<()> {
     let addr_g = m.sysarg(0);
     let length = m.sysarg(1);
@@ -175,6 +192,8 @@ pub(super) fn syscall_mmap(m: &mut Machine) -> Result<()> {
         if !map_file(m, vfd, voff, dst, length)? {
             return failed(m);
         }
+        #[cfg(feature = "jit")]
+        record_pinned_file(m, vfd, dst, length, voff);
         m.memory.set_page_attr(dst, length, attr)?;
         m.set_result(dst);
         return Ok(());
@@ -312,4 +331,139 @@ pub(super) fn syscall_madvise(m: &mut Machine) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[cfg(feature = "jit")]
+mod tests {
+    use super::*;
+    use crate::MachineOptions;
+    use crate::jit_cache::CacheDir;
+    use crate::registers::REG_ARG0;
+    use crate::syscalls::fds::OpenFile;
+
+    const PIN: u64 = 32 << 20;
+    const PROT_RW: u64 = 3;
+    const PROT_RX: u64 = 5;
+    const MAP_PRIVATE: u64 = 2;
+    const FIXED: u64 = MAP_PRIVATE | MAP_FIXED as u64;
+
+    fn call(m: &mut Machine, f: fn(&mut Machine) -> Result<()>, args: &[u64]) -> u64 {
+        for (i, &a) in (0u32..).zip(args) {
+            m.cpu.set_reg(REG_ARG0 + i, a);
+        }
+        f(m).unwrap();
+        m.return_value()
+    }
+
+    /// Whether the segment of `len` bytes at `vaddr` in `m`'s memory
+    /// would be saved to `dir` (not initial, not a rebuild).
+    fn saves(m: &Machine, dir: &CacheDir, vaddr: u64, len: usize) -> bool {
+        let mut code = vec![0; len];
+        m.copy_from_guest(&mut code, vaddr).unwrap();
+        m.memory.saves_to_cache_dir(dir, vaddr, &code, false, false)
+    }
+
+    /// A guest can't get code of its own saved to a JIT cache directory
+    /// (where later runs would use it in place of a library: the key's
+    /// hashes can be forged): only segments whose bytes are a pinned
+    /// file's, mapped there, are saved. Its own code in the pinned range
+    /// isn't, nor a library's code it changed.
+    #[test]
+    fn only_code_from_pinned_files_is_saved_to_the_cache_dir() {
+        let dir =
+            std::env::temp_dir().join(format!("libriscv-pinned-origin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib = dir.join("lib.so");
+        let contents: Vec<u8> = (0..3 * PAGE_SIZE).map(|i| (i * 7 + 3) as u8).collect();
+        std::fs::write(&lib, &contents).unwrap();
+        let path = lib.to_str().unwrap().to_owned();
+        let mut m = Machine::new(
+            &[],
+            MachineOptions {
+                memory_max: 64 << 20,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        m.setup_linux_syscalls(true, false);
+        let fds = m.fds_mut().unwrap();
+        fds.pinned_mappings = vec![(path.clone(), PIN)];
+        let file = OpenFile {
+            file: std::fs::File::open(&lib).unwrap(),
+            path,
+            access: 0,
+        };
+        let vfd = u64::from(fds.assign_file(file).unwrap().cast_unsigned());
+        let cache = CacheDir {
+            path: dir.join("cache"),
+            initial_segment: false,
+            ranges: std::iter::once(PIN..PIN + (16 << 20)).collect(),
+        };
+        let len = contents.len() as u64;
+
+        // The guest writes the library's very bytes into the range itself:
+        // not saved (nothing was mapped from the file).
+        let anonymous = FIXED | MAP_ANONYMOUS as u64;
+        let args = [PIN, len, PROT_RW, anonymous, u64::MAX, 0];
+        assert_eq!(call(&mut m, syscall_mmap, &args), PIN);
+        m.copy_to_guest(PIN, &contents).unwrap();
+        call(&mut m, syscall_mprotect, &[PIN, len, PROT_RX]);
+        assert!(!saves(&m, &cache, PIN, contents.len()));
+
+        // The file mapped there: saved, all of it or a part.
+        assert_eq!(
+            call(&mut m, syscall_mmap, &[PIN, len, PROT_RX, FIXED, vfd, 0]),
+            PIN
+        );
+        assert!(saves(&m, &cache, PIN, contents.len()));
+        assert!(saves(&m, &cache, PIN + PAGE_SIZE, PAGE_SIZE as usize));
+        // Not past the mapping, nor outside the ranges, nor as a rebuild.
+        assert!(!saves(&m, &cache, PIN, contents.len() + PAGE_SIZE as usize));
+        let elsewhere = CacheDir {
+            ranges: Vec::new(),
+            ..cache.clone()
+        };
+        assert!(!saves(&m, &elsewhere, PIN, contents.len()));
+        assert!(
+            !m.memory
+                .saves_to_cache_dir(&cache, PIN, &contents, false, true)
+        );
+
+        // The guest changes a byte of the mapped file: that page is no
+        // longer the file's, the others still are.
+        call(&mut m, syscall_mprotect, &[PIN, len, PROT_RW]);
+        m.copy_to_guest(PIN + 100, &[!contents[100]]).unwrap();
+        call(&mut m, syscall_mprotect, &[PIN, len, PROT_RX]);
+        assert!(!saves(&m, &cache, PIN, contents.len()));
+        assert!(!saves(&m, &cache, PIN, PAGE_SIZE as usize));
+        assert!(saves(&m, &cache, PIN + PAGE_SIZE, 2 * PAGE_SIZE as usize));
+
+        // A mapping from an offset in the file is compared at that offset.
+        let at = PIN + (1 << 20);
+        let args = [at, PAGE_SIZE, PROT_RX, FIXED, vfd, PAGE_SIZE];
+        assert_eq!(call(&mut m, syscall_mmap, &args), at);
+        assert!(saves(&m, &cache, at, PAGE_SIZE as usize));
+        // Anonymous memory over it: guest code again.
+        let args = [at, PAGE_SIZE, PROT_RW, anonymous, u64::MAX, 0];
+        assert_eq!(call(&mut m, syscall_mmap, &args), at);
+        m.copy_to_guest(at, &[1, 2, 3, 4]).unwrap();
+        assert!(!saves(&m, &cache, at, PAGE_SIZE as usize));
+
+        // The initial segment (the host's program): only if the directory
+        // says so.
+        assert!(
+            !m.memory
+                .saves_to_cache_dir(&cache, 0x1000, &contents, true, false)
+        );
+        let initial = CacheDir {
+            initial_segment: true,
+            ..cache.clone()
+        };
+        assert!(
+            m.memory
+                .saves_to_cache_dir(&initial, 0x1000, &contents, true, false)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
