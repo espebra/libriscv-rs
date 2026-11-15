@@ -70,6 +70,16 @@ pub struct MachineOptions {
     /// system calls, so `stop()` still works. Translations are only used
     /// by machines with the same setting.
     pub jit_ignore_instruction_limit: bool,
+    /// With `jit`, guard native code against speculation past its bounds
+    /// checks (Spectre v1; default on): the accesses a check covers take
+    /// their base register through a conditional move, and so do entry
+    /// table lookups, so that even speculatively guest code reads nothing
+    /// outside the arena. Turn it off only for trusted guests: it costs
+    /// about a quarter of CoreMark's speed in native code with bounds
+    /// checks. Masked accesses (`jit_automatic_nbit_address_space`) don't
+    /// need the guard and don't pay for it. Results are the same either
+    /// way.
+    pub jit_spectre_guards: bool,
     /// Use JIT code compiled by an earlier run for the execute segments it
     /// was compiled for (default on): code linked into the program, and
     /// code from shared objects loaded with
@@ -177,6 +187,7 @@ impl Default for MachineOptions {
             jit_background_slice: crate::JIT_BACKGROUND_SLICE,
             jit_automatic_nbit_address_space: false,
             jit_ignore_instruction_limit: false,
+            jit_spectre_guards: true,
             jit_cache: true,
             #[cfg(feature = "jit")]
             jit_cache_output: None,

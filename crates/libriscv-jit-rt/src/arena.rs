@@ -27,6 +27,10 @@
 //! disappear (no `SIGBUS`).
 //!
 //! The arena itself is a `memmap2` anonymous mapping on every platform.
+//! On Linux it lies between two [`GUARD`] bytes of inaccessible pages, so
+//! that an access a little outside it faults instead of reaching other
+//! memory: defense in depth for native code, whose own bounds checks keep
+//! it inside the arena.
 //! Images need sealable memfds and a fixed-address `mmap`, which `memmap2`
 //! doesn't offer: the few Linux calls for those are declared in [`sys`] by
 //! hand (like `dlopen` in `linked.rs`), for the architectures whose `mmap`
@@ -51,6 +55,11 @@ pub fn host_page_size() -> usize {
     sys::page_size()
 }
 
+/// Inaccessible bytes on each side of an arena (Linux): more than any
+/// offset an access instruction encodes, and a multiple of every host page
+/// size. Address space only: `PROT_NONE`, `MAP_NORESERVE`.
+pub(crate) const GUARD: usize = if sys::SUPPORTED { 1 << 20 } else { 0 };
+
 /// Zero-initialized guest memory: an anonymous private mapping of `len`
 /// bytes (`MAP_NORESERVE` where the platform has it, so untouched pages
 /// cost nothing), owned exclusively like a `Box<[u8]>`. The low part of it
@@ -66,6 +75,8 @@ pub struct GuestArena {
     /// The length of the image attached at the start, 0 for none: pages
     /// that [`GuestArena::zero_pages`] must not drop.
     attached: usize,
+    /// Where `ptr` lies in `map`: after the low guard ([`GUARD`], or 0).
+    guard: usize,
 }
 
 // SAFETY: the arena exclusively owns its mapping, like a `Box<[u8]>`, and
@@ -93,6 +104,7 @@ impl GuestArena {
             len: 0,
             map: None,
             attached: 0,
+            guard: 0,
         }
     }
 
@@ -101,13 +113,38 @@ impl GuestArena {
         if len == 0 {
             return Ok(Self::empty());
         }
-        let mut map = MmapOptions::new().len(len).no_reserve_swap().map_anon()?;
-        let ptr = NonNull::new(map.as_mut_ptr()).ok_or_else(|| io::Error::other("null mapping"))?;
+        // [low guard][arena, up to a page boundary][high guard]
+        let too_big = || io::Error::from(io::ErrorKind::OutOfMemory);
+        let high = len
+            .checked_next_multiple_of(host_page_size())
+            .and_then(|l| l.checked_add(GUARD))
+            .ok_or_else(too_big)?;
+        let total = high.checked_add(GUARD).ok_or_else(too_big)?;
+        let mut map = MmapOptions::new().len(total).no_reserve_swap().map_anon()?;
+        let base = map.as_mut_ptr();
+        if GUARD != 0 {
+            // SAFETY: the low guard is the first whole pages of the mapping
+            // just made, which nothing borrows yet; the arena isn't touched.
+            #[allow(unsafe_code)]
+            unsafe {
+                sys::protect_none(base, GUARD)?;
+            }
+            // SAFETY: the high guard is the last whole pages of that
+            // mapping (`high` is a multiple of the page size), past the
+            // arena.
+            #[allow(unsafe_code)]
+            unsafe {
+                sys::protect_none(base.wrapping_add(high), GUARD)?;
+            }
+        }
+        let ptr = NonNull::new(base.wrapping_add(GUARD))
+            .ok_or_else(|| io::Error::other("null mapping"))?;
         Ok(Self {
             ptr,
-            len: map.len(),
+            len,
             map: Some(map),
             attached: 0,
+            guard: GUARD,
         })
     }
 
@@ -197,21 +234,25 @@ impl GuestArena {
         #[cfg(target_os = "linux")]
         {
             // SAFETY: `[start, end)` is whole pages of our own private
-            // anonymous mapping (checked above: `ptr` is the mapping's
-            // start, so memmap2 doesn't widen the range to align it), past
-            // any attached image, and `&mut self` means nothing borrows
-            // them. On Linux, such pages read as zeroes after
+            // anonymous mapping (checked above: `ptr` is `guard` bytes, a
+            // whole number of pages, into it, so the offset is page-aligned
+            // and memmap2 doesn't widen the range to align it), past any
+            // attached image, and `&mut self` means nothing borrows them. On Linux, such pages read as zeroes after
             // `MADV_DONTNEED`, which is the effect wanted; the mapping
             // itself, and so `ptr` and `len`, stay as they are.
             #[allow(unsafe_code)]
             let dropped = unsafe {
-                map.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, start, len)
+                map.unchecked_advise_range(
+                    memmap2::UncheckedAdvice::DontNeed,
+                    self.guard + start,
+                    len,
+                )
             };
             dropped.is_ok()
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = map;
+            let _ = (map, self.guard);
             false
         }
     }
@@ -322,6 +363,7 @@ mod sys {
 
     pub(super) const SUPPORTED: bool = true;
 
+    const PROT_NONE: c_int = 0;
     const PROT_READ: c_int = 1;
     const PROT_WRITE: c_int = 2;
     const MAP_PRIVATE: c_int = 0x02;
@@ -351,6 +393,7 @@ mod sys {
             offset: i64,
         ) -> *mut c_void;
         fn memfd_create(name: *const c_char, flags: c_uint) -> c_int;
+        fn mprotect(addr: *mut c_void, len: usize, prot: c_int) -> c_int;
         fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
         safe fn sysconf(name: c_int) -> c_long;
     }
@@ -382,6 +425,22 @@ mod sys {
             )
         };
         if addr == base.cast() {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// Make `[base, base + len)` inaccessible (`PROT_NONE`).
+    ///
+    /// # Safety
+    ///
+    /// The range must be whole pages of a mapping the caller owns and
+    /// nothing borrows: any access to them faults afterwards.
+    #[allow(unsafe_code)]
+    pub(super) unsafe fn protect_none(base: *mut u8, len: usize) -> io::Result<()> {
+        // SAFETY: the caller's contract; the result is checked.
+        if unsafe { mprotect(base.cast(), len, PROT_NONE) } == 0 {
             Ok(())
         } else {
             Err(io::Error::last_os_error())
@@ -492,6 +551,12 @@ mod sys {
         unsupported()
     }
 
+    /// Never called: there are no guards (`GUARD` is 0) where this is.
+    #[allow(unsafe_code)]
+    pub(super) unsafe fn protect_none(_: *mut u8, _: usize) -> io::Result<()> {
+        unsupported()
+    }
+
     pub(super) fn new_memfd() -> io::Result<File> {
         unsupported()
     }
@@ -540,6 +605,42 @@ mod tests {
             assert_eq!(arena[3 * page], 1);
         }
         assert!(!GuestArena::empty().zero_pages(0, page));
+    }
+
+    /// On Linux the arena lies between two inaccessible guards, also with
+    /// a length that isn't a whole number of pages.
+    #[test]
+    fn arenas_have_guard_pages() {
+        let len = 3 * host_page_size() + 100;
+        let mut arena = GuestArena::new(len).unwrap();
+        assert_eq!(arena.len(), len);
+        arena[0] = 1;
+        arena[len - 1] = 2;
+        assert_eq!((arena[0], arena[len - 1]), (1, 2));
+        if GUARD == 0 {
+            return;
+        }
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        // Whether `[from, to)` lies in one inaccessible mapping.
+        let inaccessible = |from: usize, to: usize| {
+            maps.lines().any(|line| {
+                let mut fields = line.split_whitespace();
+                let (Some(range), Some(perms)) = (fields.next(), fields.next()) else {
+                    return false;
+                };
+                let Some((lo, hi)) = range.split_once('-') else {
+                    return false;
+                };
+                let lo = usize::from_str_radix(lo, 16).unwrap();
+                let hi = usize::from_str_radix(hi, 16).unwrap();
+                perms.starts_with("---") && lo <= from && to <= hi
+            })
+        };
+        let start = arena.as_ptr() as usize;
+        let end = (start + len).next_multiple_of(host_page_size());
+        assert!(inaccessible(start - GUARD, start), "{maps}");
+        assert!(inaccessible(end, end + GUARD), "{maps}");
+        assert!(!inaccessible(start, start + 1));
     }
 
     #[test]

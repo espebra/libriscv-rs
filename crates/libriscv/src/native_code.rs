@@ -72,6 +72,7 @@ pub(crate) struct MemoryLayout {
     pub read: (u64, u64),
     pub write: (u64, u64),
     pub unlimited: bool,
+    pub unguarded: bool,
 }
 
 /// What a call into native code ended with.

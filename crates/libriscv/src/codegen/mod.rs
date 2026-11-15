@@ -81,7 +81,8 @@ impl NativeKey {
     pub(crate) fn words(&self) -> [u64; Self::WORDS] {
         let flags = u64::from(self.execute_only)
             | u64::from(self.libc_fastpath) << 1
-            | u64::from(self.layout.unlimited) << 2;
+            | u64::from(self.layout.unlimited) << 2
+            | u64::from(self.layout.unguarded) << 3;
         let l = &self.layout;
         [
             self.build,
@@ -114,6 +115,7 @@ impl NativeKey {
                 read: (rb, rl),
                 write: (wb, wl),
                 unlimited: flags & 4 != 0,
+                unguarded: flags & 8 != 0,
             },
         })
     }
@@ -173,6 +175,7 @@ mod tests {
                 read: (0x1000, 0x2000),
                 write: (0x3000, 0x400),
                 unlimited: true,
+                unguarded: true,
             },
         };
         assert_eq!(NativeKey::from_words(key.words()), Some(key));
