@@ -25,9 +25,12 @@ pub type IoctlFilter = Box<dyn FnMut(u64) -> bool + Send + Sync>;
 #[derive(Debug)]
 pub struct OpenFile {
     pub file: File,
-    /// The (filtered) path it was opened with; relative `openat` lookups
-    /// against a directory descriptor use it.
+    /// The host path it was opened with (what `filter_open` returned).
     pub path: String,
+    /// The guest path it was opened as: absolute and normalised, before
+    /// `filter_open` rewrote it. Paths relative to a directory descriptor
+    /// are joined to it before they go through the filters.
+    pub guest_path: String,
     /// The access mode bits (`O_ACCMODE`) it was opened with, for `F_GETFL`.
     pub access: i32,
 }
@@ -46,13 +49,45 @@ pub struct FileDescriptors {
     /// The working directory the guest sees (a fake root by default).
     pub cwd: String,
     file_counter: i32,
-    /// Allow opening files at all (subject to `filter_open`).
+    /// Allow the path-based system calls (`openat`, `fstatat`,
+    /// `faccessat`, `readlinkat`) at all. On its own this opens nothing:
+    /// outside [`proxy_mode`](Self::proxy_mode), a path reaches the host
+    /// only when [`filter_open`](Self::filter_open) (or `filter_stat`,
+    /// `filter_readlink`) admits it.
     pub permit_filesystem: bool,
     /// Allow sockets (not ported yet; kept for API parity).
     pub permit_sockets: bool,
     /// Proxy mode: the guest may write to files and see host details
-    /// (exact time). Disables most of the sandbox.
+    /// (exact time), and with no filter installed every path is admitted.
+    /// Disables most of the sandbox.
     pub proxy_mode: bool,
+    /// Allow opening files that are neither regular files nor directories:
+    /// devices (`/dev/urandom`, but also `/dev/tty`), FIFOs and sockets.
+    /// Off by default, because opening or reading one can block the host
+    /// thread indefinitely, outside any instruction limit. The type is
+    /// checked on the file a path resolves to, so a symbolic link to such
+    /// a file is refused too. Not in C++, which opens anything admitted.
+    pub permit_special_files: bool,
+    /// Decides which paths `openat` and `faccessat` may use (and `fstatat`
+    /// without `filter_stat`). With no filter, every path is denied unless
+    /// [`proxy_mode`](Self::proxy_mode) is on.
+    ///
+    /// The filter is given an absolute, lexically normalised guest path
+    /// (see [`normalize_path`](Self::normalize_path)): `.`, `..` and
+    /// repeated slashes are collapsed before it runs, and a path relative
+    /// to a directory descriptor is joined to the directory's guest path
+    /// first. So a prefix check like `path.starts_with("/srv/data/")`
+    /// can't be escaped with `..`. Relative paths through `AT_FDCWD` are
+    /// `EBADF` (as in C++, the guest has no host working directory) and
+    /// never reach the filter. The filter may rewrite the path: what it
+    /// leaves in the string is the host path that is opened, as is (a
+    /// relative one is relative to the host process's working directory).
+    ///
+    /// The host still resolves symbolic links when it opens the path, so
+    /// a link inside an admitted directory leads wherever it points:
+    /// admit only paths whose contents you trust. Files that aren't
+    /// regular files or directories are refused unless
+    /// [`permit_special_files`](Self::permit_special_files) is set.
     pub filter_open: Option<PathFilter>,
     pub filter_readlink: Option<PathFilter>,
     pub filter_stat: Option<StatFilter>,
@@ -75,6 +110,7 @@ impl core::fmt::Debug for FileDescriptors {
             .field("permit_filesystem", &self.permit_filesystem)
             .field("permit_sockets", &self.permit_sockets)
             .field("proxy_mode", &self.proxy_mode)
+            .field("permit_special_files", &self.permit_special_files)
             .finish_non_exhaustive()
     }
 }
@@ -88,6 +124,7 @@ impl Default for FileDescriptors {
             permit_filesystem: false,
             permit_sockets: false,
             proxy_mode: false,
+            permit_special_files: false,
             filter_open: None,
             filter_readlink: None,
             filter_stat: None,
@@ -103,6 +140,37 @@ impl FileDescriptors {
     /// Files the guest may have open at once (C++ has no limit). Guests
     /// leaking descriptors would otherwise exhaust the host's.
     pub const MAX_FILES: usize = 1024;
+
+    /// Lexically normalise a guest path into the absolute form the filters
+    /// are given: empty, `.` and `..` components are collapsed (`..` at the
+    /// root stays at the root), and the result starts with `/`. A relative
+    /// path is treated as relative to `/`. A trailing slash (or a final
+    /// `.` or `..`) is kept as a trailing slash, so `"/etc/hosts/"` stays
+    /// distinct from `"/etc/hosts"`. Symbolic links aren't consulted: the
+    /// normalised path is the one that is opened.
+    pub fn normalize_path(path: &str) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        let mut trailing = false;
+        for component in path.split('/') {
+            trailing = matches!(component, "" | "." | "..");
+            match component {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                c => parts.push(c),
+            }
+        }
+        let mut out = String::with_capacity(path.len() + 1);
+        for part in parts {
+            out.push('/');
+            out.push_str(part);
+        }
+        if out.is_empty() || trailing {
+            out.push('/');
+        }
+        out
+    }
 
     /// Register an open file and return its virtual file descriptor, or
     /// `None` when the table is full.
@@ -223,6 +291,7 @@ mod tests {
             .assign_file(OpenFile {
                 file,
                 path: "/dev/null".into(),
+                guest_path: "/dev/null".into(),
                 access: 0,
             })
             .unwrap();
@@ -230,5 +299,21 @@ mod tests {
         assert!(matches!(fds.translate(vfd), Some(Target::File(_))));
         assert!(fds.erase(vfd));
         assert!(fds.translate(vfd).is_none());
+    }
+
+    #[test]
+    fn paths_are_normalised() {
+        let n = FileDescriptors::normalize_path;
+        assert_eq!(n("/etc/hosts"), "/etc/hosts");
+        assert_eq!(n("//etc///./hosts"), "/etc/hosts");
+        assert_eq!(n("/srv/data/../../etc/shadow"), "/etc/shadow");
+        assert_eq!(n("/../../.."), "/");
+        assert_eq!(n("/a/b/.."), "/a/");
+        assert_eq!(n("/a/b/."), "/a/b/");
+        assert_eq!(n("/a/b/"), "/a/b/");
+        assert_eq!(n("/"), "/");
+        assert_eq!(n(""), "/");
+        assert_eq!(n("a/./b"), "/a/b");
+        assert_eq!(n("/a/..b/.c"), "/a/..b/.c");
     }
 }

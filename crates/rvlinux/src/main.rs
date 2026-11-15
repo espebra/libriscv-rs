@@ -663,13 +663,24 @@ fn setup_linux(
 
     let program = guest_args.first().cloned().unwrap_or_default();
     // The dynamic linker may open the program it runs.
-    let dynamic_program = guest_args.get(1).filter(|_| is_dynamic).cloned();
+    // The filter sees normalised absolute paths, so compare against those.
+    let normalize = |p: &String| {
+        if p.starts_with('/') {
+            libriscv::FileDescriptors::normalize_path(p)
+        } else {
+            p.clone()
+        }
+    };
+    let dynamic_program = guest_args.get(1).filter(|_| is_dynamic).map(normalize);
     let verbose = args.verbose;
     let proxy = args.proxy;
-    let allowed = args.allowed_files.clone();
+    let allowed: Vec<String> = args.allowed_files.iter().map(normalize).collect();
     if let Some(fds) = machine.fds_mut() {
         fds.permit_filesystem = !args.sandbox;
         fds.permit_sockets = !args.sandbox;
+        // The filter below is an exact allow-list (`/dev/urandom` is a
+        // device), or proxy mode, which admits everything anyway.
+        fds.permit_special_files = true;
         if is_dynamic {
             fds.pinned_mappings = pinned_libraries();
         }

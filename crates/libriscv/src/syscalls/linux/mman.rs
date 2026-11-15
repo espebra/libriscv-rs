@@ -391,6 +391,7 @@ mod tests {
         fds.pinned_mappings = vec![(path.clone(), PIN)];
         let file = OpenFile {
             file: std::fs::File::open(&lib).unwrap(),
+            guest_path: path.clone(),
             path,
             access: 0,
         };

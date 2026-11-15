@@ -1253,7 +1253,7 @@ Phase 5) and `insert_non_owned_memory`.
 | Layer | Where | What |
 |---|---|---|
 | Unit | `#[cfg(test)]` in each module | Decoding, helpers, edge cases |
-| Integration | `crates/libriscv/tests/` | Ports of `../libriscv/tests/unit/*.cpp` (Catch2 → `#[test]`); guests built with `testutil::build_and_load`. `linux.rs`: `security.cpp`, Linux cases of `protections.cpp`, threads, signals, the file sandbox, and every system call with random arguments. `paging.rs`: the memory cases of `protections.cpp`, `va_execute.cpp` (code on mprotected and high pages, FENCE.I/`riscv_flush_icache`, constant pools) and `dynamic.cpp` (PIE). `vmcall.rs`: `vmcall.cpp` (the fork case included) and preemption (restoring, clobbering, errors, shared budget, nested under background JIT). `custom.rs`: `custom.cpp`'s custom instruction, and userdata (`with_userdata` included). `dyncall.rs`: `dyncall.cpp`, adapted to dyncalls being system calls (interpreter and JIT, exactly equal). `native.rs`: `native.cpp` (native heap system calls and the guest C++ containers). `native_rust.rs`: `native_rust.cpp` (the guest Rust containers against a Rust guest, built with `testutil::build_rust`; needs the `riscv64gc-unknown-linux-gnu` target of the pinned toolchain). `rust_collections.rs`: guest-built cycles and deep nesting of the Rust containers, without a Rust guest. `brutal.rs`: `brutal.cpp` (forks, stepping a few instructions at a time, copy-on-write and page cache cases) plus fork snapshots, forks of forks, forking from threads and fork page accounting |
+| Integration | `crates/libriscv/tests/` | Ports of `../libriscv/tests/unit/*.cpp` (Catch2 → `#[test]`); guests built with `testutil::build_and_load`. `linux.rs`: `security.cpp`, Linux cases of `protections.cpp`, threads, signals, the file sandbox, and every system call with random arguments. `paging.rs`: the memory cases of `protections.cpp`, `va_execute.cpp` (code on mprotected and high pages, FENCE.I/`riscv_flush_icache`, constant pools) and `dynamic.cpp` (PIE). `vmcall.rs`: `vmcall.cpp` (the fork case included) and preemption (restoring, clobbering, errors, shared budget, nested under background JIT). `custom.rs`: `custom.cpp`'s custom instruction, and userdata (`with_userdata` included). `filesystem.rs`: the file system sandbox (no filter means no access, normalised paths, special files) without a guest toolchain. `dyncall.rs`: `dyncall.cpp`, adapted to dyncalls being system calls (interpreter and JIT, exactly equal). `native.rs`: `native.cpp` (native heap system calls and the guest C++ containers). `native_rust.rs`: `native_rust.cpp` (the guest Rust containers against a Rust guest, built with `testutil::build_rust`; needs the `riscv64gc-unknown-linux-gnu` target of the pinned toolchain). `rust_collections.rs`: guest-built cycles and deep nesting of the Rust containers, without a Rust guest. `brutal.rs`: `brutal.cpp` (forks, stepping a few instructions at a time, copy-on-write and page cache cases) plus fork snapshots, forks of forks, forking from threads and fork page accounting |
 | Example | `examples/asteroids/tests/headless.rs` | The example game played without a terminal: frames at a fixed rate with scripted input, the JIT against the interpreter frame by frame (screens and instruction counts), heap balance across frames. Builds the Rust guest with cargo; skipped without the guest toolchain |
 | Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Static and dynamic glibc C and C++ programs (stdio, malloc, threads incl. `test_threads.cpp`, condvars, abort, a fault with a signal handler, timeouts; dynamic ones run under `ld.so`), code generated at runtime (mprotect, FENCE.I, pages far outside the arena, `dlopen`, an execute fault), `getrusage`'s page accounting, the prebuilt Rust/Zig/newlib fixtures (Go: output only, its count varies under the oracle too) and glibc CoreMark, and `--libc-fastpath` (the guest of `libc_fastpath.cpp` calling every patched function, the glibc C and C++ programs, timeouts, and faults inside patched functions). Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics; RV64IM and RV64IMC+Zcb with Zba/Zbb/Zbc/Zbs/Zicond/Zbkb for bit manipulation; RV64IMFD and RV64IMAFDC+Zcb with Zfhmin/Zfa for floating point; CoreMark (soft-float, F/D, F/D+B), whose clock is the instruction counter so its whole output is compared. `rvlinux --call` (a VM call after the program exits). Each scenario is one test per Rust configuration (`<name>::interp`, `::jit`, `::jit_upfront`), and long fuel loops are split, so the harness runs them concurrently |
 | Instruction | ports of `../libriscv/tests/instructions/` | Per-instruction checks incl. RVC (`test_rv32c.cpp` → `tests/rvc.rs`, widened to RV64) |
@@ -1404,7 +1404,7 @@ C++'s raw `memcpy` of the object). Template parameters became methods:
 | C++ | Rust |
 |---|---|
 | `vmcall(f, args...)` (`MAXI = UINT64_MAX`: `simulate_inaccurate`) | `vmcall(f, args)` |
-| `vmcall<MAXI>` / `vmcall<MAXI, false>` | `vmcall_limited` / `try_vmcall` (0 or `u64::MAX`: unlimited, as in C++) |
+| `vmcall<MAXI>` / `vmcall<MAXI, false>` | `vmcall_limited` / `try_vmcall` (0 or `u64::MAX`: unlimited, as in C++; the docs warn that a limit of 0 runs untrusted code unbounded) |
 | `preempt<true, true>` | `preempt` (registers, PC included, restored) |
 | `preempt<true, false>` | `preempt_clobbering` |
 | `preempt<false, StoreRegs>` | `try_preempt(.., store_regs)` |
@@ -1617,10 +1617,31 @@ the guest raw host access, the port is deliberately stricter:
 - `openat` refuses write access (`O_WRONLY`/`O_RDWR`/`O_CREAT`/`O_TRUNC`/
   `O_APPEND`) outside proxy mode with `EACCES`; C++ opens (creating or
   truncating the host file) and only refuses the writes.
-- Host paths are only looked up through the filters: `fstatat` with a path
-  needs `filter_stat` (or `filter_open` without rewriting), `faccessat`
-  needs `filter_open`, `readlinkat` needs `filter_readlink`; without them
-  only proxy mode allows it. C++ goes to the host when no filter is set.
+- Host paths are only looked up through the filters: `openat` and
+  `faccessat` need `filter_open`, `fstatat` with a path needs
+  `filter_stat` (or `filter_open` without rewriting), `readlinkat` needs
+  `filter_readlink`; without them only proxy mode allows it. C++ goes to
+  the host when no filter is set (for `openat` too: `permit_filesystem`
+  without a filter opened any host path).
+- The filters get an absolute, lexically normalised guest path
+  (`FileDescriptors::normalize_path`: `.`, `..` and repeated slashes
+  collapsed, a trailing slash kept), and the host opens that path or the
+  filter's rewrite of it, so `..` can't escape a prefix check. A path
+  relative to a directory descriptor is joined to the directory's guest
+  path (`OpenFile::guest_path`) before filtering; C++ filters the
+  relative tail and opens it relative to the host directory. Relative
+  paths through `AT_FDCWD` are `EBADF` without consulting the filter
+  (C++ runs the filter first, which could rewrite them to absolute
+  paths), and an empty path is `ENOENT`.
+- `openat` refuses (`EACCES`) files that are neither regular files nor
+  directories unless `permit_special_files` is set: a FIFO, a terminal or
+  `/proc/self/fd/0` could block the host thread in `open` or `read`
+  outside the instruction limit. Without `libc` there's no portable
+  `O_NONBLOCK`, so the type of what the path resolves to (symbolic links
+  followed) is checked before opening, and the opened file's again after.
+  `faccessat`'s `R_OK`/`W_OK` probes don't open such files either. C++
+  opens anything the filter admits; `rvlinux` sets `permit_special_files`
+  (its filter is an exact allow-list that includes `/dev/urandom`).
 - `dup` returns a virtual descriptor (C++: a host number the guest can't
   use), `dup3` can't replace descriptors (`EPERM`), `pipe2` and
   `getdents64` are `ENOSYS` (a pipe nobody reads would block the host),

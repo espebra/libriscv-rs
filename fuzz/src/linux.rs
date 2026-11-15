@@ -42,6 +42,8 @@ fn sandboxed_linux(m: &mut Machine) {
         fds.permit_filesystem = true;
         fds.permit_sockets = false;
         fds.proxy_mode = false;
+        // The allowed files are devices that never block.
+        fds.permit_special_files = true;
         fds.filter_open = Some(Box::new(|path: &mut String| {
             ALLOWED_FILES.contains(&path.as_str())
         }));
