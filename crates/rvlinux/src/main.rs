@@ -16,7 +16,7 @@ mod aot_embed {
     include!(concat!(env!("OUT_DIR"), "/aot_embed.rs"));
 }
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Debug, Default)]
@@ -254,12 +254,26 @@ fn main() -> ExitCode {
     if let Some(interp) = libriscv::elf_interpreter(&binary) {
         // A dynamic executable: run its dynamic linker instead, which maps
         // the program and its libraries at runtime, with the program as
-        // its first argument (C++ `main`).
+        // its first argument (C++ `main`). Unlike C++, the guest doesn't
+        // choose the host file: `PT_INTERP` only selects rvlinux's own
+        // dynamic linker, and anything else is replaced by it, with a
+        // warning. A PT_INTERP of `/dev/zero`, a FIFO or another readable
+        // file would otherwise exhaust host memory, hang, or become the
+        // initial segment.
         let interp_path = interp.trim_end_matches('\0');
-        binary = match std::fs::read(interp_path).or_else(|_| std::fs::read(DYNAMIC_LINKER)) {
+        let canonical = interp_path.rsplit('/').next() == Some(DYNAMIC_LINKER_NAME);
+        let interp = if canonical {
+            interp
+        } else {
+            eprintln!(
+                "Warning: Ignoring the program's interpreter {interp_path:?}, using {DYNAMIC_LINKER}"
+            );
+            DYNAMIC_LINKER.to_string()
+        };
+        binary = match read_host_file(Path::new(DYNAMIC_LINKER), MAX_DYNAMIC_LINKER_SIZE) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("Could not read the dynamic linker {interp_path}: {e}");
+                eprintln!("Could not read the dynamic linker {DYNAMIC_LINKER}: {e}");
                 return ExitCode::FAILURE;
             }
         };
@@ -557,9 +571,42 @@ fn save_translation(args: &CliArgs, output: Option<&libriscv::aot::AotOutput>) -
 /// The guest environment (as in C++).
 const GUEST_ENV: [&str; 3] = ["LC_CTYPE=C", "LC_ALL=C", "RUST_BACKTRACE=full"];
 
-/// The dynamic linker used when the interpreter named by a dynamic
-/// executable can't be read (C++ `DYNAMIC_LINKER`).
+/// The dynamic linker of every dynamic executable (C++ `DYNAMIC_LINKER`,
+/// which C++ only uses when the program's `PT_INTERP` can't be read).
 const DYNAMIC_LINKER: &str = "/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1";
+/// The file name a program's `PT_INTERP` must end in to run without a
+/// warning (any directory: `/lib/` in practice).
+const DYNAMIC_LINKER_NAME: &str = "ld-linux-riscv64-lp64d.so.1";
+/// Larger than any real `ld.so` (glibc's is ~200 KiB).
+const MAX_DYNAMIC_LINKER_SIZE: u64 = 64 << 20;
+
+/// Reads a host file rvlinux loads for the guest: it must be a regular
+/// file of at most `max` bytes, so a device or FIFO can't hang rvlinux or
+/// exhaust host memory.
+fn read_host_file(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind, Read};
+    let file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(Error::new(ErrorKind::InvalidInput, "not a regular file"));
+    }
+    if meta.len() > max {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("larger than {max} bytes"),
+        ));
+    }
+    let mut data = Vec::new();
+    // The file may grow after the check.
+    file.take(max.saturating_add(1)).read_to_end(&mut data)?;
+    if data.len() as u64 > max {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("larger than {max} bytes"),
+        ));
+    }
+    Ok(data)
+}
 
 /// Libraries the guest may open, from `/lib/riscv64-linux-gnu/` (C++
 /// `filter_open`, for dynamic executables).
@@ -750,5 +797,22 @@ fn run_sighandler(machine: &mut libriscv::Machine, signal: i32) {
     }
     if let Ok(action) = machine.sigaction(signal) {
         action.handler = handler;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_host_file_rejects_devices_directories_and_large_files() {
+        assert!(read_host_file(Path::new("/dev/zero"), 1 << 20).is_err());
+        assert!(read_host_file(Path::new("/"), 1 << 20).is_err());
+        let path =
+            std::env::temp_dir().join(format!("rvlinux_read_host_file_{}", std::process::id()));
+        std::fs::write(&path, [7u8; 100]).unwrap();
+        assert_eq!(read_host_file(&path, 100).unwrap(), [7u8; 100]);
+        assert!(read_host_file(&path, 99).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 }
