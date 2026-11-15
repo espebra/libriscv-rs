@@ -48,6 +48,17 @@ pub(crate) const DIVISOR: u64 = if COMPRESSED { 2 } else { 4 };
 /// `log2(DIVISOR)` (C++ `DecoderData::SHIFT`).
 pub(crate) const SHIFT: u32 = if COMPRESSED { 1 } else { 2 };
 
+/// Host bytes of one [`DecoderEntry`].
+const ENTRY_BYTES: u64 = size_of::<DecoderEntry>() as u64;
+
+/// [`DecodedSegment::host_bytes`] of a new segment of `len` bytes of code,
+/// before it is decoded: its padded code copy and one decoder entry per
+/// [`DIVISOR`] bytes of it (see [`DecodedSegment::new`]).
+pub(crate) const fn segment_host_bytes(len: u64) -> u64 {
+    let padded = len.saturating_add(8);
+    padded.saturating_add((padded / DIVISOR).saturating_mul(ENTRY_BYTES))
+}
+
 /// One decoder cache entry (C++ `DecoderData`). The handler is stored
 /// directly instead of a bytecode index, so dispatch needs no second table.
 #[derive(Debug, Clone, Copy)]
@@ -338,6 +349,20 @@ impl DecodedSegment {
 
     pub const fn exec_begin(&self) -> u64 {
         self.begin
+    }
+    /// Host bytes this segment holds: the copy of its code and its decoder
+    /// cache, plus the list of entries patched to enter native code. (Not
+    /// the native code itself, nor a compiled copy a background
+    /// compilation is still building.) Counted against
+    /// `MachineOptions::execute_segment_memory_max`.
+    pub fn host_bytes(&self) -> u64 {
+        let native = self
+            .native
+            .as_ref()
+            .map_or(0, crate::native_code::NativeSegment::host_bytes);
+        (self.data.len() as u64)
+            .saturating_add((self.cache.len() as u64).saturating_mul(ENTRY_BYTES))
+            .saturating_add(native)
     }
     pub const fn exec_end(&self) -> u64 {
         self.end

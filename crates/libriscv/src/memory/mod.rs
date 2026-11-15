@@ -47,6 +47,10 @@ pub const DYLINK_BASE: u64 = 0x40000;
 pub const SIGRETURN_OFFSET: u64 = 8;
 /// Execute segments besides the main one (C++ `RISCV_MAX_EXECUTE_SEGS`).
 pub const MAX_EXECUTE_SEGS: usize = 16;
+/// The least host memory execute segments may hold by default
+/// (`MachineOptions::execute_segment_memory_max`), for machines with a small
+/// `memory_max`: room for about 28 MiB of code.
+pub const EXECUTE_SEGMENT_MEMORY_MIN: u64 = 256 << 20;
 
 pub(crate) const fn protection_fault(addr: u64) -> MachineError {
     MachineError::trigger(ExceptionKind::ProtectionFault, addr)
@@ -67,6 +71,9 @@ pub struct Memory {
     paging: paging::PageTable,
     /// Largest execute segment built from pages, in pages (the memory limit).
     max_exec_pages: u64,
+    /// Most host bytes the execute segments may hold together
+    /// (`MachineOptions::execute_segment_memory_max`).
+    exec_memory_max: u64,
     read_boundary: u64,
     write_boundary: u64,
     initial_rodata_end: u64,
@@ -257,6 +264,11 @@ impl Memory {
             arena_pages,
             paging: paging::PageTable::new(arena_pages, table_max, fault_limit, fault_oom_data),
             max_exec_pages: pages_max.max(1),
+            exec_memory_max: options.execute_segment_memory_max.unwrap_or(
+                pages_max
+                    .saturating_mul(PAGE_SIZE)
+                    .max(EXECUTE_SEGMENT_MEMORY_MIN),
+            ),
             // Without an ELF the whole arena is usable. (C++ leaves both
             // boundaries at zero and serves the arena through the page
             // table, which is also usable, but slower.)
@@ -342,6 +354,9 @@ impl Memory {
             arena_pages: 0,
             paging: self.fork_page_table(options.minimal_fork),
             max_exec_pages: self.max_exec_pages,
+            exec_memory_max: options
+                .execute_segment_memory_max
+                .unwrap_or(self.exec_memory_max),
             read_boundary: 0,
             write_boundary: 0,
             initial_rodata_end: 0,
@@ -574,6 +589,29 @@ impl Memory {
         self.exec.len()
     }
 
+    /// Host bytes held by the registered execute segments
+    /// ([`DecodedSegment::host_bytes`]), counted against
+    /// `MachineOptions::execute_segment_memory_max`.
+    pub fn execute_segments_memory(&self) -> u64 {
+        self.main_exec
+            .iter()
+            .chain(self.exec.iter().flatten())
+            .fold(0, |sum, s| sum.saturating_add(s.host_bytes()))
+    }
+
+    /// The limit on [`execute_segments_memory`](Self::execute_segments_memory)
+    /// (`MachineOptions::execute_segment_memory_max`, or its default).
+    pub const fn execute_segments_memory_max(&self) -> u64 {
+        self.exec_memory_max
+    }
+
+    /// True for a registered segment (not the main one) inside
+    /// `[begin, end)`: a new segment there replaces it (see
+    /// [`create_execute_segment`](Self::create_execute_segment)).
+    fn superseded(segment: &DecodedSegment, begin: u64, end: u64) -> bool {
+        segment.exec_begin() >= begin && segment.exec_end() <= end
+    }
+
     /// Port of `Memory::create_execute_segment`: decode `code` as an execute
     /// segment at `vaddr` and register it. With `use_shared_execute_segments`
     /// an identical live segment of another machine is reused instead
@@ -595,6 +633,28 @@ impl Memory {
             return Err(MachineError::invalid_program(
                 "Max execute segments reached",
                 0,
+            ));
+        }
+        // Then the memory limit, counting what the segment will hold and
+        // leaving out the segments it replaces. (C++ has no limit, and
+        // keeps segments the new one covers.)
+        let code_end = vaddr.saturating_add(code.len() as u64);
+        let main = self.main_exec.as_ref();
+        let kept = main
+            .into_iter()
+            .chain(
+                self.exec
+                    .iter()
+                    .flatten()
+                    .filter(|s| main.is_none() || !Self::superseded(s, vaddr, code_end)),
+            )
+            .fold(0u64, |sum, s| sum.saturating_add(s.host_bytes()));
+        let needed = kept.saturating_add(decoder_cache::segment_host_bytes(code.len() as u64));
+        if needed > self.exec_memory_max {
+            return Err(MachineError::new(
+                ExceptionKind::OutOfMemory,
+                "Execute segments would exceed their memory limit",
+                needed,
             ));
         }
         let crc32c = decoder_cache::crc32c(code);
@@ -801,6 +861,20 @@ impl Memory {
         if self.main_exec.is_none() {
             self.main_exec = Some(Arc::clone(&segment));
         } else {
+            // Evict the segments the new one covers: it serves all their
+            // addresses, from the guest's current code. A new segment spans
+            // all the executable pages around the PC, so otherwise a guest
+            // growing an executable area a page at a time would keep a copy
+            // of the whole area per page. (C++ keeps them, and finds them
+            // first.) Their slots stay taken, so segments are created as
+            // often as in C++ before `MAX_EXECUTE_SEGS` is reached.
+            for slot in &mut self.exec {
+                if slot.as_ref().is_some_and(|s| {
+                    !Arc::ptr_eq(s, &segment) && Self::superseded(s, vaddr, code_end)
+                }) {
+                    *slot = None;
+                }
+            }
             self.exec.push(Some(Arc::clone(&segment)));
         }
         Ok(segment)

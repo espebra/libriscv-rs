@@ -1307,6 +1307,28 @@ Deliberate, permanent differences in paging:
   bytes (`OUT_OF_MEMORY` otherwise): C++ would decode e.g. a guest's
   `mprotect(PROT_EXEC)` of 64 × `memory_max` of attribute-only pages,
   exhausting host memory.
+- Execute segments are bounded in host memory as well as in number. Each
+  holds a copy of its code and a 16-byte decoder entry per 2 bytes of it,
+  about 9 host bytes per byte of code, outside `memory_max`; together the
+  machine's segments may hold `MachineOptions::execute_segment_memory_max`
+  bytes (default `memory_max`, at least `EXECUTE_SEGMENT_MEMORY_MIN` =
+  256 MiB, i.e. about `memory_max / 9` bytes of code but at least 28 MiB,
+  so programs with large code run under the default `memory_max`), and a
+  new segment past it is `OUT_OF_MEMORY` (`Memory::execute_segments_memory`
+  reports the total). Shared segments count in full in every machine holding them;
+  native code isn't counted, and a background compilation briefly holds a
+  second copy of the segment. And a new segment evicts the (non-main)
+  segments it covers, which C++ keeps and keeps finding first: a segment
+  spans every executable page around the PC, so a guest growing an RWX
+  area a page at a time and jumping into each new page made C++ keep a
+  copy of the whole area per page (16 × 9 × the area; about 5 GB for a
+  48 MiB area). The evicted segments' slots stay taken, so
+  `Max execute segments reached` comes at the same point as in C++. Normal
+  programs, dynamic ones included, never cover an earlier segment, nor
+  come near the limit. An embedder should expect execute segments to add
+  up to `max(memory_max, 256 MiB)` (or the limit set) of host memory per
+  machine on top of guest memory, plus native code with the JIT; with
+  many small machines, set the limit lower.
 - Slow-path accesses that cross a page boundary use both pages (C++ reads
   or writes past the end of a heap page; for arena pages, as here, the
   next arena bytes).
