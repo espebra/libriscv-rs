@@ -150,7 +150,10 @@ impl<T: GuestType + ToHost> ToHost for GuestRustBox<T> {
         if self.is_null() {
             return Err(container_error("Guest Rust Box is null"));
         }
-        nested(|| self.ptr.get(m)?.to_host(m))
+        super::host_copy(|| {
+            super::charge_host_elements::<T::Host>(1)?;
+            nested(|| self.ptr.get(m)?.to_host(m))
+        })
     }
 }
 
@@ -257,7 +260,7 @@ impl<T: GuestPod> GuestRustBoxedSlice<T> {
     }
     /// Copy the elements out.
     pub fn to_vec(&self, m: &Machine) -> Result<Vec<T>> {
-        Ok(self.view(m)?.to_vec())
+        super::copy_view(&self.view(m)?)
     }
 }
 
@@ -326,7 +329,7 @@ impl<T: GuestType> GuestType for GuestRustBoxedSlice<T> {
 impl<T: GuestPod + ToHost> ToHost for GuestRustBoxedSlice<T> {
     type Host = Vec<T::Host>;
     fn to_host(&self, m: &Machine) -> Result<Vec<T::Host>> {
-        nested(|| self.view(m)?.iter().map(|v| v.to_host(m)).collect())
+        super::host_copy(|| nested(|| super::to_host_all(m, &self.view(m)?)))
     }
 }
 
@@ -434,7 +437,7 @@ impl GuestRustBoxedStr {
     }
     /// The text as a host string, with invalid UTF-8 replaced.
     pub fn to_string_lossy(&self, m: &Machine) -> Result<String> {
-        Ok(String::from_utf8_lossy(self.as_bytes(m)?).into_owned())
+        super::host_string(self.as_bytes(m)?)
     }
 
     /// Release the allocation, leaving an empty boxed str.

@@ -97,7 +97,7 @@ impl GuestStdString {
     /// replaced, as by `Memory::memstring`; use [`to_view`](Self::to_view)
     /// for the bytes.
     pub fn to_string(&self, m: &Machine) -> Result<String> {
-        Ok(String::from_utf8_lossy(self.to_view(m, MAX_BYTES)?).into_owned())
+        super::host_string(self.to_view(m, MAX_BYTES)?)
     }
 
     /// Replace the characters (C++ `set_string`), freeing a heap block the
@@ -204,7 +204,7 @@ impl GuestPtr<GuestStdString> {
     }
     /// The characters.
     pub fn to_bytes(&self, m: &Machine) -> Result<Vec<u8>> {
-        Ok(self.get(m)?.to_view(m, super::MAX_BYTES)?.to_vec())
+        super::host_bytes(self.get(m)?.to_view(m, super::MAX_BYTES)?)
     }
     /// Replace the characters in place (C++ `set_string(machine, self,
     /// ...)`, and `ScopedArenaObject`'s string assignment).

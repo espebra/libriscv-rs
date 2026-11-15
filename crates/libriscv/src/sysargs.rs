@@ -13,6 +13,14 @@
 //! | [`GuestSlice<T>`] | `std::span<const T>` | pointer and element count: [`Memory::memspan`] |
 //! | [`ByPointer<T>`] | other standard-layout types | pointer, value copied out |
 //!
+//!
+//! The borrowed arguments (`&[u8]`, `&str`, [`Buffer`], [`GuestSlice`])
+//! don't copy, so each is bounded only by guest memory; a handler that
+//! copies them (`.to_vec()`, `.to_owned()`) and keeps the copies across
+//! calls must bound the total it keeps itself, as the per-call limits
+//! (and the per-copy budget of [`MAX_HOST_COPY`]) don't.
+//!
+//! [`MAX_HOST_COPY`]: crate::guest::MAX_HOST_COPY
 //! [`Memory::memstring`]: crate::Memory::memstring
 //! [`Memory::memview`]: crate::Memory::memview
 //! [`Memory::membuffer`]: crate::Memory::membuffer

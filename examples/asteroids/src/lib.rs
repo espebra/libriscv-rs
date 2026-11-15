@@ -232,11 +232,17 @@ fn cos_f32(m: &mut Machine) -> Result<()> {
 
 /// Lines a script may keep in the log before the engine takes them.
 const MAX_LOG_LINES: usize = 1000;
+/// Bytes a script may keep in the log before the engine takes them. Each
+/// `&str` may be as long as guest memory allows (and every call may pass
+/// the same one), so the line count alone doesn't bound what the host
+/// holds.
+const MAX_LOG_BYTES: usize = 64 << 10;
 
 fn log(m: &mut Machine) -> Result<()> {
     m.with_userdata(|state: &mut HostState, m| {
         let (message,): (&str,) = m.sysargs()?;
-        if state.log.len() < MAX_LOG_LINES {
+        let held: usize = state.log.iter().map(String::len).sum();
+        if state.log.len() < MAX_LOG_LINES && held.saturating_add(message.len()) <= MAX_LOG_BYTES {
             state.log.push(message.to_owned());
         }
         Ok(())

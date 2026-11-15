@@ -90,7 +90,7 @@ impl<T: GuestPod> GuestRustSlice<T> {
     }
     /// Copy the elements out.
     pub fn to_vec(&self, m: &Machine) -> Result<Vec<T>> {
-        Ok(self.view(m)?.to_vec())
+        super::copy_view(&self.view(m)?)
     }
 }
 
@@ -260,7 +260,7 @@ impl<T: GuestPod> GuestRustVec<T> {
 
     /// Copy the elements out: shallow copies, still owned by the vector.
     pub fn to_vec(&self, m: &Machine) -> Result<Vec<T>> {
-        Ok(self.view(m)?.to_vec())
+        super::copy_view(&self.view(m)?)
     }
 }
 
@@ -451,7 +451,7 @@ impl<T: GuestType> GuestType for GuestRustVec<T> {
 impl<T: GuestPod + ToHost> ToHost for GuestRustVec<T> {
     type Host = Vec<T::Host>;
     fn to_host(&self, m: &Machine) -> Result<Vec<T::Host>> {
-        nested(|| self.view(m)?.iter().map(|v| v.to_host(m)).collect())
+        super::host_copy(|| nested(|| super::to_host_all(m, &self.view(m)?)))
     }
 }
 

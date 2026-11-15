@@ -366,13 +366,16 @@ impl<V: GuestType + ToHost> GuestRustAttributes<V> {
     /// host values on their own; walk a tree with [`iter`](Self::iter).
     /// Keys that aren't UTF-8 are replaced.
     pub fn to_map(&self, m: &Machine) -> Result<BTreeMap<String, V::Host>> {
-        let mut out = BTreeMap::new();
-        for entry in self.iter(m)? {
-            let (key, value) = entry?;
-            let host = value.get(m)?.to_host(m)?;
-            out.insert(String::from_utf8_lossy(key).into_owned(), host);
-        }
-        Ok(out)
+        super::host_copy(|| {
+            let mut out = BTreeMap::new();
+            for entry in self.iter(m)? {
+                let (key, value) = entry?;
+                super::charge_host_elements::<(String, V::Host)>(1)?;
+                let host = value.get(m)?.to_host(m)?;
+                out.insert(super::host_string(key)?, host);
+            }
+            Ok(out)
+        })
     }
 }
 

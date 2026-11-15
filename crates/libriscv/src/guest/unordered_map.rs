@@ -550,11 +550,14 @@ impl<K: GuestHashKey, V: GuestType, H: HashPolicy<K>> GuestPtr<Map<K, V, H>> {
         V: ToHost,
         K::Host: Eq + Hash,
     {
-        let mut result = HashMap::new();
-        for (k, v) in self.entries(m)? {
-            result.insert(k.to_host(m)?, v.get(m)?.to_host(m)?);
-        }
-        Ok(result)
+        super::host_copy(|| {
+            let mut result = HashMap::new();
+            for (k, v) in self.entries(m)? {
+                super::charge_host_elements::<(K::Host, V::Host)>(1)?;
+                result.insert(k.to_host(m)?, v.get(m)?.to_host(m)?);
+            }
+            Ok(result)
+        })
     }
 
     // --- changes ------------------------------------------------------------
