@@ -533,7 +533,11 @@ dyncall promises its handler reads (`codegen::calls::dyncall_regs`: the
 `a0..` inputs, `fa0-fa7` unless the word promises no FP access, and `sp`,
 so that a handler can preempt into the guest below the live frames),
 calls the host through `JitState::host_call` with the dyncall word, PC
-and counter, and reloads the counter and the promised outputs. Region
+and counter, and reloads the counter and the promised outputs. It stores
+the outputs before the call too: a handler that doesn't write one leaves
+it as it was, which includes a value native code computed and hadn't
+stored yet (`jitdifffuzzer`: `slti a0, ...` then a dyncall with no inputs
+and one output reloaded the stale `a0`). FP outputs are FP inputs already. Region
 summaries include those registers, so native callers store and reload
 them around calls into a region with a dyncall. On the host side
 (`jit::JitHost`, a `libriscv_jit_rt::Host`), the call runs the handler

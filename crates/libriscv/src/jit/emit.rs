@@ -2010,7 +2010,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
 
     /// The dyncall `word` at `pc` (C++ asmjit `emit_dyncall`), in the
     /// middle of its block (already counted): store the registers its
-    /// handler may read, make the host call (`jit::JitHost`, which runs the
+    /// handler may read or write, make the host call (`jit::JitHost`, which runs the
     /// handler with the exact PC and counter), and reload the counter and
     /// the registers the handler may write. If the host says so, leave
     /// with the exit it left in the state block; otherwise go on (returns
@@ -2030,7 +2030,10 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
             return false;
         }
         let (reads, writes) = calls::dyncall_regs(word);
-        self.store_set(self.written_set & reads);
+        // The outputs too: they are reloaded after the call, and a handler
+        // that doesn't write one must leave it as it was, including a value
+        // native code computed but hasn't stored yet.
+        self.store_set(self.written_set & (reads | writes));
         let st = self.state;
         let host_call = self
             .b

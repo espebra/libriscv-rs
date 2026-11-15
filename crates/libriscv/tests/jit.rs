@@ -491,6 +491,24 @@ fn dyncalls_mid_block_check_the_limit_at_the_block_end() {
     assert_ne!(last.regs[11], 0, "the handler didn't run");
 }
 
+/// A handler that doesn't write a dyncall's outputs leaves them as they
+/// were: native code stores the outputs before the call, as well as the
+/// inputs, since it reloads them after (found by `jitdifffuzzer`: `slti a0,
+/// ...` then a dyncall with no inputs and one output lost the `slti`).
+#[test]
+fn dyncall_outputs_the_handler_leaves_alone_keep_their_values() {
+    let program = [
+        itype(0x13, 0, 10, 10, 7),             // addi a0, a0, 7 (not stored yet)
+        Dyncall::encode(DYNCALL, 0, 1, false), // the handler only writes a1
+        itype(0x13, 0, 10, 10, 1),             // addi a0, a0, 1
+        itype(0x13, 0, 12, 10, 0),             // mv a2, a0
+        jtype(0, 0),
+    ];
+    let last = compare_dyncalls(&words(&program), "dyncall without inputs");
+    assert_eq!(last.regs[10], 8);
+    assert_ne!(last.regs[11], 0, "the handler didn't run");
+}
+
 /// A small penalty halts right after the dyncall only when it takes the
 /// retired count to the limit. The block's count crossing it is checked at
 /// the block end, as without a penalty.
