@@ -14,6 +14,8 @@
 //! |---|---|---|
 //! | `RCC` | `riscv64-linux-gnu-gcc-14` | C cross compiler |
 //! | `RCXX` | `riscv64-linux-gnu-g++-14` | C++ cross compiler |
+//! | `RUSTC` | `rustc` | Compiler of the Rust guests ([`build_rust`]) |
+//! | `RUST_LINKER` | first of `riscv64-linux-gnu-gcc-{14,13,12,}` | Cross linker of the Rust guests |
 //! | `LIBRISCV_CPP` | `../libriscv` (sibling of the workspace) | C++ libriscv checkout |
 //! | `LIBRISCV_CPP_EMULATOR` | `$LIBRISCV_CPP/emulator/rvlinux` | Reference emulator binary |
 //! | `LIBRISCV_REQUIRE_TOOLCHAIN` | unset | If `1`, missing tools fail tests instead of skipping them |
@@ -510,6 +512,145 @@ pub fn build_and_load(code: &str, args: &str) -> Result<Vec<u8>, BuildError> {
 /// Like [`build_and_load`] but for C++.
 pub fn build_and_load_cxx(code: &str, args: &str) -> Result<Vec<u8>, BuildError> {
     Ok(std::fs::read(build(code, args, Lang::Cxx)?)?)
+}
+
+/// The Rust target of the Rust guests.
+pub const RUST_GUEST_TARGET: &str = "riscv64gc-unknown-linux-gnu";
+
+/// Cross linkers rustc can drive for the Rust guests, newest first (C++
+/// `RUST_LINKER_CANDIDATES`).
+const RUST_LINKER_CANDIDATES: [&str; 4] = [
+    "riscv64-linux-gnu-gcc-14",
+    "riscv64-linux-gnu-gcc-13",
+    "riscv64-linux-gnu-gcc-12",
+    "riscv64-linux-gnu-gcc",
+];
+
+/// The rustc that builds Rust guests (`$RUSTC`, default `rustc`), run from
+/// the workspace so that `rust-toolchain.toml` picks the toolchain.
+fn rustc() -> Command {
+    let mut cmd = Command::new(env_or("RUSTC", "rustc"));
+    cmd.current_dir(workspace_root());
+    cmd
+}
+
+/// The cross linker for Rust guests (`$RUST_LINKER`, else the first of
+/// [`RUST_LINKER_CANDIDATES`] that runs).
+fn rust_linker() -> Option<String> {
+    if let Ok(linker) = std::env::var("RUST_LINKER") {
+        return Some(linker);
+    }
+    RUST_LINKER_CANDIDATES
+        .iter()
+        .find(|c| runs(c))
+        .map(|c| (*c).to_owned())
+}
+
+/// True when Rust guests can be built: a rustc with the
+/// `riscv64gc-unknown-linux-gnu` standard library, and a cross linker (C++
+/// `rust_toolchain_available`).
+pub fn have_rust_toolchain() -> bool {
+    if rust_linker().is_none() {
+        return false;
+    }
+    let Ok(out) = rustc()
+        .args(["--print", "target-libdir", "--target", RUST_GUEST_TARGET])
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    // rustc prints the directory whether or not the target is installed.
+    let libdir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    std::fs::read_dir(libdir).is_ok_and(|entries| {
+        entries.flatten().any(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("libstd-") && name.ends_with(".rlib")
+        })
+    })
+}
+
+/// Skip-or-fail helper for tests with Rust guests:
+/// `if !testutil::need_rust_toolchain() { return; }`
+pub fn need_rust_toolchain() -> bool {
+    tool_available(
+        &format!("a {RUST_GUEST_TARGET} Rust toolchain with a cross linker"),
+        have_rust_toolchain(),
+    )
+}
+
+/// Compile a Rust guest program (a binary crate in one file) with extra
+/// rustc `args` and return the path to the cached ELF (C++
+/// `build_rust_and_load`). It is statically linked against glibc, with a
+/// static relocation model (no `rcrt1.o` needed) and `--no-gc-sections`,
+/// which keeps exported functions that nothing in the guest calls.
+pub fn build_rust(code: &str, args: &str) -> Result<PathBuf, BuildError> {
+    let linker =
+        rust_linker().ok_or_else(|| BuildError::CompilerMissing("riscv64 linker".into()))?;
+    let version = rustc()
+        .arg("--version")
+        .output()
+        .map_err(|_| BuildError::CompilerMissing(env_or("RUSTC", "rustc")))?;
+    let mut h = DefaultHasher::new();
+    (code, args, &linker, &version.stdout).hash(&mut h);
+    let key = format!("rust-{:016x}", h.finish());
+
+    let dir = target_dir().join("riscv-guests");
+    std::fs::create_dir_all(&dir)?;
+    let elf = dir.join(format!("{key}.elf"));
+    if elf.exists() {
+        return Ok(elf);
+    }
+    static BUILDS: AtomicU64 = AtomicU64::new(0);
+    let unique = format!(
+        "{}.{}",
+        std::process::id(),
+        BUILDS.fetch_add(1, Ordering::Relaxed)
+    );
+    let src = dir.join(format!("{key}.{unique}.rs"));
+    std::fs::write(&src, code)?;
+    let tmp = dir.join(format!("{key}.{unique}.tmp"));
+
+    let mut cmd = rustc();
+    cmd.args([
+        "--edition",
+        "2021",
+        "--crate-name",
+        "rust_guest",
+        "--target",
+    ])
+    .arg(RUST_GUEST_TARGET)
+    .args(["-C", "target-feature=+crt-static"])
+    .args(["-C", "relocation-model=static"])
+    .arg("-C")
+    .arg(format!("linker={linker}"))
+    .args(["-C", "link-args=-Wl,--no-gc-sections"])
+    .args(args.split_whitespace())
+    .arg("-o")
+    .arg(&tmp)
+    .arg(&src);
+    let command = format!("{cmd:?}");
+    let out = cmd
+        .output()
+        .map_err(|_| BuildError::CompilerMissing(env_or("RUSTC", "rustc")))?;
+    let _ = std::fs::remove_file(&src);
+    if !out.status.success() {
+        return Err(BuildError::CompileFailed {
+            command,
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    std::fs::rename(&tmp, &elf)?;
+    Ok(elf)
+}
+
+/// [`build_rust`], returning the ELF bytes.
+pub fn build_rust_and_load(code: &str, args: &str) -> Result<Vec<u8>, BuildError> {
+    Ok(std::fs::read(build_rust(code, args)?)?)
 }
 
 /// Result of running a guest program under an emulator binary.

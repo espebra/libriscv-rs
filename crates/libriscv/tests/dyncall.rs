@@ -1,7 +1,9 @@
-//! Dyncalls: port of `tests/unit/dyncall.cpp`. The interpreter runs every
-//! custom instruction as a plain slow-path instruction; with the JIT
-//! (`--features jit`), valid dyncall words are counted calls that see the
-//! exact PC and instruction counter and can stop or penalize the machine.
+//! Dyncalls: port of `tests/unit/dyncall.cpp`, adapted to dyncalls being
+//! system calls here. A valid dyncall word runs the system call numbered by
+//! its immediate, in the interpreter and the JIT alike: the handler sees the
+//! exact PC and instruction counter, and can stop or penalize the machine.
+//! (In C++ a dyncall is a custom instruction, whose handler the decoder
+//! hook picks, and only asmjit publishes the counter to it.)
 
 #![allow(
     clippy::panic,
@@ -10,8 +12,14 @@
     clippy::indexing_slicing
 )]
 
+#[cfg(feature = "jit")]
+mod support;
+
 use libriscv::registers::REG_ARG0;
 use libriscv::{Dyncall, ExceptionKind, Instr, Machine, MachineError, MachineOptions};
+
+const CALL: usize = 500;
+const FP_CALL: usize = 501;
 
 #[test]
 fn counted_dyncall_fp_flag_encoding() {
@@ -45,13 +53,30 @@ struct CallState {
     scenario: u32,
 }
 
-fn call_handler(m: &mut Machine, i: Instr) -> libriscv::Result<()> {
+/// System call 500: a0 += 7. 501 also reads all of fa0-fa7 and writes
+/// fa0-fa1.
+///
+/// Like the C++ test's decoder hook, the handler rejects a counted word
+/// whose promise doesn't fit it: one input and one output, and FP
+/// registers live for 501. The word is read from instruction memory at PC.
+fn call(m: &mut Machine, fp: bool) -> libriscv::Result<()> {
+    let word: u32 = m.memory.read_value(m.cpu.pc())?;
+    let fits = !Dyncall::is_counted(word)
+        || (Dyncall::inputs(word) == 1
+            && Dyncall::outputs(word) == 1
+            && (!fp || Dyncall::floats(word)));
+    if !fits {
+        return Err(MachineError::trigger(
+            ExceptionKind::UnimplementedInstruction,
+            u64::from(word),
+        ));
+    }
     let state = m.userdata_mut::<CallState>().unwrap();
     state.calls += 1;
     let scenario = state.scenario;
     let a0 = m.cpu.reg(REG_ARG0);
     m.cpu.set_reg(REG_ARG0, a0.wrapping_add(7));
-    if i.itype().imm() == 501 {
+    if fp {
         let regs = m.cpu.registers_mut();
         let sum: f64 = (REG_FA0..REG_FA0 + 8)
             .map(|r| f64::from_bits(regs.fp_bits(r)))
@@ -70,14 +95,14 @@ fn call_handler(m: &mut Machine, i: Instr) -> libriscv::Result<()> {
     Ok(())
 }
 
+/// A custom-2 word that isn't a dyncall still goes to the decoder hook.
 fn on_unimplemented(i: Instr) -> Option<libriscv::CustomInstruction> {
-    let w = i.whole();
-    let imm = i.itype().imm();
-    (Dyncall::valid(w)
-        && (imm == 500 || imm == 501)
-        && (!Dyncall::is_counted(w) || (Dyncall::inputs(w) == 1 && Dyncall::outputs(w) == 1))
-        && (imm != 501 || Dyncall::floats(w)))
-    .then_some(call_handler)
+    (i.whole() == NOT_A_DYNCALL).then_some(not_a_dyncall)
+}
+const NOT_A_DYNCALL: u32 = 0b1000011011011;
+fn not_a_dyncall(m: &mut Machine, _: Instr) -> libriscv::Result<()> {
+    m.cpu.set_reg(REG_ARG0, 0x1234);
+    Ok(())
 }
 
 /// The guest: dirty every FP argument and a non-argument. Each loop also
@@ -125,7 +150,8 @@ fn run(binary: &[u8], scenario: u32, translated: bool) -> (Machine, Outcome) {
     if translated {
         assert!(machine.cpu.current_execute_segment().jit_entry_count() > 0);
     }
-    machine.set_on_unimplemented_instruction(on_unimplemented);
+    machine.install_syscall_handler(CALL, |m| call(m, false));
+    machine.install_syscall_handler(FP_CALL, |m| call(m, true));
     machine.set_userdata(CallState { calls: 0, scenario });
     for r in 0..32 {
         machine
@@ -158,52 +184,40 @@ fn counted_calls(word: u32) {
             if translated && !cfg!(feature = "jit") {
                 continue;
             }
-            // The interpreter doesn't publish the counter to the handler,
-            // so a stop or penalty takes effect later.
-            if !translated && (scenario == 1 || scenario == 2) {
-                continue;
-            }
             let (machine, got) = run(&binary, scenario, translated);
             let ctx = format!("word {word:#x} scenario {scenario} translated {translated}");
-            if scenario == 1 || scenario == 2 {
-                let invalid = word >> 20 == 501;
-                assert_eq!(got.calls, u32::from(!invalid), "{ctx}");
-                let want = if invalid {
-                    Some(ExceptionKind::UnimplementedInstruction)
-                } else if scenario == 1 {
-                    Some(ExceptionKind::MaxInstructionsReached)
-                } else {
-                    None
-                };
+            if word >> 20 == FP_CALL as u32 && !Dyncall::floats(word) {
+                // The FP handler rejects the very first call, before it
+                // changes anything
+                assert_eq!(got.calls, 0, "{ctx}");
+                let want = Some(ExceptionKind::UnimplementedInstruction);
                 assert_eq!(got.exception, want, "{ctx}");
-                assert_eq!(
-                    got.gpr[REG_ARG0 as usize],
-                    if invalid { 1 } else { 8 },
-                    "{ctx}"
-                );
+                assert_eq!(got.gpr[REG_ARG0 as usize], 1, "{ctx}");
+                assert_eq!(got.pc, machine.address_of("_start").unwrap() + 44, "{ctx}");
+            } else if scenario == 1 || scenario == 2 {
+                // The first call stops the machine on the spot, or
+                // penalizes it beyond the limit.
+                assert_eq!(got.calls, 1, "{ctx}");
+                let want = (scenario == 1).then_some(ExceptionKind::MaxInstructionsReached);
+                assert_eq!(got.exception, want, "{ctx}");
+                assert_eq!(got.gpr[REG_ARG0 as usize], 8, "{ctx}");
                 for r in 0..32 {
                     let dirty = r == 2 || (10..18).contains(&r);
                     let want = f64::from(r) + 0.25 + if dirty { 31.25 } else { 0.0 };
                     assert_eq!(f64::from_bits(got.fp[r as usize]), want, "{ctx} f{r}");
                 }
-                continue;
+            }
+            if scenario == 3 {
+                // The faulting dyncall itself, in both
+                assert_eq!(got.pc, machine.address_of("_start").unwrap() + 44, "{ctx}");
             }
             let Some(exp) = &expected else {
                 expected = Some(got);
                 continue;
             };
-            assert_eq!(got.gpr, exp.gpr, "{ctx}");
-            assert_eq!(got.fp, exp.fp, "{ctx}");
-            if got.exception.is_none() {
-                assert_eq!(got.pc, exp.pc, "{ctx}");
-                assert_eq!(got.counter, exp.counter, "{ctx}");
-            } else {
-                // Interpreter handlers report the block PC; native calls
-                // publish the precise faulting instruction instead.
-                assert_eq!(got.pc, machine.address_of("_start").unwrap() + 44, "{ctx}");
-            }
-            assert_eq!(got.calls, exp.calls, "{ctx}");
-            assert_eq!(got.exception, exp.exception, "{ctx}");
+            // The interpreter and the JIT agree on everything, the
+            // instruction count included
+            assert_eq!(&got, exp, "{ctx}");
         }
     }
 }
@@ -220,16 +234,57 @@ fn counted_call_with_fp() {
     counted_calls(Dyncall::encode(500, 1, 1, true));
 }
 
+/// An integer call to the FP handler breaks the word's promise, which the
+/// handler checks.
+#[test]
+#[cfg_attr(not(feature = "ext-f"), ignore = "the guest uses D")]
+fn integer_call_to_fp_handler_is_unimplemented() {
+    counted_calls(Dyncall::encode(FP_CALL as u32, 1, 1, false));
+}
+
 #[test]
 #[cfg_attr(not(feature = "ext-f"), ignore = "the guest uses D")]
 fn legacy_call() {
     counted_calls((500 << 20) | Dyncall::OPCODE);
 }
 
+/// The index beyond the system call table is an unhandled system call, and
+/// a custom-2 word that isn't a dyncall is still the decoder hook's.
 #[test]
-#[cfg_attr(not(feature = "ext-f"), ignore = "the guest uses D")]
-fn integer_call_to_fp_handler_is_unimplemented() {
-    counted_calls(Dyncall::encode(501, 1, 1, false));
+fn unknown_dyncall_index_and_other_custom_instructions() {
+    if !testutil::need_compiler() {
+        return;
+    }
+    let source = format!(
+        "__attribute__((naked)) void _start(void) {{ __asm__ volatile(\".word {}\\n.word {}\\n.word 0x7ff00073\"); }}",
+        Dyncall::encode(4000, 0, 0, false),
+        NOT_A_DYNCALL
+    );
+    let binary = testutil::build_and_load(
+        &source,
+        "-nostdlib -static -march=rv64g -mabi=lp64d -Wl,-e,_start",
+    )
+    .unwrap();
+    for jit in [false, cfg!(feature = "jit")] {
+        let mut machine = Machine::new(
+            &binary,
+            MachineOptions {
+                memory_max: 8 << 20,
+                jit,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        machine.set_on_unimplemented_instruction(on_unimplemented);
+        machine.set_on_unhandled_syscall(|m, number| {
+            assert_eq!(number, 4000);
+            m.cpu.set_reg(REG_ARG0 + 1, number);
+            Ok(())
+        });
+        machine.simulate(1000).unwrap();
+        assert_eq!(machine.cpu.reg(REG_ARG0 + 1), 4000, "jit={jit}");
+        assert_eq!(machine.cpu.reg(REG_ARG0), 0x1234, "jit={jit}");
+    }
 }
 
 /// A counted call that stops the machine leaves it after the dyncall with
@@ -260,5 +315,60 @@ fn stop_in_counted_call_resumes_exactly() {
     assert_eq!(machine.cpu.pc(), uninterrupted.pc);
     for r in 0..32 {
         assert_eq!(machine.cpu.reg(r), uninterrupted.gpr[r as usize], "x{r}");
+    }
+}
+
+/// Straight-line blocks longer than the decoder allows are forced to end,
+/// and one that ends at a dyncall keeps the dyncall's bytecode there: sweep
+/// a dyncall across that point. The handler returns, penalizes beyond the
+/// limit, or stops; the interpreter and the JIT must agree exactly, and a
+/// stop or penalty must halt right after the dyncall with its exact count.
+#[test]
+#[cfg(feature = "jit")]
+fn dyncalls_around_a_forced_block_end() {
+    use support::*;
+    let addi = itype(0x13, 0, 10, 10, 1); // addi a0, a0, 1
+    for number in [CALL, CALL + 2, CALL + 3] {
+        for at in 110..140usize {
+            let mut code = vec![addi; at];
+            code.push(Dyncall::encode(number as u32, 1, 1, false));
+            code.extend([addi; 40]);
+            code.push(0x7ff0_0073); // stop
+            let code = words(&code);
+            let outcome = |jit: bool, fuel: u64| {
+                let mut m = machine_sized(
+                    &code,
+                    1 << 20,
+                    MachineOptions {
+                        jit,
+                        ..Default::default()
+                    },
+                );
+                m.install_syscall_handler(CALL, |_| Ok(()));
+                m.install_syscall_handler(CALL + 2, |m| {
+                    m.penalize(100_000);
+                    Ok(())
+                });
+                m.install_syscall_handler(CALL + 3, |m| {
+                    m.stop();
+                    Ok(())
+                });
+                run(&mut m, &[0; 64], fuel)
+            };
+            for fuel in [at as u64, at as u64 + 1, at as u64 + 2, 10_000] {
+                let interp = outcome(false, fuel);
+                let jit = outcome(true, fuel);
+                let ctx = format!("number {number} at {at} fuel {fuel}");
+                assert!(jit == interp, "{ctx}:\n{}", describe(&jit, &interp));
+                if number != CALL && fuel == 10_000 {
+                    assert_eq!(interp.pc, V + 4 * at as u64 + 4, "{ctx}");
+                    assert_eq!(
+                        interp.counter,
+                        at as u64 + 1 + 100_000 * u64::from(number == CALL + 2),
+                        "{ctx}"
+                    );
+                }
+            }
+        }
     }
 }

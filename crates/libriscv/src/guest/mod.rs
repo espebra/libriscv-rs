@@ -1,8 +1,10 @@
 //! Port of `guest_datatypes.hpp`, `guest/guest_common.hpp`,
-//! `guest/guest_cpp_common.hpp` and `guest/guest_arena_object.hpp`:
-//! host-side access to the C++ standard containers that live in guest
-//! memory, in libstdc++'s layout (`std::string`, `std::vector`,
-//! `std::unordered_map`, `std::variant`).
+//! `guest/guest_cpp_common.hpp`, `guest/guest_rust_common.hpp` and
+//! `guest/guest_arena_object.hpp`: host-side access to the containers that
+//! live in guest memory: the C++ standard containers in libstdc++'s layout
+//! (`std::string`, `std::vector`, `std::unordered_map`, `std::variant`),
+//! and Rust's (`String`, `&str`, `Vec<T>`, `&[T]`, `Box<T>`, `Box<[T]>`,
+//! `Box<str>`, `#[repr(C, uN)]` enums and a sorted attribute map).
 //!
 //! # Design
 //!
@@ -30,11 +32,43 @@
 //!   `relocate_guest_object`) and [`GuestInit`] (construct one from a host
 //!   value: `construct_guest_object`).
 //!
+//! The Rust collections are not a port: they are a Rust scripting layer
+//! with the names of `std` (`len`, `is_empty`, `push`, `pop`, `get`,
+//! `insert`, `remove`, `as_str`, `from_raw_parts`, ...), with one
+//! difference that follows from where the data lives: every method that
+//! touches guest memory takes the [`Machine`], and returns a [`Result`]
+//! because the guest may have lied about what is there.
+//!
+//! - [`GuestRustString`], [`GuestRustVec`], [`GuestRustBoxedSlice`],
+//!   [`GuestRustBoxedStr`] and [`GuestRustAttributes`] are host-side copies
+//!   of the words of a guest collection (a Rust move is a memcpy, and
+//!   nothing points into itself). Their `&mut self` methods change the
+//!   copy, and the guest sees the change once the copy is written back.
+//! - A [`GuestPtr`] to one of them has the same methods, which read, change
+//!   and write back the collection in place.
+//! - [`GuestRustBox<T>`] owns a `T` on the native heap and dereferences to
+//!   its [`GuestPtr`]: it is how the host holds a guest value, and how one
+//!   is passed by reference to a VM call.
+//! - Reads borrow guest memory without copying (`as_bytes`, `to_str`,
+//!   `view`), which needs the bytes to be contiguous in host memory: always
+//!   true with a flat arena.
+//! - There is no `Drop`, as dropping needs the machine: `free` is what
+//!   the guest's drop glue does, and methods that hand a value over (`pop`,
+//!   `remove`, `into_raw`) leave freeing it to the caller.
+//!
+//! For a Rust guest to hand collections back and forth, its global
+//! allocator must be the native heap (`setup_native_heap`): then a
+//! collection either side allocates is one the other can grow and drop.
+//!
 //! Only RV64 guests: the 32-bit variants of the layouts and of `std::hash`
-//! are not ported. The Rust guest containers (`guest_rust_*.hpp`) are not
-//! ported yet.
+//! are not ported.
 
 mod hash;
+mod rust_attributes;
+mod rust_box;
+mod rust_enum;
+mod rust_string;
+mod rust_vec;
 mod string;
 mod unordered_map;
 mod variant;
@@ -43,6 +77,11 @@ mod vector;
 pub use hash::{
     CustomHash, GuestHashKey, GuestKeyArg, HashPolicy, SEED as HASH_SEED, StdHash, hash_bytes,
 };
+pub use rust_attributes::{GuestRustAttr, GuestRustAttributes};
+pub use rust_box::{GuestRustBox, GuestRustBoxedSlice, GuestRustBoxedStr};
+pub use rust_enum::{GuestRustEnum, RustEnumTag, RustEnumVariants};
+pub use rust_string::{GuestRustStr, GuestRustString, rust_dangling, rust_min_capacity};
+pub use rust_vec::{GuestRustSlice, GuestRustVec};
 pub use string::GuestStdString;
 pub use unordered_map::GuestStdUnorderedMap;
 #[doc(hidden)]
@@ -181,6 +220,22 @@ impl<T: GuestPod> GuestPtr<T> {
     }
 }
 
+impl<T: GuestPod> GuestPtr<T> {
+    /// Read the object, change the host copy, and write it back, also when
+    /// `f` fails (the copy may already own new memory by then).
+    pub fn modify<R>(
+        &self,
+        m: &mut Machine,
+        f: impl FnOnce(&mut T, &mut Machine) -> Result<R>,
+    ) -> Result<R> {
+        let mut value = self.get(m)?;
+        let result = f(&mut value, m);
+        // Write back even on error: the copy may already own new memory.
+        self.set(m, &value)?;
+        result
+    }
+}
+
 impl<T: GuestType> GuestPtr<T> {
     /// Construct the object from a host value (C++
     /// `construct_guest_object`). Whatever was there is overwritten, not
@@ -239,8 +294,16 @@ pub trait GuestType: GuestPod {
 macro_rules! plain_types {
     ($($t:ty),*) => {$( impl GuestType for $t {} )*};
 }
-plain_types!(i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, bool);
+plain_types!(i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, bool, ());
 impl<T: GuestPod, const N: usize> GuestType for [T; N] {}
+
+/// A unit variant of a guest enum (C++ `std::monostate`): no bytes.
+impl GuestPod for () {
+    const SIZE: usize = 0;
+    const ALIGN: usize = 1;
+    fn write_guest(&self, _out: &mut Vec<u8>) {}
+    fn read_guest(_bytes: &[u8]) -> Self {}
+}
 
 /// C++ `bool`: one byte.
 impl GuestPod for bool {
@@ -273,7 +336,7 @@ macro_rules! plain_to_host {
         }
     )*};
 }
-plain_to_host!(i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, bool);
+plain_to_host!(i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, bool, ());
 
 impl ToHost for GuestStdString {
     type Host = String;

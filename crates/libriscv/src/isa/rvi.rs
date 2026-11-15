@@ -198,7 +198,14 @@ ops! {
     /// decoder entry); here the machine's hook is asked when the
     /// instruction executes, so decoded segments shared between machines
     /// don't depend on any machine's hook.
+    ///
+    /// A valid [`Dyncall`](crate::Dyncall) word isn't custom here: it is the
+    /// system call numbered by its immediate (as `dispatch::dyncall` runs
+    /// it on the fast path, and the JIT on leaving native code).
     Custom = |m, i| {
+        if crate::Dyncall::valid(i.whole()) {
+            return m.system_call(crate::Dyncall::index(i.whole()));
+        }
         match m.custom_instruction(i) {
             Some(handler) => handler(m, i),
             None => Unimplemented::exec(m, i),

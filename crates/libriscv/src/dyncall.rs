@@ -12,12 +12,22 @@
 //! Legacy is the encoding documented for `.insn i 0b1011011, 0, x0, x0, N`:
 //! it carries no counts and means 8 inputs and 2 outputs.
 //!
-//! A dyncall is a custom instruction (see
-//! [`Machine::set_on_unimplemented_instruction`](crate::Machine::set_on_unimplemented_instruction)):
-//! the interpreter runs its handler like any other. The JIT compiles valid
-//! words as calls of the handler that publish the exact PC and instruction
-//! counter, and collect stops and penalties right after it (C++ asmjit's
-//! `emit_dyncall`).
+//! A valid dyncall word is the system call numbered by its index (see
+//! [`Machine::install_syscall_handler`](crate::Machine::install_syscall_handler)),
+//! with the counts as the guest's promise of which argument registers the
+//! handler reads and writes: an ECALL without `a7`, which never changes PC
+//! (it is never clone-like or an exit), so it doesn't end its block. The
+//! interpreter (the `dispatch::dyncall` bytecode) and the JIT (which leaves
+//! native code for it) both publish the PC, instruction counter and limit
+//! to the handler, and a stop or penalty takes effect right after it, with
+//! the exact count. Indices beyond the system call table go to the
+//! unhandled system call callback.
+//!
+//! Not in C++, where a dyncall is a custom instruction whose handler the
+//! decoder hook picks, and only asmjit publishes the counter to it
+//! (`emit_dyncall`). The decoder hook
+//! ([`Machine::set_on_unimplemented_instruction`](crate::Machine::set_on_unimplemented_instruction))
+//! still gets every other custom-2 word.
 
 /// The dyncall encoding (C++ `struct Dyncall`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +82,12 @@ impl Dyncall {
         } else {
             Self::MAX_OUTPUTS
         }
+    }
+
+    /// The index in the immediate: the number of the system call the
+    /// dyncall runs (see [`Dyncall`]'s module docs).
+    pub const fn index(word: u32) -> u64 {
+        (word >> 20) as u64
     }
 
     /// Synchronize fa0-fa7 inputs and fa0-fa1 outputs. Clearing the bit

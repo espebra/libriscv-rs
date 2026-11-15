@@ -47,7 +47,8 @@ Toolchain: pinned nightly (`rust-toolchain.toml`) for `become`. Don't bump it
 as a side effect of other work; see "Toolchain" in `PORTING.md`.
 
 Guests compile with `riscv64-linux-gnu-gcc-14` (`$RCC`); outputs are cached in
-`target/riscv-guests/`.
+`target/riscv-guests/`. Rust guests (`testutil::build_rust`, `tests/native_rust.rs`)
+need `rustup target add riscv64gc-unknown-linux-gnu` for the pinned toolchain.
 
 ## Rules
 

@@ -1,12 +1,10 @@
 //! Harness for calls into the guest (`vmcall.rs`, `dyncall.rs`,
 //! `sysargs.rs`): VM calls with host arguments, preemption from system
-//! call handlers (nested), dyncall handlers, and system call argument
+//! call handlers (nested), dyncalls (system calls), and system call argument
 //! parsing, all against guest-chosen code and data.
 
 use libriscv::registers::REG_ARG0;
-use libriscv::{
-    Buffer, Dyncall, ExceptionKind, Instr, Machine, MachineError, MachineOptions, OnStack,
-};
+use libriscv::{Buffer, ExceptionKind, Machine, MachineError, MachineOptions, OnStack};
 
 use crate::elf::{self, CODE};
 use crate::{MAX_CYCLES, quiet};
@@ -15,6 +13,8 @@ use crate::{MAX_CYCLES, quiet};
 const SYS_PREEMPT: usize = 1;
 const SYS_TRY_PREEMPT: usize = 2;
 const SYS_ARGS: usize = 3;
+/// 4-7: the dyncall behaviours of `sys_dyncall`.
+const SYS_DYNCALL: usize = 4;
 /// Preemptions nest (a preempted function may preempt again): each level
 /// is a host stack frame, so the embedder has to bound the depth. Like an
 /// embedder, the harness refuses beyond this.
@@ -81,24 +81,21 @@ fn sys_args(m: &mut Machine) -> libriscv::Result<()> {
     Ok(())
 }
 
-/// Dyncall handler: reads its arguments as a string and a buffer, then
-/// stops, penalizes or fails depending on the immediate.
-fn dyncall(m: &mut Machine, i: Instr) -> libriscv::Result<()> {
+/// System calls 4-7, which dyncalls (system calls numbered by their
+/// immediate) reach too: read the arguments as a string and a buffer, then
+/// return, penalize, stop or fail.
+fn sys_dyncall<const BEHAVIOUR: usize>(m: &mut Machine) -> libriscv::Result<()> {
     let n = m
         .sysargs::<(String, &[u8])>()
         .map_or(0, |(s, v)| s.len() + v.len());
     m.cpu.set_reg(REG_ARG0, n as u64);
-    match i.itype().imm() & 3 {
+    match BEHAVIOUR {
         0 => {}
         1 => m.penalize(1000),
         2 => m.stop(),
         _ => return Err(MachineError::trigger(ExceptionKind::IllegalOperation, 0)),
     }
     Ok(())
-}
-
-fn on_unimplemented(i: Instr) -> Option<libriscv::CustomInstruction> {
-    Dyncall::valid(i.whole()).then_some(dyncall)
 }
 
 /// A machine running `code`, with the harness's system calls and dyncalls.
@@ -115,7 +112,12 @@ fn vmcall_machine(code: &[u8]) -> Option<Machine> {
     m.install_syscall_handler(SYS_PREEMPT, sys_preempt);
     m.install_syscall_handler(SYS_TRY_PREEMPT, sys_try_preempt);
     m.install_syscall_handler(SYS_ARGS, sys_args);
-    m.set_on_unimplemented_instruction(on_unimplemented);
+    m.install_syscall_handlers([
+        (SYS_DYNCALL, sys_dyncall::<0> as libriscv::SyscallHandler),
+        (SYS_DYNCALL + 1, sys_dyncall::<1>),
+        (SYS_DYNCALL + 2, sys_dyncall::<2>),
+        (SYS_DYNCALL + 3, sys_dyncall::<3>),
+    ]);
     m.setup_argv(&["program"], &["LC_ALL=C"]).ok()?;
     Some(m)
 }

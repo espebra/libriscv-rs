@@ -954,6 +954,10 @@ pub(crate) fn fast_handler(i: Instr, pc: u64, begin: u64, end: u64) -> Option<(H
                 _ => return function(),
             })
         }
+        // A dyncall is the system call numbered by its immediate.
+        crate::Dyncall::OPCODE if crate::Dyncall::valid(original) => {
+            Some((dispatch::dyncall, original))
+        }
         SYSTEM => {
             if it.funct3() == 0 {
                 match it.imm() {

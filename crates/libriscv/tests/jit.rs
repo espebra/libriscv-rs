@@ -27,7 +27,7 @@
 
 mod support;
 
-use libriscv::{Dyncall, ExceptionKind, Instr, Machine, MachineOptions};
+use libriscv::{Dyncall, ExceptionKind, Machine, MachineOptions};
 use support::*;
 
 fn machine(code: &[u8], jit: bool) -> Machine {
@@ -423,8 +423,12 @@ fn fmin_fmax_of_two_nans_is_canonical() {
     assert!(got == expected, "{}", describe(&got, &expected));
 }
 
-/// The dyncall handler of [`dyncall_machine`]: leaves the counters alone.
-fn dyncall_handler(m: &mut Machine, _: Instr) -> libriscv::Result<()> {
+/// The dyncall handlers of [`dyncall_machine`]: system call 500 leaves the
+/// counters alone, 501 also penalizes by one instruction.
+const DYNCALL: u32 = 500;
+const PENALIZING_DYNCALL: u32 = 501;
+
+fn dyncall_handler(m: &mut Machine) -> libriscv::Result<()> {
     let a1 = m.cpu.reg(11);
     m.cpu.set_reg(11, a1.wrapping_mul(3).wrapping_add(1000));
     Ok(())
@@ -432,12 +436,19 @@ fn dyncall_handler(m: &mut Machine, _: Instr) -> libriscv::Result<()> {
 
 fn dyncall_machine(code: &[u8], jit: bool) -> Machine {
     let mut m = machine(code, jit);
-    m.set_on_unimplemented_instruction(|i| Dyncall::valid(i.whole()).then_some(dyncall_handler));
+    m.install_syscall_handler(DYNCALL as usize, dyncall_handler);
+    m.install_syscall_handler(PENALIZING_DYNCALL as usize, |m| {
+        m.penalize(1);
+        dyncall_handler(m)
+    });
     m
 }
 
-/// [`compare`] with [`dyncall_handler`] installed in both machines.
-fn compare_dyncalls(code: &[u8], what: &str) {
+/// [`compare`] with the dyncall handlers installed in both machines. A run
+/// that ends on the limit has reached it: a penalty only halts right after
+/// the dyncall when the retired count crosses the limit. Returns the
+/// interpreter's outcome with the most fuel.
+fn compare_dyncalls(code: &[u8], what: &str) -> Outcome {
     let mut interp = dyncall_machine(code, false);
     let mut jit = dyncall_machine(code, true);
     assert!(jit.cpu.current_execute_segment().jit_entry_count() > 0);
@@ -447,7 +458,15 @@ fn compare_dyncalls(code: &[u8], what: &str) {
         if got != expected {
             panic!("{what}, fuel {fuel}:\n{}", describe(&got, &expected));
         }
+        if expected.result == Ok(false) {
+            assert!(
+                expected.counter >= fuel,
+                "{what}, fuel {fuel}: halted at {} before the limit",
+                expected.counter
+            );
+        }
     }
+    run(&mut interp, &[0; 64], 100_000)
 }
 
 /// A dyncall that leaves the counters alone doesn't stop native code: a
@@ -455,16 +474,31 @@ fn compare_dyncalls(code: &[u8], what: &str) {
 /// interpreter checks it.
 #[test]
 fn dyncalls_mid_block_check_the_limit_at_the_block_end() {
+    let last = compare_dyncalls(&mid_block_dyncalls(DYNCALL), "dyncall mid-block");
+    assert_ne!(last.regs[11], 0, "the handler didn't run");
+}
+
+/// A small penalty halts right after the dyncall only when it takes the
+/// retired count to the limit. The block's count crossing it is checked at
+/// the block end, as without a penalty.
+#[test]
+fn small_penalties_mid_block_halt_only_at_the_limit() {
+    let code = mid_block_dyncalls(PENALIZING_DYNCALL);
+    let last = compare_dyncalls(&code, "penalizing dyncall mid-block");
+    assert_ne!(last.regs[11], 0, "the handler didn't run");
+}
+
+/// A loop with system call `number` as a dyncall in the middle of its block.
+fn mid_block_dyncalls(number: u32) -> Vec<u8> {
     let addi = itype(0x13, 0, 10, 10, 1); // addi a0, a0, 1
-    let dyncall = Dyncall::encode(500, 1, 1, false);
     let mut program = vec![itype(0x13, 0, 6, 0, 5)]; // li t1, 5
     program.extend([addi; 3]);
-    program.push(dyncall);
+    program.push(Dyncall::encode(number, 1, 1, false));
     program.extend([addi; 5]);
     program.push(itype(0x13, 0, 6, 6, -1)); // addi t1, t1, -1
     program.push(btype(1, 6, 0, -40)); // bnez t1, loop
     program.push(jtype(0, 0)); // j .
-    compare_dyncalls(&words(&program), "dyncall mid-block");
+    words(&program)
 }
 
 /// A dyncall as the segment's last instruction: in the 4-byte layout the
@@ -473,8 +507,10 @@ fn dyncalls_mid_block_check_the_limit_at_the_block_end() {
 #[test]
 fn dyncall_at_the_segment_end_matches_the_interpreter() {
     let addi = itype(0x13, 0, 10, 10, 1); // addi a0, a0, 1
-    let dyncall = Dyncall::encode(500, 1, 1, false);
-    compare_dyncalls(&words(&[addi, addi, dyncall]), "dyncall at the end");
+    for number in [DYNCALL, PENALIZING_DYNCALL] {
+        let dyncall = Dyncall::encode(number, 1, 1, false);
+        let _ = compare_dyncalls(&words(&[addi, addi, dyncall]), "dyncall at the end");
+    }
 }
 
 #[test]

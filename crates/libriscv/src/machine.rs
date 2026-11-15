@@ -485,6 +485,18 @@ impl Machine {
         }
     }
 
+    /// The handler installed for system call `number` (C++
+    /// `syscall_handlers.at(number)`), e.g. to chain onto it. `None` above
+    /// [`SYSCALLS_MAX`].
+    pub fn syscall_handler(&self, number: usize) -> Option<SyscallHandler> {
+        if number == SYSCALL_EBREAK_NR
+            && let Some(previous) = self.previous_ebreak
+        {
+            return Some(previous);
+        }
+        self.syscall_handlers.get(number).copied()
+    }
+
     /// Set the callback for system calls without a handler.
     pub const fn set_on_unhandled_syscall(&mut self, f: UnhandledSyscall) {
         self.on_unhandled_syscall = f;
@@ -505,11 +517,10 @@ impl Machine {
     /// reserved custom opcodes, for example, but not encodings the
     /// decoder rejects as illegal itself, as in C++). The interpreter runs
     /// the handler mid-block without making the PC or the instruction
-    /// counter visible to it, like C++. With the JIT, valid
-    /// [`Dyncall`](crate::Dyncall) words are *counted*: the handler sees
-    /// the exact PC and the counter and limit, and `stop()`, `penalize()`
-    /// and changes to the limit take effect right after it (C++ asmjit's
-    /// `execute_counted_dyncall`).
+    /// counter visible to it, like C++. Valid [`Dyncall`](crate::Dyncall)
+    /// words don't reach it: they are system calls, numbered by their
+    /// index, with the exact PC and counter visible to the handler (unlike
+    /// C++, where they are custom instructions too).
     pub const fn set_on_unimplemented_instruction(&mut self, f: UnimplementedInstruction) {
         self.on_unimplemented_instruction = Some(f);
     }

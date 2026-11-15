@@ -12,15 +12,12 @@
 //!   FP bits (loads, stores, moves, sign injection, FCLASS, compares,
 //!   conversions to integers and from integers) stay, and are compared
 //!   exactly.
-//! - A fault at a dyncall is reported at the dyncall's own PC and counter
-//!   (the interpreter reports its block's): no valid dyncall words. (The
-//!   harness has no dyncall handler, so they all fault.)
 //!
 //! Only meaningful where the JIT runs (x86-64): elsewhere both sides
 //! interpret. Build with `--features jit`.
 
 use libriscv::memory::PageAttributes;
-use libriscv::{Dyncall, ExceptionKind, Machine, MachineOptions};
+use libriscv::{ExceptionKind, Machine, MachineOptions};
 
 /// Code address (as in `vmfuzzer`).
 const V: u64 = 0x2000;
@@ -52,7 +49,7 @@ fn may_differ(code: &[u8]) -> bool {
         .step_by(2)
         .filter_map(|i| code.get(i..i + 4))
         .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
-        .any(|w| nan_producing(w) || Dyncall::valid(w))
+        .any(nan_producing)
 }
 
 /// The fields of two outcomes that differ (the memory by its first
@@ -185,6 +182,7 @@ pub fn fuzz_jit_vs_interpreter(data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libriscv::Dyncall;
 
     #[test]
     fn inputs_that_may_differ_are_recognised() {
@@ -192,11 +190,12 @@ mod tests {
         let fsgnj_d = (0x11 << 25) | (11 << 20) | (10 << 15) | (10 << 7) | 0x53;
         assert!(nan_producing(fadd_d));
         assert!(!nan_producing(fsgnj_d));
-        // The two dyncall words of the first jitdifffuzzer run (2026-11-13).
+        // The two dyncall words of the first jitdifffuzzer run (2026-11-13)
+        // differed by their fault PC while the interpreter ran dyncalls
+        // mid-block. As system calls they are compared exactly.
         for word in [0x0200_005b_u32, 0x002e_7a5b] {
-            assert!(may_differ(&word.to_le_bytes()));
-            // Also at an odd halfword.
-            assert!(may_differ(&[&[0x13, 0][..], &word.to_le_bytes()].concat()));
+            assert!(Dyncall::valid(word));
+            assert!(!may_differ(&word.to_le_bytes()));
         }
         assert!(!may_differ(&0x0000_0013_u32.to_le_bytes()));
     }

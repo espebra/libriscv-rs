@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use libriscv::aot::AotOutput;
-use libriscv::{Dyncall, ExceptionKind, Instr, Machine, MachineOptions};
+use libriscv::{Dyncall, ExceptionKind, Machine, MachineOptions};
 use support::*;
 
 /// `rustc` for compiling translations (the toolchain running the tests).
@@ -515,8 +515,9 @@ fn fp_special_values_match_up_to_nan() {
     }
 }
 
-/// The dyncall handler of [`dyncall_machine`]: leaves the counters alone.
-fn dyncall_handler(m: &mut Machine, _: Instr) -> libriscv::Result<()> {
+/// System call 500, which the dyncalls of [`dyncall_machine`] run: leaves
+/// the counters alone.
+fn dyncall_handler(m: &mut Machine) -> libriscv::Result<()> {
     let a1 = m.cpu.reg(11);
     m.cpu.set_reg(11, a1.wrapping_mul(3).wrapping_add(1000));
     Ok(())
@@ -524,7 +525,7 @@ fn dyncall_handler(m: &mut Machine, _: Instr) -> libriscv::Result<()> {
 
 fn dyncall_machine(code: &[u8], options: MachineOptions) -> Machine {
     let mut m = machine_sized(code, 1 << 20, options);
-    m.set_on_unimplemented_instruction(|i| Dyncall::valid(i.whole()).then_some(dyncall_handler));
+    m.install_syscall_handler(500, dyncall_handler);
     m
 }
 

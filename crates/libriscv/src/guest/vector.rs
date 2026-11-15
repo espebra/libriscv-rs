@@ -205,18 +205,18 @@ impl<T: GuestType, A: GuestInit<T>> GuestInit<GuestStdVector<T>> for [A] {
 }
 impl<T: GuestType, A: GuestInit<T>> GuestInit<GuestStdVector<T>> for Vec<A> {
     fn init_at(&self, m: &mut Machine, addr: u64) -> Result<()> {
-        self.as_slice().init_at(m, addr)
+        GuestInit::<GuestStdVector<T>>::init_at(self.as_slice(), m, addr)
     }
     fn assign_at(&self, m: &mut Machine, addr: u64) -> Result<()> {
-        self.as_slice().assign_at(m, addr)
+        GuestInit::<GuestStdVector<T>>::assign_at(self.as_slice(), m, addr)
     }
 }
 impl<T: GuestType, A: GuestInit<T>, const N: usize> GuestInit<GuestStdVector<T>> for [A; N] {
     fn init_at(&self, m: &mut Machine, addr: u64) -> Result<()> {
-        self.as_slice().init_at(m, addr)
+        GuestInit::<GuestStdVector<T>>::init_at(self.as_slice(), m, addr)
     }
     fn assign_at(&self, m: &mut Machine, addr: u64) -> Result<()> {
-        self.as_slice().assign_at(m, addr)
+        GuestInit::<GuestStdVector<T>>::assign_at(self.as_slice(), m, addr)
     }
 }
 

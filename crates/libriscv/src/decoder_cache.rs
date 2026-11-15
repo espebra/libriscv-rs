@@ -35,6 +35,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use crate::decode;
 use crate::dispatch::{self, Handler};
+use crate::dyncall::Dyncall;
 use crate::error::{MachineError, Result};
 use crate::instruction::Instr;
 
@@ -649,7 +650,13 @@ impl DecodedSegment {
     /// `instr` through its precise handler (C++ `RV32I_BC_FUNCBLOCK`).
     fn force_funcblock(&mut self, i: usize, instr: Instr) {
         if let Some(e) = self.cache.get_mut(i) {
-            e.handler = decode::decode(instr).funcblock;
+            // The dyncall bytecode ends a block like FUNCBLOCK does, and
+            // publishes the counter to the handler, which FUNCBLOCK doesn't.
+            e.handler = if Dyncall::valid(instr.whole()) {
+                dispatch::dyncall
+            } else {
+                decode::decode(instr).funcblock
+            };
             e.instr = instr.0;
             e.invalid = false;
         }

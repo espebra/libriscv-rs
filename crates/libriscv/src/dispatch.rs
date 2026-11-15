@@ -449,6 +449,118 @@ pub(crate) extern "rust-preserve-none" fn syscall(
     next_block!(exec, cache, i, m, pc, c, 4, false)
 }
 
+/// What [`run_dyncall`] leaves behind.
+pub(crate) struct DyncallDone {
+    /// The counter and limit after the handler, the dyncall's block counted.
+    pub c: Counter,
+    /// The counter to halt with right after the dyncall: up to and
+    /// including it.
+    pub halt_after: Counter,
+    /// The handler stopped or penalized the machine, or changed its limit.
+    pub touched: bool,
+    /// The dyncall ends its block: the segment's last instruction, or an
+    /// over-long block forced to end there.
+    pub ends_block: bool,
+}
+
+/// Run the dyncall `ins` at `pc`, whose block `c` has counted: the system
+/// call numbered by its immediate, with the PC, the counter and the limit
+/// published as for an ECALL. The handler can stop or penalize the machine,
+/// but not change PC (a dyncall is never clone-like or an exit), so its
+/// block goes on after it. Shared by the [`dyncall`] bytecode and the JIT's
+/// dyncall exit; `counts` is false for native code that doesn't count.
+pub(crate) fn run_dyncall(
+    exec: &DecodedSegment,
+    m: &mut Machine,
+    pc: u64,
+    ins: u32,
+    c: Counter,
+    counts: bool,
+) -> std::result::Result<DyncallDone, Exit> {
+    let visible_max = m.dispatch.visible_max(c.max);
+    m.cpu.regs.pc = pc;
+    m.counter = c.value;
+    m.max_counter = visible_max;
+    if let Err(err) = m.system_call(crate::Dyncall::index(ins)) {
+        return Err(fault(m, err));
+    }
+    let touched = m.counter != c.value || m.max_counter != visible_max;
+    let c = Counter {
+        value: m.counter,
+        max: chain_max(m),
+    };
+    let ends_block = exec
+        .cache
+        .get(exec.index(pc))
+        .is_none_or(|e| e.block_bytes() == 0);
+    // The block is counted to its end: its instructions after the dyncall
+    // aren't retired yet.
+    let retired = if ends_block || !counts {
+        c.value
+    } else {
+        c.value
+            .wrapping_sub(crate::native_code::block_icount(exec, pc.wrapping_add(4)))
+    };
+    Ok(DyncallDone {
+        c,
+        halt_after: Counter {
+            value: retired,
+            max: c.max,
+        },
+        touched,
+        ends_block,
+    })
+}
+
+/// A [`Dyncall`](crate::Dyncall) word: the system call numbered by its
+/// immediate, in the middle of its block (not in C++, where a dyncall is a
+/// custom instruction that runs without the counter). A stop, or a penalty
+/// that takes the retired count to the limit, halts right after it with the
+/// exact count; otherwise
+/// the block goes on, and a limit merely crossed by the block's count is
+/// checked at its end, as for any instruction. The JIT's dyncall exit does
+/// the same.
+#[rustc_align(64)]
+pub(crate) extern "rust-preserve-none" fn dyncall(
+    exec: &DecodedSegment,
+    cache: &[DecoderEntry],
+    i: usize,
+    m: &mut Machine,
+    c: Counter,
+    ins: u32,
+    pc: u64,
+) -> Exit {
+    let at = exec.address_of(i);
+    let next = at.wrapping_add(4);
+    let d = match run_dyncall(exec, m, at, ins, c, true) {
+        Ok(d) => d,
+        Err(exit) => return exit,
+    };
+    // Only when the retired count reaches the limit: the block's count
+    // crossing it is checked at the block end, penalty or not.
+    if d.touched && d.halt_after.overflowed() {
+        return halt(m, next, d.halt_after);
+    }
+    // FUNCTION's stale-segment check.
+    if exec.is_stale() {
+        return leave_segment(m, next, d.c);
+    }
+    if d.ends_block {
+        // The segment's last instruction in the 4-byte layout falls
+        // through into the padding entry past the end, like FUNCTION.
+        if !exec.is_within(next, 2) {
+            execute!(exec, cache, i + STEP, m, pc, d.c)
+        }
+        // A forced block end checks the limit before the next block, like
+        // FUNCBLOCK.
+        if d.c.overflowed() {
+            return halt(m, next, d.halt_after);
+        }
+        begin_block!(exec, cache, exec.index(next), m, next, d.c)
+    }
+    execute!(exec, cache, i + STEP, m, pc, d.c)
+}
+
 /// WFI and the STOP instruction (C++ `rv32i_stop`).
 #[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn stop(
@@ -643,73 +755,49 @@ pub(crate) extern "rust-preserve-none" fn native_enter(
                 )
             }
             NativeExit::Dyncall { pc, counter } => {
-                // C++ asmjit `execute_counted_dyncall`: the handler sees the
-                // exact PC, the counter and the limit, and what it does to
-                // them takes effect right after it.
-                let visible_max = m.dispatch.visible_max(c.max);
-                m.cpu.regs.pc = pc;
-                m.counter = counter;
-                m.max_counter = visible_max;
-                let instr = Instr(exec.read_u32(pc));
-                if let Err(err) = crate::isa::rvi::Custom::exec(m, instr) {
-                    return fault(m, err);
-                }
-                // The handler stopped the machine, penalized it or changed
-                // its limit.
-                let touched = m.counter != counter || m.max_counter != visible_max;
-                c = Counter {
-                    value: m.counter,
-                    max: chain_max(m),
-                };
-                let next = pc.wrapping_add(4);
-                let ends_block = exec
-                    .cache
-                    .get(exec.index(pc))
-                    .is_none_or(|e| e.block_bytes() == 0);
-                // Counted up to the dyncall: the block's instructions after it
-                // aren't retired yet (native entries count them again).
-                let retired = if ends_block || !counts {
-                    c.value
-                } else {
-                    c.value
-                        .wrapping_sub(crate::native_code::block_icount(exec, next))
-                };
-                let halt_after = Counter {
-                    value: retired,
+                // What the interpreter's `dyncall` bytecode does: the
+                // handler sees the exact PC, the counter and the limit, and
+                // a stop or penalty takes effect right after it.
+                let at_dyncall = Counter {
+                    value: counter,
                     max: c.max,
                 };
-                // A handler that stopped or penalized the machine (or
-                // lowered its limit) takes effect right after it.
-                if touched && c.overflowed() {
-                    return halt(m, next, halt_after);
+                let d = match run_dyncall(exec, m, pc, exec.read_u32(pc), at_dyncall, counts) {
+                    Ok(d) => d,
+                    Err(exit) => return exit,
+                };
+                c = d.c;
+                let next = pc.wrapping_add(4);
+                // As in the `dyncall` bytecode: the retired count decides.
+                if d.touched && d.halt_after.overflowed() {
+                    return halt(m, next, d.halt_after);
                 }
-                // Otherwise, what the interpreter's FUNCTION and FUNCBLOCK
-                // handlers do after the instruction. First, the handler may
-                // have made the segment stale: leave it.
+                // The handler may have made the segment stale: leave it.
                 if exec.is_stale() {
                     return leave_segment(m, next, c);
                 }
                 // The segment's last instruction in the 4-byte layout: its
-                // block ends only because the segment does, and FUNCTION
-                // falls through into the padding entry after it, without
+                // block ends only because the segment does, and it falls
+                // through into the padding entry after it, without
                 // counting it or checking the limit. (With compressed
                 // instructions the decoder makes that instruction invalid,
                 // so it is never compiled.)
-                if ends_block && !exec.is_within(next, 2) {
+                if d.ends_block && !exec.is_within(next, 2) {
                     execute!(exec, cache, exec.index(next), m, pc, c)
                 }
-                // FUNCBLOCK checks the limit before the next block. In the
-                // middle of a block, the limit is only checked at its end, so
-                // the block's count crossing it is no reason to stop here.
-                if ends_block && c.overflowed() {
-                    return halt(m, next, halt_after);
+                // A forced block end checks the limit before the next
+                // block. In the middle of a block, the limit is only
+                // checked at its end, so the block's count crossing it is
+                // no reason to stop here.
+                if d.ends_block && c.overflowed() {
+                    return halt(m, next, d.halt_after);
                 }
                 let si = exec.index(next);
                 if exec.is_within(next, 2) && jit.has_entry(si) {
-                    (slot, entry_pc, before) = (si, next, retired);
+                    (slot, entry_pc, before) = (si, next, d.halt_after.value);
                     continue;
                 }
-                if ends_block {
+                if d.ends_block {
                     begin_block!(exec, cache, si, m, next, c)
                 }
                 // Finish the block in the interpreter, as after EXIT_SLOW.
