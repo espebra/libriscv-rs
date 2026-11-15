@@ -15,10 +15,19 @@
 //! * `openat` refuses write access (`O_WRONLY`, `O_RDWR`, `O_CREAT`,
 //!   `O_TRUNC`, `O_APPEND`) outside proxy mode, where C++ would create or
 //!   truncate the host file and only refuse the writes afterwards.
-//! * Paths are looked up on the host only through the filters: `fstatat`
-//!   with a path needs `filter_stat` (or `filter_open`), `faccessat`
-//!   needs `filter_open`, `readlinkat` needs `filter_readlink` (or proxy
-//!   mode). C++ goes to the host when no filter is installed.
+//! * Paths are looked up on the host only through the filters: `openat`
+//!   and `faccessat` need `filter_open`, `fstatat` with a path needs
+//!   `filter_stat` (or `filter_open`), `readlinkat` needs
+//!   `filter_readlink` (or proxy mode for all of them). C++ goes to the
+//!   host when no filter is installed.
+//! * The filters see absolute, lexically normalised paths (`.`, `..` and
+//!   repeated slashes collapsed; paths relative to a directory descriptor
+//!   joined to its guest path), and that normalised path, or the filter's
+//!   rewrite of it, is what the host opens. C++ hands the filter the raw
+//!   guest string and lets the host resolve it.
+//! * `openat` (and the `faccessat` probes) refuse files that are neither
+//!   regular files nor directories (FIFOs, devices, sockets: they can
+//!   block the host thread) unless `permit_special_files` is set.
 //! * `dup`/`dup3` return virtual descriptors (C++ returns host numbers),
 //!   `pipe2` and `getdents64` are not supported (`ENOSYS`), and reading
 //!   from fds 1 and 2 is `EBADF`. `getcwd` checks the buffer size.
@@ -385,17 +394,46 @@ mod oflags {
     pub(super) const O_APPEND: i32 = 0o2000;
 }
 
-/// Resolve a guest path against a directory descriptor: absolute paths
-/// stand alone, relative ones need a directory opened by the guest
-/// (`AT_FDCWD` is not a host directory, as in C++).
-fn resolve_at(fds: &mut FileDescriptors, dir_fd: i32, path: &str) -> Option<String> {
+/// The absolute, lexically normalised guest path the filters judge, or the
+/// errno to return. Absolute paths stand alone, relative ones are joined
+/// to the guest path of a directory opened by the guest (`AT_FDCWD` is not
+/// a host directory, as in C++, so relative paths through it are `EBADF`).
+/// An empty path is `ENOENT`, as in Linux.
+fn guest_full_path(
+    fds: &mut FileDescriptors,
+    dir_fd: i32,
+    path: &str,
+) -> core::result::Result<String, u64> {
+    if path.is_empty() {
+        return Err(neg(ENOENT));
+    }
     if path.starts_with('/') {
-        return Some(path.to_owned());
+        return Ok(FileDescriptors::normalize_path(path));
     }
     match fds.get(dir_fd) {
-        Some(dir) => Some(format!("{}/{path}", dir.path.trim_end_matches('/'))),
-        None => None,
+        Some(dir) => Ok(FileDescriptors::normalize_path(&format!(
+            "{}/{path}",
+            dir.guest_path
+        ))),
+        None => Err(neg(EBADF)),
     }
+}
+
+/// Run `filter_open` on a normalised guest path: the host path to use, or
+/// `None` when it's denied. With no filter only proxy mode admits paths.
+fn admit_path(fds: &mut FileDescriptors, guest: &str) -> Option<String> {
+    let mut host = guest.to_owned();
+    let allowed = match fds.filter_open.as_mut() {
+        Some(filter) => filter(&mut host),
+        None => fds.proxy_mode,
+    };
+    allowed.then_some(host)
+}
+
+/// Whether a file of this type may be opened (and read) without
+/// `permit_special_files`: regular files and directories never block.
+fn is_plain_file(md: &std::fs::Metadata) -> bool {
+    md.is_file() || md.is_dir()
 }
 
 fn syscall_openat(m: &mut Machine) -> Result<()> {
@@ -409,25 +447,43 @@ fn syscall_openat(m: &mut Machine) -> Result<()> {
         m.set_result(neg(EBADF));
         return Ok(());
     };
-    let Some(mut path) = path else {
+    let Some(path) = path else {
         m.set_result(neg(ENOENT));
         return Ok(());
     };
-    if let Some(filter) = fds.filter_open.as_mut()
-        && !filter(&mut path)
-    {
+    let guest = match guest_full_path(fds, dir_fd, &path) {
+        Ok(p) => p,
+        Err(errno) => {
+            m.set_result(errno);
+            return Ok(());
+        }
+    };
+    let Some(full) = admit_path(fds, &guest) else {
         m.set_result(neg(EPERM));
         return Ok(());
-    }
+    };
     let wants_write = flags & O_ACCMODE != 0 || flags & (O_CREAT | O_TRUNC | O_APPEND) != 0;
     if wants_write && !fds.proxy_mode {
         m.set_result(neg(EACCES));
         return Ok(());
     }
-    let Some(full) = resolve_at(fds, dir_fd, &path) else {
-        m.set_result(neg(EBADF));
-        return Ok(());
-    };
+    // Opening a FIFO or a device can block the host thread, so look at
+    // what the path resolves to first (std has no O_NONBLOCK), and check
+    // the opened file again below in case it changed in between.
+    if !fds.permit_special_files {
+        match std::fs::metadata(&full) {
+            Ok(md) if !is_plain_file(&md) => {
+                m.set_result(neg(EACCES));
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(e) if flags & O_CREAT != 0 && e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                m.set_result(io_error(&e));
+                return Ok(());
+            }
+        }
+    }
     let access = flags & O_ACCMODE;
     let mut opts = std::fs::OpenOptions::new();
     opts.read(access != O_WRONLY)
@@ -443,10 +499,16 @@ fn syscall_openat(m: &mut Machine) -> Result<()> {
         }
     }
     let result = match opts.open(&full) {
+        Ok(file)
+            if !fds.permit_special_files && !file.metadata().is_ok_and(|md| is_plain_file(&md)) =>
+        {
+            neg(EACCES)
+        }
         Ok(file) => {
             let entry = OpenFile {
                 file,
                 path: full,
+                guest_path: guest,
                 access,
             };
             fds.assign_file(entry)
@@ -481,6 +543,7 @@ fn dup_file(fds: &mut FileDescriptors, vfd: i32) -> u64 {
         Ok(file) => OpenFile {
             file,
             path: f.path.clone(),
+            guest_path: f.guest_path.clone(),
             access: f.access,
         },
         Err(e) => return io_error(&e),
@@ -593,9 +656,12 @@ fn syscall_readlinkat(m: &mut Machine) -> Result<()> {
         // The filter always rewrites the answer
         path.into_bytes()
     } else if fds.proxy_mode {
-        let Some(full) = resolve_at(fds, dir_fd, &path) else {
-            m.set_result(neg(EBADF));
-            return Ok(());
+        let full = match guest_full_path(fds, dir_fd, &path) {
+            Ok(p) => p,
+            Err(errno) => {
+                m.set_result(errno);
+                return Ok(());
+            }
         };
         match std::fs::read_link(full) {
             Ok(target) => {
@@ -701,11 +767,18 @@ fn syscall_fstatat(m: &mut Machine) -> Result<()> {
             }
         };
     }
+    let full = match guest_full_path(fds, vfd, &path) {
+        Ok(p) => p,
+        Err(errno) => {
+            m.set_result(errno);
+            return Ok(());
+        }
+    };
     let allowed = if let Some(filter) = fds.filter_stat.as_mut() {
-        filter(&path)
+        filter(&full)
     } else if let Some(filter) = fds.filter_open.as_mut() {
-        let mut copy = path.clone();
-        filter(&mut copy) && copy == path
+        let mut copy = full.clone();
+        filter(&mut copy) && copy == full
     } else {
         fds.proxy_mode
     };
@@ -713,10 +786,6 @@ fn syscall_fstatat(m: &mut Machine) -> Result<()> {
         m.set_result(neg(EPERM));
         return Ok(());
     }
-    let Some(full) = resolve_at(fds, vfd, &path) else {
-        m.set_result(neg(EBADF));
-        return Ok(());
-    };
     let md = if flags & AT_SYMLINK_NOFOLLOW != 0 {
         std::fs::symlink_metadata(full)
     } else {
@@ -737,33 +806,35 @@ fn syscall_faccessat(m: &mut Machine) -> Result<()> {
         m.set_result(neg(ENOSYS));
         return Ok(());
     };
-    let Some(mut path) = path else {
+    let Some(path) = path else {
         m.set_result(neg(ENOENT));
         return Ok(());
     };
-    // Only paths the guest could open can be probed.
-    let allowed = match fds.filter_open.as_mut() {
-        Some(filter) => filter(&mut path),
-        None => fds.proxy_mode,
+    let guest = match guest_full_path(fds, vfd, &path) {
+        Ok(p) => p,
+        Err(errno) => {
+            m.set_result(errno);
+            return Ok(());
+        }
     };
-    if !allowed {
+    // Only paths the guest could open can be probed.
+    let Some(full) = admit_path(fds, &guest) else {
         m.set_result(neg(EACCES));
-        return Ok(());
-    }
-    let Some(full) = resolve_at(fds, vfd, &path) else {
-        m.set_result(neg(EBADF));
         return Ok(());
     };
     let result = match std::fs::metadata(&full) {
         Err(e) => io_error(&e),
         Ok(md) => {
             use std::os::unix::fs::PermissionsExt;
-            let mut ok = true;
-            if mode & R_OK != 0 {
-                ok &= std::fs::File::open(&full).is_ok();
+            // The R_OK/W_OK probes open the file: not one that may block,
+            // and not one openat would refuse.
+            let mut ok =
+                fds.permit_special_files || is_plain_file(&md) || mode & (R_OK | W_OK) == 0;
+            if ok && mode & R_OK != 0 {
+                ok = std::fs::File::open(&full).is_ok();
             }
-            if mode & W_OK != 0 {
-                ok &= fds.proxy_mode && std::fs::OpenOptions::new().write(true).open(&full).is_ok();
+            if ok && mode & W_OK != 0 {
+                ok = fds.proxy_mode && std::fs::OpenOptions::new().write(true).open(&full).is_ok();
             }
             if mode & X_OK != 0 {
                 ok &= md.permissions().mode() & 0o111 != 0;

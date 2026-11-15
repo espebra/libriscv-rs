@@ -296,18 +296,25 @@ impl Machine {
     /// a fresh stack, and run it until it returns (to the exit function,
     /// which stops the machine). Returns `a0`.
     ///
-    /// Runs without an instruction limit and without counting (C++
-    /// `simulate_inaccurate`): for untrusted code use
-    /// [`vmcall_limited`](Self::vmcall_limited). The machine must not be
-    /// running (use [`preempt`](Self::preempt) from a system call).
+    /// **No instruction limit:** this runs without counting instructions
+    /// (C++ `simulate_inaccurate`), so a guest function that loops forever
+    /// hangs the calling host thread. Only use it on trusted guest code;
+    /// for untrusted code use [`vmcall_limited`](Self::vmcall_limited) or
+    /// [`try_vmcall`](Self::try_vmcall) with a nonzero limit. The machine
+    /// must not be running (use [`preempt`](Self::preempt) from a system
+    /// call).
     pub fn vmcall(&mut self, func: impl CallTarget, args: impl VmCallArgs) -> Result<u64> {
         self.vmcall_limited(u64::MAX, func, args)
     }
 
     /// [`vmcall`](Self::vmcall) with at most `max_instructions`
     /// instructions, counted from zero; reaching the limit is a
-    /// `MAX_INSTRUCTIONS_REACHED` error (C++ `vmcall<MAXI>`). A limit of 0
-    /// or `u64::MAX` means no limit, as in C++.
+    /// `MAX_INSTRUCTIONS_REACHED` error (C++ `vmcall<MAXI>`).
+    ///
+    /// **A limit of 0 means no limit**, like `u64::MAX` (as in C++): the
+    /// call then runs uncounted, exactly like [`vmcall`](Self::vmcall). A
+    /// limit computed from a budget that has run out (0) must be checked
+    /// by the caller, or an untrusted guest runs unbounded.
     pub fn vmcall_limited(
         &mut self,
         max_instructions: u64,
@@ -327,6 +334,10 @@ impl Machine {
     /// isn't an error (C++ `vmcall<MAXI, false>`): it returns `a0` as it
     /// is, and [`instruction_limit_reached`](Self::instruction_limit_reached)
     /// tells whether the function returned.
+    ///
+    /// **A limit of 0 (or `u64::MAX`) means no limit**, as for
+    /// [`vmcall_limited`](Self::vmcall_limited): never pass 0 for
+    /// untrusted code.
     pub fn try_vmcall(
         &mut self,
         max_instructions: u64,

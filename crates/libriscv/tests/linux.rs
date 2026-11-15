@@ -399,6 +399,8 @@ fn pinned_file_mappings() {
         machine.setup_linux(&["linux_test"], &ENV).unwrap();
         let fds = machine.fds_mut().unwrap();
         fds.permit_filesystem = true;
+        let allowed = path.clone();
+        fds.filter_open = Some(Box::new(move |p: &mut String| *p == allowed));
         if let Some(pin) = pin {
             fds.pinned_mappings = vec![(path.clone(), pin)];
         }
