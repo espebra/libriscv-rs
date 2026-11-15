@@ -842,11 +842,17 @@ fn syscall_clock_gettime(m: &mut Machine) -> Result<()> {
 /// Port of `nanosleep_clamp_and_penalize`: a guest must not block the host
 /// for long, and sleeping doesn't advance the instruction counter. Clamp
 /// the duration, and charge one instruction per microsecond requested.
-/// Returns the clamped request.
+/// Returns the clamped request (seconds clamped, as C++ writes it back;
+/// [`host_sleep`] clamps the whole duration).
+///
+/// The charge saturates: C++ computes it in an `int64_t` and overflows
+/// (undefined) for requests of 292 years and more, and wrapping it made
+/// `tv_sec = 2^55` free while the host still slept. Below that it's the
+/// same as in C++. Both values are non-negative ([`sleep_request`]).
 fn clamp_and_penalize(m: &mut Machine, sec: i64, nsec: i64) -> (i64, i64) {
     let requested_ns = (sec as u64)
-        .wrapping_mul(1_000_000_000)
-        .wrapping_add(nsec as u64);
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nsec as u64);
     m.penalize(requested_ns / 1000);
     let mut ts = (sec.min(NANOSLEEP_MAX_SECONDS), nsec);
     // Cooperative threads: sleeping blocks every guest thread. If another
@@ -861,12 +867,25 @@ fn clamp_and_penalize(m: &mut Machine, sec: i64, nsec: i64) -> (i64, i64) {
     ts
 }
 
-/// Sleep on the host like `nanosleep`: `EINVAL` for invalid nanoseconds.
-fn host_sleep((sec, nsec): (i64, i64)) -> u64 {
+/// How long [`host_sleep`] sleeps for a (seconds-clamped) request, or
+/// `None` for invalid nanoseconds. The whole duration is clamped to
+/// `NANOSLEEP_MAX_SECONDS`: clamping only the seconds, as C++ does, let a
+/// request sleep for almost twice as long.
+fn host_sleep_duration((sec, nsec): (i64, i64)) -> Option<Duration> {
     if !(0..1_000_000_000).contains(&nsec) {
-        return neg(EINVAL);
+        return None;
     }
-    std::thread::sleep(Duration::new(sec as u64, nsec as u32));
+    let max = Duration::from_secs(NANOSLEEP_MAX_SECONDS as u64);
+    let requested = Duration::new(u64::try_from(sec).unwrap_or(0), nsec as u32);
+    Some(requested.min(max))
+}
+
+/// Sleep on the host like `nanosleep`: `EINVAL` for invalid nanoseconds.
+fn host_sleep(ts: (i64, i64)) -> u64 {
+    let Some(duration) = host_sleep_duration(ts) else {
+        return neg(EINVAL);
+    };
+    std::thread::sleep(duration);
     0
 }
 
@@ -1297,5 +1316,25 @@ impl Machine {
         if filesystem || sockets {
             self.fds = Some(Box::default());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_sleeps_are_clamped_as_a_whole() {
+        let ms = |ms| Some(Duration::from_millis(ms));
+        assert_eq!(host_sleep_duration((0, 1_000_000)), ms(1));
+        assert_eq!(
+            host_sleep_duration((0, 999_999_999)),
+            Some(Duration::new(0, 999_999_999))
+        );
+        // C++ would sleep 1.9 seconds.
+        assert_eq!(host_sleep_duration((1, 900_000_000)), ms(1000));
+        assert_eq!(host_sleep_duration((1, 0)), ms(1000));
+        assert_eq!(host_sleep_duration((1, 1_000_000_000)), None);
+        assert_eq!(host_sleep_duration((0, -1)), None);
     }
 }

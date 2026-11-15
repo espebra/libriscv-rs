@@ -1662,6 +1662,14 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   goes when it exits, and `sigaltstack` without a new stack (and
   `rt_sigreturn` without a delivered signal) reads the default state
   without creating any. The guest sees the same values.
+- Not reproduced (C++ bugs): `nanosleep` and `clock_nanosleep` charge one
+  instruction per microsecond requested, computed in C++ in an `int64_t`
+  that overflows (undefined) for requests of 292 years and more; here the
+  charge saturates (`u64::MAX / 1000` at most), so `tv_sec = 2^55` isn't
+  free while the host sleeps. Smaller requests charge exactly what C++
+  does. C++ clamps only the seconds to `NANOSLEEP_MAX_SECONDS`, so a host
+  sleep could last almost two; here the whole sleep is clamped, while the
+  request `nanosleep` writes back is still C++'s (seconds clamped).
 
 ### Native heap and libc fast path
 
