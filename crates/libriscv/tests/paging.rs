@@ -244,6 +244,9 @@ fn overlapping_execute_segments_do_not_accumulate() {
     const AREA_LEN: u64 = 2 << 20;
     let mut m = with_main_segment(MachineOptions {
         memory_max: 64 << 20,
+        // 16 decodes of the growing area (~32 MiB) would otherwise be
+        // charged past the free allowance and hit the instruction limit.
+        free_decode_bytes: u64::MAX,
         ..Default::default()
     });
     let main = m.memory.execute_segments_memory();
