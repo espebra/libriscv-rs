@@ -41,9 +41,16 @@ pub(crate) const EXIT_MISALIGNED: u64 = 3;
 /// Continue at `exit_pc` after an indirect jump (C++ `UNCHECKED_JUMP`: may
 /// leave the segment).
 pub(crate) const EXIT_INDIRECT: u64 = 4;
-/// The dyncall at `exit_pc` (mid-block, block already counted): the
-/// dispatcher runs its handler, then native code continues after it.
+/// The dyncall at `exit_pc` (block already counted): the dispatcher runs
+/// its handler, then native code continues after it. (AOT code, and JIT
+/// code at a dyncall that ends its block; otherwise the JIT calls the
+/// handler itself.)
 pub(crate) const EXIT_DYNCALL: u64 = 5;
+/// The JIT ran the dyncall at `exit_pc` and can't go on after it (a stop,
+/// a fault, a stale segment, a moved arena): the host call's outcome says
+/// what next. The registers are stored.
+#[cfg(feature = "jit")]
+pub(crate) const EXIT_HOST: u64 = 6;
 
 /// The guest memory layout native code is built for: a non-zero `mask`
 /// (masked accesses, no windows: the N-bit address space), or the
@@ -99,6 +106,12 @@ pub(crate) enum NativeExit {
     Dyncall {
         pc: u64,
         counter: u64,
+    },
+    /// The dyncall at `pc` ran (in native code), with `done`; continue after
+    /// it.
+    Dyncalled {
+        pc: u64,
+        done: crate::dispatch::DyncallDone,
     },
     Fault(MachineError),
     /// The code can't run with the current memory layout; interpret instead.
@@ -252,6 +265,7 @@ impl NativeSegment {
     )]
     pub(crate) fn run(
         &self,
+        exec: &DecodedSegment,
         m: &mut Machine,
         slot: usize,
         pc: u64,
@@ -262,7 +276,7 @@ impl NativeSegment {
         crate::jit::tests::ENTRIES.with_borrow_mut(|e| e.push(pc));
         match self.code {
             #[cfg(feature = "jit")]
-            NativeCode::Jit(ref code) => crate::jit::run(code, m, slot, pc, counter, max),
+            NativeCode::Jit(ref code) => crate::jit::run(code, exec, m, slot, pc, counter, max),
             #[cfg(feature = "aot")]
             NativeCode::Aot(ref code) => code.run(m, slot, pc, counter, max),
         }

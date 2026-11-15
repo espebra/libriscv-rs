@@ -173,7 +173,7 @@ fn self_contained(exec: &DecodedSegment, a: &Analysis, r: RegionId) -> Option<bo
                 Some(t) => native_call(exec, a, r, i).is_some() || stays(t),
                 None => is_return(ins.op),
             },
-            JOp::Dyncall => true,
+            JOp::Dyncall { .. } => true,
             _ => stays(next),
         };
         if !ok {
@@ -1363,7 +1363,7 @@ impl<'a> RegionWriter<'a> {
         let slow = format!("break 'x A::X({EXIT_SLOW}, {pc:#x})");
         match ins.op {
             JOp::Nop => {}
-            JOp::Dyncall => {
+            JOp::Dyncall { .. } => {
                 // Leave with every register stored and the block counted;
                 // the dispatcher runs the handler and re-enters at `next`.
                 self.leave(EXIT_DYNCALL, pc);
