@@ -109,6 +109,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "rustguestfuzzer"
+path = "fuzz_targets/rustguestfuzzer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "jitdifffuzzer"
 path = "fuzz_targets/jitdifffuzzer.rs"
 test = false

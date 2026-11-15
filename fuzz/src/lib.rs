@@ -10,7 +10,8 @@
 //!
 //! The other harnesses have no C++ counterpart: the Linux personality and
 //! the libc fast path, forks ([`linux`]), the guest C++ containers
-//! ([`guest`]), VM calls and dyncalls ([`vmcall`]), the JIT against the
+//! ([`guest`]), the Rust guest collections of the scripting API
+//! ([`rust_guest`]), VM calls and dyncalls ([`vmcall`]), the JIT against the
 //! interpreter ([`jitdiff`]) and the arena's contents through discards
 //! ([`arena`]).
 
@@ -20,6 +21,7 @@ pub mod guest;
 #[cfg(feature = "jit")]
 pub mod jitdiff;
 pub mod linux;
+pub mod rust_guest;
 pub mod vmcall;
 
 #[cfg(test)]
