@@ -16,7 +16,7 @@ checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
 
 [[package]]
 name = "asteroids"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libriscv",
  "testutil",
@@ -244,7 +244,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libriscv"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "libriscv-jit-rt"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "memmap2",
 ]
@@ -321,7 +321,7 @@ checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
 name = "rvlinux"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libriscv",
  "testutil",
@@ -387,7 +387,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "testutil"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "unicode-ident"
