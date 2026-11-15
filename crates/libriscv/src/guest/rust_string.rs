@@ -155,7 +155,7 @@ impl GuestRustStr {
     }
     /// The text as a host string, with invalid UTF-8 replaced.
     pub fn to_string_lossy(&self, m: &Machine) -> Result<String> {
-        Ok(String::from_utf8_lossy(self.as_bytes(m)?).into_owned())
+        super::host_string(self.as_bytes(m)?)
     }
 }
 
@@ -275,7 +275,7 @@ impl GuestRustString {
     }
     /// The text as a host string, with invalid UTF-8 replaced.
     pub fn to_string_lossy(&self, m: &Machine) -> Result<String> {
-        Ok(String::from_utf8_lossy(self.as_bytes(m)?).into_owned())
+        super::host_string(self.as_bytes(m)?)
     }
 
     /// Append `s`, growing the allocation the way the guest would.
@@ -416,7 +416,7 @@ impl GuestPtr<GuestRustString> {
     }
     /// A copy of the bytes.
     pub fn to_bytes(&self, m: &Machine) -> Result<Vec<u8>> {
-        Ok(self.get(m)?.as_bytes(m)?.to_vec())
+        super::host_bytes(self.get(m)?.as_bytes(m)?)
     }
     pub fn push_str(&self, m: &mut Machine, s: &str) -> Result<()> {
         self.modify(m, |string, m| string.push_str(m, s))

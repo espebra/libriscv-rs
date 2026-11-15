@@ -1798,6 +1798,22 @@ itself, so:
   aborts the process. `tests/rust_collections.rs` checks both, and that
   real nesting below the limit is freed completely, without a Rust guest;
   `rustguestfuzzer` fuzzes the whole layer on guest-supplied bytes.
+- Copies to the host (`ToHost`, `to_string`, `to_bytes`, `to_vec`,
+  `to_string_vector`, `to_map`, C++ and Rust containers alike) charge what
+  they allocate (text bytes, at least one byte per element, box and map
+  entry) to one budget per top-level copy, `guest::MAX_HOST_COPY` (64 MiB,
+  4 × `MAX_BYTES`) unless `guest::with_host_copy_limit` sets another, and
+  fail with `IllegalOperation` when it runs out (a thread-local like the
+  nesting counter). The per-container `MAX_BYTES` limits alone bound each
+  piece, not the whole: aliased elements (every `String` of a `Vec`
+  pointing at one 16 MiB buffer) made the host allocate up to TiBs, and
+  shared subtrees took exponential work, with guest memory untouched. Not
+  in C++ (which checks per element too, and so has the same weakness): a
+  deliberate difference, as no guest-visible result changes. The budget
+  is per call; hosts that keep copies across calls (and zero-copy
+  sysargs followed by `.to_vec()`) must bound their own totals, as the
+  `asteroids` log does (`MAX_LOG_BYTES`). Tested in
+  `tests/rust_collections.rs`.
 - Allocation follows `RawVec`: constructing from host values allocates
   exactly (`String::from`, `to_vec`), growing doubles from the minimum
   capacity, and zero-sized elements are never allocated (their stored

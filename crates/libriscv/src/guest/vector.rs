@@ -136,16 +136,24 @@ impl<T: GuestType> GuestStdVector<T> {
         if self.size_bytes() > self.capacity_bytes() {
             return Err(container_error("Guest std::vector has size > capacity"));
         }
-        self.iter()?.map(|p| p.get(m)).collect()
+        super::host_copy(|| {
+            let elements = self.iter()?;
+            super::charge_host_elements::<T>(self.size())?;
+            elements.map(|p| p.get(m)).collect()
+        })
     }
 }
 
 impl GuestStdVector<GuestStdString> {
     /// The strings as host strings (C++ `to_string_vector`).
     pub fn to_string_vector(&self, m: &Machine) -> Result<Vec<String>> {
-        self.iter()?
-            .map(|p| p.get(m).and_then(|s| s.to_string(m)))
-            .collect()
+        super::host_copy(|| {
+            let elements = self.iter()?;
+            super::charge_host_elements::<String>(self.size())?;
+            elements
+                .map(|p| p.get(m).and_then(|s| s.to_string(m)))
+                .collect()
+        })
     }
 }
 

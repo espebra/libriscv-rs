@@ -60,6 +60,23 @@
 //! allocator must be the native heap (`setup_native_heap`): then a
 //! collection either side allocates is one the other can grow and drop.
 //!
+//! # Copying to the host
+//!
+//! The guest controls every pointer and length, so the limits on each
+//! container ([`MAX_BYTES`] for a string or a vector's elements,
+//! [`MAX_NESTING`] for depth) don't bound what a whole structure costs:
+//! a `Vec<String>` whose strings all point at one 16 MiB buffer would copy
+//! as `count` × 16 MiB. Every copy to the host therefore also charges
+//! what it allocates to a budget for the whole top-level operation,
+//! [`MAX_HOST_COPY`] by default (see [`with_host_copy_limit`]), and fails
+//! with an error when it runs out.
+//!
+//! The budget covers one call. A host that keeps what it copies across
+//! calls (a log, a message queue, ...) must cap the total it keeps itself;
+//! and borrowing zero-copy (`as_bytes`, `to_str`, the `&[u8]`, `&str`,
+//! `Buffer` and `GuestSlice` system call arguments) then copying with
+//! `.to_vec()` or `.to_owned()` is bounded only by guest memory per call.
+//!
 //! Only RV64 guests: the 32-bit variants of the layouts and of `std::hash`
 //! are not ported.
 
@@ -151,6 +168,136 @@ pub(crate) fn nested<R>(f: impl FnOnce() -> Result<R>) -> Result<R> {
         ));
     }
     f()
+}
+
+/// The most host memory one copy of guest objects to the host may
+/// allocate, in bytes, unless [`with_host_copy_limit`] sets another limit.
+///
+/// The per-container limits ([`MAX_BYTES`] for a string's bytes or a
+/// vector's elements) bound each piece, not the whole: the guest controls
+/// every pointer, so all the strings of a `Vec<String>` can point at the
+/// same 16 MiB buffer, and copying them would allocate `count` × 16 MiB on
+/// the host while the guest uses 16 MiB. So every copy to the host (the
+/// [`ToHost`] impls, `to_string`, `to_bytes`, `to_vec`,
+/// `to_string_vector`, `to_map`) charges what it allocates (bytes of text,
+/// and at least one byte per element, box and map entry) against a budget
+/// shared by everything one top-level copy does, nested containers
+/// included, and fails with an `IllegalOperation` error when it runs out.
+/// That also bounds the work of walking a guest structure whose pointers
+/// share subtrees.
+///
+/// The budget is per top-level call: a host that keeps what it copies
+/// across calls (or system calls) must bound the total itself. Zero-copy
+/// reads (`as_bytes`, `to_str`, `view`, and the `&[u8]`, `&str`,
+/// [`Buffer`](crate::memory::Buffer) and [`GuestSlice`](crate::memory::GuestSlice)
+/// system call arguments) allocate nothing and are not charged; copying
+/// one of them (`.to_vec()`, `.to_owned()`) is bounded only by the
+/// per-call limit, and only by guest memory per call.
+pub const MAX_HOST_COPY: usize = 4 * MAX_BYTES;
+
+thread_local! {
+    /// What the current copy to the host may still allocate; `None`
+    /// outside one.
+    static HOST_COPY_LEFT: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with at most `limit` bytes for the copies of guest objects to
+/// the host that it makes (see [`MAX_HOST_COPY`]), all of them sharing
+/// the one budget. Inside another such call (or a copy already under
+/// way), the limit is at most what is left there, and what `f` uses is
+/// charged there too.
+///
+/// ```no_run
+/// # use libriscv::{Machine, Result};
+/// # use libriscv::guest::{self, GuestPtr, GuestRustString, GuestRustVec, ToHost};
+/// # fn f(m: &Machine, ptr: GuestPtr<GuestRustVec<GuestRustString>>) -> Result<()> {
+/// // Two copies, together at most 1 MiB.
+/// let (a, b) = guest::with_host_copy_limit(1 << 20, || {
+///     Ok((ptr.get(m)?.to_host(m)?, ptr.get(m)?.to_host(m)?))
+/// })?;
+/// # Ok(()) }
+/// ```
+pub fn with_host_copy_limit<R>(limit: usize, f: impl FnOnce() -> Result<R>) -> Result<R> {
+    /// Hand what is left back to the enclosing budget however `f` ends.
+    struct Scope {
+        outer: Option<usize>,
+        start: usize,
+    }
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            HOST_COPY_LEFT.with(|left| {
+                let used = self.start.saturating_sub(left.get().unwrap_or(0));
+                left.set(self.outer.map(|outer| outer.saturating_sub(used)));
+            });
+        }
+    }
+    let outer = HOST_COPY_LEFT.with(std::cell::Cell::get);
+    let start = outer.map_or(limit, |outer| outer.min(limit));
+    HOST_COPY_LEFT.with(|left| left.set(Some(start)));
+    let _scope = Scope { outer, start };
+    f()
+}
+
+/// Run `f` as one copy to the host: the budget of the copy under way, or
+/// a fresh one of [`MAX_HOST_COPY`].
+pub(crate) fn host_copy<R>(f: impl FnOnce() -> Result<R>) -> Result<R> {
+    with_host_copy_limit(MAX_HOST_COPY, f)
+}
+
+/// Charge `bytes` of host memory to the copy under way (outside one, to a
+/// fresh budget of [`MAX_HOST_COPY`]), or fail when it is used up.
+pub(crate) fn charge_host_copy(bytes: usize) -> Result<()> {
+    HOST_COPY_LEFT.with(|left| {
+        let available = left.get().unwrap_or(MAX_HOST_COPY);
+        let Some(rest) = available.checked_sub(bytes) else {
+            return Err(MachineError::new(
+                ExceptionKind::IllegalOperation,
+                "Guest objects too large to copy to the host",
+                bytes as u64,
+            ));
+        };
+        if left.get().is_some() {
+            left.set(Some(rest));
+        }
+        Ok(())
+    })
+}
+
+/// Charge `count` host values of type `H` (at least one byte each, so
+/// that walking costs too).
+pub(crate) fn charge_host_elements<H>(count: usize) -> Result<()> {
+    charge_host_copy(count.saturating_mul(std::mem::size_of::<H>().max(1)))
+}
+
+/// Guest bytes as a host string, invalid UTF-8 replaced, charged.
+pub(crate) fn host_string(bytes: &[u8]) -> Result<String> {
+    charge_host_copy(bytes.len())?;
+    let s = String::from_utf8_lossy(bytes).into_owned();
+    // Replacement characters are longer than the bytes they replace.
+    charge_host_copy(s.len().saturating_sub(bytes.len()))?;
+    Ok(s)
+}
+
+/// Every element of a guest view copied to the host, charged.
+pub(crate) fn to_host_all<T: GuestPod + ToHost>(
+    m: &Machine,
+    view: &crate::memory::GuestSlice<'_, T>,
+) -> Result<Vec<T::Host>> {
+    charge_host_elements::<T::Host>(view.len())?;
+    view.iter().map(|v| v.to_host(m)).collect()
+}
+
+/// The elements of a guest view, copied out (shallow), charged.
+pub(crate) fn copy_view<T: GuestPod>(view: &crate::memory::GuestSlice<'_, T>) -> Result<Vec<T>> {
+    charge_host_elements::<T>(view.len())?;
+    Ok(view.to_vec())
+}
+
+/// Guest bytes copied to the host, charged.
+pub(crate) fn host_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+    charge_host_copy(bytes.len())?;
+    Ok(bytes.to_vec())
 }
 
 /// Allocate from the native heap; C++ throws `std::bad_alloc` on a null
