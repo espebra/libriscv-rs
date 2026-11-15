@@ -925,7 +925,11 @@ N-bit address space accesses are masked, without checks.
 **Native calls** (2026-11-14; C++ `emit_function_call`). A call (`jal`,
 or `jalr` with a link register, including `auipc`+`jalr` with a constant
 target, `Analysis::jalr_target`, which `-mno-relax` code uses for every
-call) is a Rust call when its return address is a label of the caller's
+call; such a `jalr` jumps without reading its base register, so it is
+never a region entry: not when it's a block start, a direct target or
+itself the target of a constant `jalr`, which `jitdifffuzzer` found
+jumping to itself, and the region size limit never separates it from its
+constant) is a Rust call when its return address is a label of the caller's
 region: regions keep a call's return address (unless
 something calls it: after a `noreturn` call it begins another function)
 and are capped at 512 instructions, since they are whole functions. The
@@ -1132,7 +1136,20 @@ these were for on CoreMark.
   (at most `memory_max` bytes, see the differences). FENCE.I and
   `riscv_flush_icache` mark segments stale, which then get rebuilt the
   same way. The host code page is an execute-only page, not a segment
-  made at load time.
+  made at load time. With the JIT, a rebuild from the same bytes at the
+  same address (for the same memory layout) reuses the stale segment's
+  native code instead of compiling it again (`jit::reuse`): C++ compiles
+  again, but a Cranelift compile takes milliseconds per page, and a loop
+  around a FENCE.I made the host spend that every iteration (`vmfuzzer`:
+  754 compiles, 6 s, in 1500 instructions). A rebuild from changed code
+  is interpreted at first and compiled once it is hot: when it has stayed
+  valid while the machine ran `jit_background_slice` instructions (the
+  dispatcher runs in slices while such a segment exists, and each slice
+  counts; `DecodedSegment::defer_jit`). Code rewritten in a loop is then
+  never compiled, and the host time a guest takes stays proportional to
+  its instructions; code generated once and then run is compiled after a
+  slice, as if in the background. Only rebuilds are deferred: a segment
+  for pages that had none is compiled when it's created, as before.
 - **ELF loading:** segments are copied in through the page table (so they
   can be anywhere, e.g. `-Ttext-segment` above the arena) and get their
   program header's attributes (`protect_segments`), or RWX.
@@ -1442,6 +1459,17 @@ the architectures whose flag values they spell out. Nothing else changes: the ar
 one contiguous `[u8]`, so the interpreter's `arena_read`/`arena_write`,
 the JIT's base-pointer addressing and AOT code are untouched, and the cost
 is all at machine creation.
+
+The mapping also lets a discard of the arena (`memdiscard`: `madvise
+(MADV_DONTNEED)`, anonymous `mmap`, `munmap`) do what C++ does: hand whole
+host pages back to the kernel (`GuestArena::zero_pages`, Linux only,
+never over an attached image, whose pages would read as the image again)
+instead of zeroing them by hand, for ranges of 256 KiB or more. The
+`Vec<u8>` arena (no `jit` feature) can't, so it scans for non-zero 4 KiB
+chunks, and reading untouched pages faults each one in: Go guests discard
+large ranges over a hundred times at startup, which makes a Go hello world
+take about 370 ms there (184k page faults), against about 12 ms with the
+feature or in C++.
 
 Differences from C++:
 

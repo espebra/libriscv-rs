@@ -915,7 +915,7 @@ impl Machine {
         self.dispatch.slice = outer;
         // A compilation this (nested) run started concerns the outer run too.
         #[cfg(feature = "jit")]
-        if outer.is_none() && self.jit_pending() {
+        if outer.is_none() && (self.jit_pending() || self.memory.jit_deferred()) {
             self.dispatch.jit_spawned = true;
         }
         result
@@ -928,18 +928,20 @@ impl Machine {
     /// halt, and the next one begins the block there, as the uninterrupted
     /// run would have: results and counts don't depend on where the slices
     /// fall. A compilation that starts during an unsliced run (a segment
-    /// created at runtime) begins a slice there (`begin_slice`).
+    /// created at runtime) begins a slice there (`begin_slice`). Segments
+    /// whose compilation is deferred until they are hot also run in slices,
+    /// each of which counts towards it.
     #[cfg(feature = "jit")]
     fn dispatch_sliced(&mut self, pc: u64, counter: u64, max: u64) -> Result<Counter> {
         let (mut pc, mut counter, mut max) = (pc, counter, max);
-        let slice = self.options().jit_background_slice.max(1);
+        let slice_len = self.options().jit_background_slice.max(1);
         loop {
             self.dispatch.jit_spawned = false;
-            let pending = self.jit_pending() && {
+            let pending = (self.jit_pending() && {
                 self.refresh_execute_segments(false);
                 self.jit_pending()
-            };
-            let end = counter.saturating_add(slice);
+            }) || self.memory.jit_deferred();
+            let end = counter.saturating_add(slice_len);
             let limit = if pending && end < max {
                 self.dispatch.slice = Some(Slice { end, max });
                 end
@@ -954,6 +956,11 @@ impl Machine {
             if let Some(s) = slice
                 && c.max == s.end
             {
+                // Deferred compilations: the instructions of this slice (it
+                // may have begun after `counter`, see `begin_slice`).
+                let begun = s.end.saturating_sub(slice_len).max(counter);
+                self.memory
+                    .run_deferred_jit(c.value.saturating_sub(begun), slice_len);
                 max = s.max;
                 // At this check, the real limit is reached too: an
                 // uninterrupted run would halt here as well.

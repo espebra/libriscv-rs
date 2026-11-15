@@ -88,6 +88,29 @@ pub(crate) struct Save {
     pub verbose: bool,
 }
 
+/// How to compile a segment whose compilation was deferred until it is hot
+/// ([`DecodedSegment::defer_jit`]).
+#[derive(Debug)]
+pub(crate) struct Deferred {
+    pub layout: MemoryLayout,
+    pub save: Option<Save>,
+    /// On a new thread (`MachineOptions::jit_background`), or right away.
+    pub background: bool,
+}
+
+/// Compile `segment`, whose compilation was deferred, publishing the result
+/// as a background compilation does: every machine holding the segment
+/// switches to the compiled copy at its next slice.
+pub(crate) fn compile_deferred(segment: &Arc<DecodedSegment>, deferred: &Deferred) {
+    if deferred.background {
+        spawn_background(segment, deferred.layout, deferred.save.clone());
+    } else {
+        segment.begin_background_jit();
+        let compiled = compile_and_load(segment, deferred.layout, deferred.save.as_ref());
+        segment.finish_background_jit(compiled);
+    }
+}
+
 /// Compile `exec` and patch its decoder entries to enter the native code
 /// (saving the code to `save`). Leaves `exec` untouched if nothing could
 /// be compiled.
@@ -99,7 +122,37 @@ pub(crate) fn attach(exec: &mut DecodedSegment, layout: MemoryLayout, save: Opti
 
 /// Patch `exec`'s decoder entries to enter `compiled`.
 pub(crate) fn install(exec: &mut DecodedSegment, compiled: Compiled) {
-    NativeSegment::install(exec, NativeCode::Jit(compiled.code), compiled.patch);
+    NativeSegment::install(
+        exec,
+        NativeCode::Jit(Arc::new(compiled.code)),
+        compiled.patch,
+    );
+}
+
+/// Give `exec`, a segment rebuilt in place of the stale segment `old`, the
+/// JIT code of `old` if it would compile to the same: the same bytes at the
+/// same address, decoded the same way, for the same memory layout. True if
+/// it did; then there is nothing to compile.
+///
+/// FENCE.I marks every execute segment stale, and the next instruction
+/// fetch rebuilds the segment from memory (as in C++). Code that hasn't
+/// changed would compile to the same thing again, which takes the JIT
+/// milliseconds per page: a loop around a FENCE.I would cost that every
+/// iteration, so that a guest's instruction limit no longer bounds the host
+/// time it takes (found by `vmfuzzer`, 754 compiles in 1500 instructions).
+pub(crate) fn reuse(exec: &mut DecodedSegment, old: &DecodedSegment, layout: MemoryLayout) -> bool {
+    let Some((code, patch)) = old.native.as_ref().and_then(NativeSegment::jit_code) else {
+        return false;
+    };
+    let same = old.exec_begin() == exec.exec_begin()
+        && old.is_execute_only() == exec.is_execute_only()
+        && old.cache.len() == exec.cache.len()
+        && code.layout() == layout
+        && old.code() == exec.code();
+    if same {
+        NativeSegment::install(exec, NativeCode::Jit(code), patch);
+    }
+    same
 }
 
 /// [`compile`], save the code to `save`, then map it.
@@ -129,6 +182,8 @@ fn compile_and_load(
 /// it (C++ `aj_machine_info`'s baked arena bounds); machines whose
 /// windows don't contain them interpret the segment instead.
 fn compile(exec: &DecodedSegment, layout: MemoryLayout) -> Option<Image> {
+    #[cfg(test)]
+    tests::COMPILES.with(|c| c.set(c.get() + 1));
     let analysis = region::analyse(exec);
     emit::compile(exec, &analysis, layout)
 }
@@ -253,6 +308,8 @@ pub(crate) mod tests {
         /// The PC of every entry into native code on this thread.
         pub(crate) static ENTRIES: std::cell::RefCell<Vec<u64>> =
             const { std::cell::RefCell::new(Vec::new()) };
+        /// Segments compiled on this thread.
+        pub(crate) static COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     const fn addi(rd: u32, rs1: u32, imm: i32) -> u32 {
@@ -343,6 +400,216 @@ pub(crate) mod tests {
         let mut state = m.cpu.registers().all().to_vec();
         state.extend([m.cpu.pc(), m.instruction_counter(), m.max_instructions()]);
         (result, state)
+    }
+
+    /// Runs `page` at `V + 0x1000` (read, write, execute; reached from a
+    /// main segment at `V`, which never goes stale) with `t2` pointing at
+    /// it: the state, and the compilations it took on this thread.
+    fn run_page(
+        page: &[u32],
+        jit: bool,
+        background: bool,
+        slice: u64,
+        fuel: u64,
+    ) -> ((Result<bool, String>, Vec<u64>), usize) {
+        let lp = V + 0x1000;
+        let bytes: Vec<u8> = page.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut m = Machine::new(
+            &[],
+            MachineOptions {
+                memory_max: 1 << 20,
+                jit,
+                jit_background: background,
+                jit_background_slice: slice,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        m.memory.memcpy(lp, &bytes).unwrap();
+        let rwx = crate::memory::PageAttributes {
+            read: true,
+            write: true,
+            exec: true,
+            ..Default::default()
+        };
+        m.memory.set_page_attr(lp, 0x1000, rwx).unwrap();
+        m.cpu.set_reg(7, lp);
+        let before = COMPILES.with(std::cell::Cell::get);
+        // lui t0, lp; jalr x0, 0(t0)
+        let entry: Vec<u8> = [
+            (lp as u32 & 0xFFFF_F000) | (5 << 7) | 0x37,
+            (5 << 15) | 0x67,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        m.init_execute_area(&entry, V).unwrap();
+        m.cpu.jump(V).unwrap();
+        let result = m.try_simulate(fuel, 0).map_err(|e| e.to_string());
+        if background {
+            m.wait_for_jit();
+        }
+        let compiles = COMPILES.with(std::cell::Cell::get) - before;
+        let mut state = m.cpu.registers().all().to_vec();
+        state.extend([m.cpu.pc(), m.instruction_counter()]);
+        if let Ok(page) = m.memory.memview(lp, 0x100) {
+            state.extend(page.iter().map(|&b| u64::from(b)));
+        }
+        ((result, state), compiles)
+    }
+
+    const FENCE_I: u32 = 0x100F;
+    /// `sw t1, 0x40(t2)`: changes the page's code bytes (past the code).
+    const SW_T1_PAGE: u32 = (2 << 25) | (6 << 20) | (7 << 15) | (2 << 12) | 0x23;
+
+    /// Code that changes its own page and runs FENCE.I in a loop: every
+    /// iteration rebuilds the page from changed bytes. The rebuilds are
+    /// interpreted (each would take a compilation of milliseconds) until
+    /// one stays valid for `jit_background_slice` instructions, which none
+    /// does here.
+    #[test]
+    fn code_rewritten_in_a_loop_is_not_compiled_each_time() {
+        const J_BACK_12: u32 = 0xFF5F_F06F; // jal x0, -12
+        let page = [SW_T1_PAGE, addi(6, 6, 1), FENCE_I, J_BACK_12];
+        let (expected, _) = run_page(&page, false, false, 1 << 20, 30_000);
+        assert!(expected.1[6] > 5000, "{expected:?}");
+        for background in [false, true] {
+            let (got, compiles) = run_page(&page, true, background, 1 << 20, 30_000);
+            assert_eq!(got, expected, "background {background}");
+            if cfg!(target_arch = "x86_64") && !background {
+                // The main segment and the page's first segment.
+                assert_eq!(compiles, 2);
+            }
+        }
+    }
+
+    /// A rebuild from changed code that stays valid is compiled once it is
+    /// hot, and runs natively from then on.
+    #[test]
+    fn a_rebuilt_segment_that_stays_valid_is_compiled_once_hot() {
+        const J_BACK_4: u32 = 0xFFDF_F06F; // jal x0, -4
+        // Change the page once (t1 isn't 0, so its bytes do change), then
+        // loop.
+        let page = [
+            addi(6, 0, 0x55),
+            SW_T1_PAGE,
+            FENCE_I,
+            addi(10, 10, 1),
+            J_BACK_4,
+        ];
+        let (expected, _) = run_page(&page, false, false, 1000, 20_000);
+        for background in [false, true] {
+            ENTRIES.with_borrow_mut(Vec::clear);
+            let (got, compiles) = run_page(&page, true, background, 1000, 20_000);
+            assert_eq!(got, expected, "background {background}");
+            // In the background the code may arrive after the run: only the
+            // results are compared then.
+            if cfg!(target_arch = "x86_64") && !background {
+                // The main segment, the page, and its rebuild, which then
+                // runs natively.
+                assert_eq!(compiles, 3);
+                let loop_pc = V + 0x1000 + 12;
+                assert!(ENTRIES.with_borrow(|e| e.contains(&loop_pc)));
+            }
+        }
+    }
+
+    /// A `jalr` after a constant whose target is the `jalr` itself: the
+    /// second time, it is entered with the link it wrote as its base, and
+    /// must jump with that (found by `jitdifffuzzer`).
+    #[test]
+    fn a_constant_jalr_reached_again_uses_its_base_register() {
+        const LUI_A4: u32 = (V as u32) | (14 << 7) | 0x37; // lui a4, V
+        const JALR_A4_4: u32 = (4 << 20) | (14 << 15) | (14 << 7) | 0x67; // jalr a4, 4(a4)
+        // V+4 jumps to itself, then to V+12.
+        let code: Vec<u8> = [LUI_A4, JALR_A4_4, JSELF, addi(10, 10, 1), JSELF]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let run = |jit: bool| {
+            let mut m = Machine::new(
+                &[],
+                MachineOptions {
+                    memory_max: 1 << 20,
+                    jit,
+                    jit_background: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            m.init_execute_area(&code, V).unwrap();
+            m.cpu.jump(V).unwrap();
+            let result = m.try_simulate(100, 0).map_err(|e| e.to_string());
+            (
+                result,
+                m.cpu.reg(10),
+                m.cpu.reg(14),
+                m.cpu.pc(),
+                m.instruction_counter(),
+            )
+        };
+        let interpreted = run(false);
+        assert_eq!(interpreted.1, 1, "{interpreted:?}");
+        assert_eq!(run(true), interpreted);
+    }
+
+    /// A loop around a FENCE.I rebuilds its segment every iteration (one
+    /// made from executable pages: the main segment is never stale). The
+    /// rebuilds reuse the JIT code instead of compiling the unchanged page
+    /// again (each compile takes milliseconds), with the results of the
+    /// interpreter.
+    #[test]
+    fn fence_i_loops_reuse_the_compiled_code() {
+        const FENCE_I: u32 = 0x100F;
+        const J_BACK_8: u32 = 0xFF9F_F06F; // jal x0, -8
+        let lp = V + 0x1000;
+        let mut page = vec![0u8; 0x1000];
+        for (i, w) in [addi(6, 6, 1), FENCE_I, J_BACK_8].iter().enumerate() {
+            page[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let run = |jit: bool| {
+            let mut m = Machine::new(
+                &[],
+                MachineOptions {
+                    memory_max: 1 << 20,
+                    jit,
+                    jit_background: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            m.memory.memcpy(lp, &page).unwrap();
+            let rx = crate::memory::PageAttributes {
+                read: true,
+                write: false,
+                exec: true,
+                ..Default::default()
+            };
+            m.memory.set_page_attr(lp, 0x1000, rx).unwrap();
+            let before = COMPILES.with(std::cell::Cell::get);
+            // lui t0, lp; jalr x0, 0(t0)
+            let entry: Vec<u8> = [
+                (lp as u32 & 0xFFFF_F000) | (5 << 7) | 0x37,
+                (5 << 15) | 0x67,
+            ]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+            m.init_execute_area(&entry, V).unwrap();
+            m.cpu.jump(V).unwrap();
+            let result = m.try_simulate(3001, 0).map_err(|e| e.to_string());
+            let compiles = COMPILES.with(std::cell::Cell::get) - before;
+            let state = (result, m.cpu.reg(6), m.cpu.pc(), m.instruction_counter());
+            (state, compiles)
+        };
+        let (interpreted, _) = run(false);
+        let (compiled, compiles) = run(true);
+        assert_eq!(compiled, interpreted);
+        assert!(interpreted.1 > 500, "{interpreted:?}");
+        if cfg!(target_arch = "x86_64") {
+            // The main segment and the loop's page, once.
+            assert_eq!(compiles, 2);
+        }
     }
 
     /// F and D are compiled, apart from the formats and Zfa/Zfhmin

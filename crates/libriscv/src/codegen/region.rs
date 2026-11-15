@@ -94,7 +94,10 @@ impl Analysis {
     /// The target of the `jalr` at `insns[i]` when it's a constant: the
     /// instruction before it sets its base register to a constant
     /// (`auipc`, `lui`, `li`) and nothing else reaches the `jalr` (it
-    /// doesn't begin a block and isn't a branch target).
+    /// doesn't begin a block and isn't a branch target or the target of a
+    /// constant `jalr`). Such a `jalr` is never a region entry: native code
+    /// jumps to its target without reading the base register, which is
+    /// only right right after the instruction before it.
     pub(crate) fn jalr_target(&self, i: usize) -> Option<u64> {
         self.jalr_targets
             .binary_search_by_key(&i, |&(j, _)| j)
@@ -130,6 +133,14 @@ fn find_jalr_targets(exec: &DecodedSegment, a: &Analysis) -> Vec<(usize, u64)> {
         }
         out.push((i + 1, value.wrapping_add(imm as u64) & !1));
     }
+    // The targets become entries (and are jumped to): a `jalr` at one of
+    // them is reached from elsewhere. Found by `jitdifffuzzer`: `c.lui a4,
+    // 2` (0x2000), then `jalr a4, 6(a4)` at 0x2006, which links a4 =
+    // 0x200a and jumps to itself; the second run jumps to 0x2010, but the
+    // native code, entered at the `jalr`, jumped to 0x2006 again. (The
+    // targets of the dropped candidates stay excluded: conservative.)
+    let targets: BTreeSet<u64> = out.iter().map(|&(_, t)| t).collect();
+    out.retain(|&(i, _)| a.insns.get(i).is_some_and(|ins| !targets.contains(&ins.pc)));
     out
 }
 
@@ -298,9 +309,13 @@ fn form_regions(exec: &DecodedSegment, a: &mut Analysis) {
         work.clear();
         work.push(start);
         while let Some(i) = work.pop() {
+            // A constant `jalr` stays with the instruction before it (its
+            // only way in, see `Analysis::jalr_target`): it must not begin
+            // another region.
             if region.insns.len() >= MAX_REGION_INSNS
                 && (region.insns.len() >= MAX_REGION_INSNS_WITH_LOOPS
                     || !in_held_loop(exec, a, &loops, id, i))
+                && a.jalr_target(i).is_none()
             {
                 // Left for another region.
                 continue;
@@ -398,6 +413,42 @@ mod tests {
         m.init_execute_area(&code, V).unwrap();
         let a = analyse(m.cpu.current_execute_segment());
         (m, a)
+    }
+
+    /// `lui a4, V`
+    const LUI_A4: u32 = (V as u32) | (14 << 7) | 0x37;
+    /// `jalr rd, imm(a4)`
+    const fn jalr_a4(rd: u32, imm: u32) -> u32 {
+        (imm << 20) | (14 << 15) | (rd << 7) | 0x67
+    }
+
+    /// A `jalr` after a constant is a direct jump, unless it is the target
+    /// of one: then it is entered with other base values.
+    #[test]
+    fn a_constant_jalr_to_itself_is_not_constant() {
+        let (_, a) = analysed(&[LUI_A4, jalr_a4(14, 4), JSELF]);
+        assert_eq!(a.jalr_target(1), None);
+        let (_, a) = analysed(&[LUI_A4, jalr_a4(0, 8), JSELF]);
+        assert_eq!(a.jalr_target(1), Some(V + 8));
+    }
+
+    /// The size limit doesn't separate a constant `jalr` from the constant
+    /// before it: as the first instruction of a region, it would be an
+    /// entry, reached with any base value.
+    #[test]
+    fn the_size_limit_keeps_a_constant_jalr_with_its_constant() {
+        // The branch (to the next instruction) begins a new block at the
+        // `lui`: blocks have a length limit too.
+        let mut words = vec![ADDI; MAX_REGION_INSNS - 2];
+        words.extend([bnez(4), LUI_A4, jalr_a4(0, 0)]);
+        let (m, a) = analysed(&words);
+        let exec = m.cpu.current_execute_segment();
+        let jalr = MAX_REGION_INSNS;
+        assert_eq!(a.jalr_target(jalr), Some(V));
+        let region = |i: usize| a.region_at(exec, V + 4 * i as u64);
+        assert!(region(0).is_some());
+        assert_eq!(region(jalr), region(jalr - 1));
+        assert_eq!(region(jalr), region(0));
     }
 
     /// A loop that the size limit would cut in two stays in one region:

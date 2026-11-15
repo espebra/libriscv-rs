@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 use super::page::{HOST_PAGE, Page, PageAttributes, PageBytes, PageData, ZERO_PAGE};
-use super::{Memory, PAGE_SIZE, RWREAD_BEGIN, protection_fault};
+use super::{Memory, PAGE_SIZE, RWREAD_BEGIN, protection_fault, shared};
 use crate::error::{ExceptionKind, MachineError, Result};
 
 pub(super) const PAGE: usize = PAGE_SIZE as usize;
@@ -1429,7 +1429,16 @@ impl Memory {
     }
 
     /// Zero arena bytes `[begin, end)` (C++ `madvise(MADV_DONTNEED)`).
+    ///
+    /// With the `jit` feature the arena is a mapping, and for large ranges
+    /// the whole host pages past any shared image are handed back to the
+    /// kernel as in C++ (see [`shared::zero_arena_pages`]); the rest, or
+    /// all of it otherwise, is zeroed by [`zero_lazily`]. Go guests map
+    /// and unmap the same 64 MiB over a hundred times at startup: reading
+    /// it all each time was 96% of a hello world.
     fn zero_arena(&mut self, begin: u64, end: u64) {
+        /// Smaller ranges are cheaper to scan than a system call.
+        const DROP_MIN: usize = 256 << 10;
         let end = end.min(self.arena_size);
         if begin >= end {
             return;
@@ -1437,6 +1446,28 @@ impl Memory {
         let (Ok(b), Ok(e)) = (usize::try_from(begin), usize::try_from(end)) else {
             return;
         };
+        let page = shared::host_page_size();
+        let image_end = usize::try_from(self.shared_rodata_end()).unwrap_or(usize::MAX);
+        let lo = b
+            .max(image_end)
+            .checked_next_multiple_of(page)
+            .unwrap_or(usize::MAX);
+        let hi = e - e % page;
+        if lo < hi && hi - lo >= DROP_MIN && shared::zero_arena_pages(&mut self.arena, lo, hi - lo)
+        {
+            self.zero_arena_bytes(b, lo);
+            self.zero_arena_bytes(hi, e);
+            return;
+        }
+        self.zero_arena_bytes(b, e);
+    }
+
+    /// Zero arena bytes `[b, e)` by writing them, skipping host pages that
+    /// are already zero.
+    fn zero_arena_bytes(&mut self, b: usize, e: usize) {
+        if b >= e {
+            return;
+        }
         if let Some(range) = self.arena.get_mut(b..e) {
             // Chunks aligned to host pages.
             let head = (PAGE - b % PAGE) % PAGE;

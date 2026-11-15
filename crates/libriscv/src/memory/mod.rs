@@ -570,12 +570,16 @@ impl Memory {
     /// an identical live segment of another machine is reused instead
     /// (see [`decoder_cache::shared_segment`]). The program's `initial`
     /// segment gets the libc fast path (`MachineOptions::libc_fastpath`).
+    ///
+    /// `rebuilt_from` is the stale segment this one replaces, if any: its
+    /// JIT code is reused if it still fits ([`crate::jit::reuse`]).
     pub(crate) fn create_execute_segment(
         &mut self,
         code: &[u8],
         vaddr: u64,
         execute_only: bool,
         initial: bool,
+        rebuilt_from: Option<&DecodedSegment>,
     ) -> Result<Arc<DecodedSegment>> {
         // Check the slot first: decoding (or compiling) for nothing is slow.
         if self.main_exec.is_some() && self.exec.len() >= MAX_EXECUTE_SEGS {
@@ -711,19 +715,37 @@ impl Memory {
                 }
                 None => None,
             };
+            // A rebuild of a stale segment from the same code reuses its
+            // JIT code. One from changed code is compiled once it's hot:
+            // code rewritten in a loop (a FENCE.I each time) would otherwise
+            // cost a compilation (milliseconds) every iteration.
             #[cfg(feature = "jit")]
-            let compile = cached.is_none() && jit && !translated;
+            let reused = cached.is_none()
+                && jit
+                && !translated
+                && patches.ebreak_locations.is_empty()
+                && rebuilt_from.is_some_and(|old| crate::jit::reuse(&mut segment, old, layout));
+            #[cfg(feature = "jit")]
+            let compile = cached.is_none() && jit && !translated && !reused;
+            #[cfg(feature = "jit")]
+            let compile_now = compile && rebuilt_from.is_none();
             #[cfg(feature = "jit")]
             if let Some(compiled) = cached {
                 crate::jit::install(&mut segment, compiled);
-            } else if compile && !background {
+            } else if compile && !compile_now {
+                segment.defer_jit(crate::jit::Deferred {
+                    layout,
+                    save: save.clone(),
+                    background,
+                });
+            } else if compile_now && !background {
                 crate::jit::attach(&mut segment, layout, save.as_ref());
             }
             #[cfg(not(feature = "jit"))]
-            let _ = translated;
+            let _ = (translated, rebuilt_from);
             let segment = Arc::new(segment);
             #[cfg(feature = "jit")]
-            if compile && background {
+            if compile_now && background {
                 crate::jit::spawn_background(&segment, layout, save.clone());
             }
             Ok(segment)
@@ -804,6 +826,25 @@ impl Memory {
             .iter()
             .chain(self.exec.iter().flatten())
             .any(|s| s.jit_outstanding())
+    }
+
+    /// True while one of the execute segments waits to become hot before it
+    /// is compiled ([`DecodedSegment::defer_jit`]).
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_deferred(&self) -> bool {
+        self.main_exec
+            .iter()
+            .chain(self.exec.iter().flatten())
+            .any(|s| s.jit_deferred())
+    }
+
+    /// Count `executed` instructions for the segments whose compilation is
+    /// deferred, compiling those that reach `hot`.
+    #[cfg(feature = "jit")]
+    pub(crate) fn run_deferred_jit(&self, executed: u64, hot: u64) {
+        for segment in self.main_exec.iter().chain(self.exec.iter().flatten()) {
+            segment.run_deferred(executed, hot);
+        }
     }
 
     /// Switch every execute segment to its JIT-compiled copy, where a
@@ -1524,6 +1565,60 @@ mod tests {
         assert!(start.elapsed().as_secs() < 2, "{:?}", start.elapsed());
         assert_eq!(mem.read_u8(MIB + 2).unwrap(), 7);
         assert_eq!(mem.read_u8(MIB + 3).unwrap(), 0);
+    }
+
+    /// Discarding large arena ranges zeroes exactly the range, edges not
+    /// on page boundaries included, whether the host pages are dropped
+    /// (the `jit` feature's mapping, on Linux) or written.
+    #[test]
+    fn discarding_a_large_arena_range_zeroes_exactly_it() {
+        let mut mem = empty_memory(16 * MIB);
+        let (start, len) = (MIB + 123, 5 * MIB + 77);
+        let marks = [
+            MIB,
+            start - 1,
+            start,
+            start + 4095,
+            2 * MIB,
+            start + len / 2,
+            start + len - 1,
+            start + len,
+            15 * MIB,
+        ];
+        for &a in &marks {
+            mem.write_u8(a, 0xA5).unwrap();
+        }
+        mem.memdiscard(start, len, true).unwrap();
+        for &a in &marks {
+            let inside = (start..start + len).contains(&a);
+            assert_eq!(
+                mem.read_u8(a).unwrap(),
+                if inside { 0 } else { 0xA5 },
+                "{a:#x}"
+            );
+        }
+        // Writable again afterwards.
+        mem.write_u8(start + 4096, 1).unwrap();
+        assert_eq!(mem.read_u8(start + 4096).unwrap(), 1);
+    }
+
+    /// Go guests map and unmap large ranges over a hundred times at
+    /// startup (each one a discard); with the arena's pages handed back to
+    /// the kernel that costs no more than in C++. Scanning them instead
+    /// faulted in every untouched page: 96% of a hello world.
+    #[cfg(all(feature = "jit", target_os = "linux"))]
+    #[test]
+    fn discarding_large_ranges_repeatedly_is_fast() {
+        // rvlinux's default 4000 MiB arena (reserved, not committed).
+        let mut mem = empty_memory(4000 * MIB);
+        let start = std::time::Instant::now();
+        for _ in 0..3 {
+            for i in 0..60 {
+                mem.memdiscard(MIB + i * 64 * MIB, 64 * MIB, true).unwrap();
+            }
+        }
+        let elapsed = start.elapsed();
+        assert!(elapsed.as_millis() < 300, "{elapsed:?}");
     }
 
     /// `set_page_attr` changes runs of existing pages through the index;
