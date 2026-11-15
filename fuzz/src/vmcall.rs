@@ -1,10 +1,14 @@
 //! Harness for calls into the guest (`vmcall.rs`, `dyncall.rs`,
 //! `sysargs.rs`): VM calls with host arguments, preemption from system
 //! call handlers (nested), dyncalls (system calls), and system call argument
-//! parsing, all against guest-chosen code and data.
+//! parsing (the Rust scripting API's readers included), all against
+//! guest-chosen code and data.
 
+use libriscv::guest::{GuestPtr, GuestRustStr, GuestRustString, GuestRustVec};
 use libriscv::registers::REG_ARG0;
-use libriscv::{Buffer, ExceptionKind, Machine, MachineError, MachineOptions, OnStack};
+use libriscv::{
+    Buffer, ByPointer, ExceptionKind, GuestSlice, Machine, MachineError, MachineOptions, OnStack,
+};
 
 use crate::elf::{self, CODE};
 use crate::{MAX_CYCLES, quiet};
@@ -15,6 +19,10 @@ const SYS_TRY_PREEMPT: usize = 2;
 const SYS_ARGS: usize = 3;
 /// 4-7: the dyncall behaviours of `sys_dyncall`.
 const SYS_DYNCALL: usize = 4;
+/// The argument readers of the Rust scripting API: borrowed strings and
+/// slices, and guest pointers to Rust collections.
+const SYS_RUST_ARGS: usize = 8;
+const SYS_RUST_PTRS: usize = 9;
 /// Preemptions nest (a preempted function may preempt again): each level
 /// is a host stack frame, so the embedder has to bound the depth. Like an
 /// embedder, the harness refuses beyond this.
@@ -81,6 +89,39 @@ fn sys_args(m: &mut Machine) -> libriscv::Result<()> {
     Ok(())
 }
 
+/// The readers a Rust guest's host functions use, on guest-chosen pointers
+/// and lengths: a UTF-8-checked `&str`, an unread `GuestRustStr` (then
+/// read both ways) and a `GuestSlice<u32>`.
+fn sys_rust_args(m: &mut Machine) -> libriscv::Result<()> {
+    let n = {
+        let (s, raw, words): (&str, GuestRustStr, GuestSlice<'_, u32>) = m.sysargs()?;
+        let lossy = raw.to_string_lossy(m)?.len();
+        let checked = raw.to_str(m).map_or(0, str::len);
+        let sum = words.iter().fold(0u64, |a, w| a.wrapping_add(u64::from(w)));
+        (s.len() + lossy + checked) as u64 ^ sum
+    };
+    m.set_result(n);
+    Ok(())
+}
+
+/// A value read through a guest pointer, and guest pointers to a Rust
+/// `String` and `Vec<u32>`, read and changed in place.
+fn sys_rust_ptrs(m: &mut Machine) -> libriscv::Result<()> {
+    let (ByPointer(pair), s, v): (
+        ByPointer<[u64; 2]>,
+        GuestPtr<GuestRustString>,
+        GuestPtr<GuestRustVec<u32>>,
+    ) = m.sysargs()?;
+    let text = s.to_string_lossy(m)?;
+    let words = v.to_vec(m)?;
+    if pair[0] & 1 != 0 {
+        s.push_str(m, "!")?;
+        v.push(m, &(text.len() as u32))?;
+    }
+    m.set_result(pair[1] ^ (words.len() as u64));
+    Ok(())
+}
+
 /// System calls 4-7, which dyncalls (system calls numbered by their
 /// immediate) reach too: read the arguments as a string and a buffer, then
 /// return, penalize, stop or fail.
@@ -112,6 +153,8 @@ fn vmcall_machine(code: &[u8]) -> Option<Machine> {
     m.install_syscall_handler(SYS_PREEMPT, sys_preempt);
     m.install_syscall_handler(SYS_TRY_PREEMPT, sys_try_preempt);
     m.install_syscall_handler(SYS_ARGS, sys_args);
+    m.install_syscall_handler(SYS_RUST_ARGS, sys_rust_args);
+    m.install_syscall_handler(SYS_RUST_PTRS, sys_rust_ptrs);
     m.install_syscall_handlers([
         (SYS_DYNCALL, sys_dyncall::<0> as libriscv::SyscallHandler),
         (SYS_DYNCALL + 1, sys_dyncall::<1>),
@@ -170,5 +213,47 @@ mod tests {
         let mut m = vmcall_machine(&code).unwrap();
         assert_eq!(m.vmcall_limited(1000, CODE, (37u64,)).unwrap(), 42);
         assert_eq!(m.vmcall_limited(1000, CODE + 8, ()).unwrap(), 42);
+    }
+
+    /// The Rust scripting API's readers, on arguments set up by hand in
+    /// the data segment.
+    #[test]
+    fn the_rust_argument_readers_read_guest_memory() {
+        use libriscv::registers::{REG_ARG1, REG_ARG2, REG_ARG3, REG_ARG4, REG_ARG5};
+        let mut m = vmcall_machine(&words(&[RET])).unwrap();
+        let data = crate::elf::DATA;
+        m.copy_to_guest(data, b"hi").unwrap();
+        m.copy_to_guest(data + 0x10, &5u32.to_le_bytes()).unwrap();
+        // ("hi", GuestRustStr "hi", [5u32])
+        for (reg, value) in [
+            (REG_ARG0, data),
+            (REG_ARG1, 2),
+            (REG_ARG2, data),
+            (REG_ARG3, 2),
+            (REG_ARG4, data + 0x10),
+            (REG_ARG5, 1),
+        ] {
+            m.cpu.set_reg(reg, value);
+        }
+        m.system_call(SYS_RUST_ARGS as u64).unwrap();
+        assert_eq!(m.cpu.reg(REG_ARG0), (2 + 2 + 2) ^ 5);
+        // ByPointer([0, 9]) at data + 0x20, a String "hi" at data + 0x40
+        // ({ cap, ptr, len }) and an empty Vec<u32> at data + 0x60
+        let words64 = |m: &mut Machine, at: u64, w: &[u64]| {
+            let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            m.copy_to_guest(at, &bytes).unwrap();
+        };
+        words64(&mut m, data + 0x20, &[0, 9]);
+        words64(&mut m, data + 0x40, &[2, data, 2]);
+        words64(&mut m, data + 0x60, &[0, 4, 0]);
+        for (reg, value) in [
+            (REG_ARG0, data + 0x20),
+            (REG_ARG1, data + 0x40),
+            (REG_ARG2, data + 0x60),
+        ] {
+            m.cpu.set_reg(reg, value);
+        }
+        m.system_call(SYS_RUST_PTRS as u64).unwrap();
+        assert_eq!(m.cpu.reg(REG_ARG0), 9);
     }
 }

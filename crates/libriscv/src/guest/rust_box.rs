@@ -19,7 +19,7 @@ use super::rust_string::{array_bytes, guest_bytes, rust_dangling, utf8, word};
 use super::rust_vec::{elem, element, elements, within_limit};
 use super::{
     GuestInit, GuestPtr, GuestRustSlice, GuestRustStr, GuestType, ToHost, container_error,
-    guest_alloc, guest_free,
+    guest_alloc, guest_free, nested,
 };
 use crate::error::Result;
 use crate::machine::Machine;
@@ -135,7 +135,7 @@ impl<T: GuestType> GuestRustBox<T> {
     pub fn free(self, m: &mut Machine) -> Result<()> {
         if !self.is_null() {
             let addr = self.ptr.address();
-            T::free_at(m, addr)?;
+            nested(|| T::free_at(m, addr))?;
             if T::SIZE != 0 {
                 guest_free(m, addr)?;
             }
@@ -150,7 +150,7 @@ impl<T: GuestType + ToHost> ToHost for GuestRustBox<T> {
         if self.is_null() {
             return Err(container_error("Guest Rust Box is null"));
         }
-        self.ptr.get(m)?.to_host(m)
+        nested(|| self.ptr.get(m)?.to_host(m))
     }
 }
 
@@ -299,9 +299,13 @@ impl<T: GuestType> GuestRustBoxedSlice<T> {
                 if !within_limit::<T>(self.len) {
                     return Err(container_error("Guest Rust Box<[T]> is too large"));
                 }
-                for i in 0..self.len {
-                    T::free_at(m, self.ptr.wrapping_add(i * elem::<T>()))?;
-                }
+                let ptr = self.ptr;
+                nested(|| {
+                    for i in 0..self.len {
+                        T::free_at(m, ptr.wrapping_add(i * elem::<T>()))?;
+                    }
+                    Ok(())
+                })?;
             }
             guest_free(m, self.ptr)?;
         }
@@ -322,7 +326,7 @@ impl<T: GuestType> GuestType for GuestRustBoxedSlice<T> {
 impl<T: GuestPod + ToHost> ToHost for GuestRustBoxedSlice<T> {
     type Host = Vec<T::Host>;
     fn to_host(&self, m: &Machine) -> Result<Vec<T::Host>> {
-        self.view(m)?.iter().map(|v| v.to_host(m)).collect()
+        nested(|| self.view(m)?.iter().map(|v| v.to_host(m)).collect())
     }
 }
 

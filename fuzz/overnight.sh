@@ -32,7 +32,7 @@ cd "$HERE"
 TARGETS=("$@")
 if [ ${#TARGETS[@]} -eq 0 ]; then
 	TARGETS=(vmfuzzer elffuzzer nativefuzzer syshelperfuzzer linuxfuzzer
-		libcfuzzer forkfuzzer guestfuzzer vmcallfuzzer)
+		libcfuzzer forkfuzzer guestfuzzer rustguestfuzzer arenafuzzer vmcallfuzzer)
 	if [ -z "${NO_JIT:-}" ]; then
 		TARGETS+=(jitdifffuzzer)
 	fi

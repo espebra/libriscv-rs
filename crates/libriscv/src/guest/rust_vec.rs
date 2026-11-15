@@ -8,7 +8,7 @@ use super::rust_string::{
 };
 use super::{
     GuestInit, GuestPtr, GuestType, MAX_BYTES, ToHost, container_error, guest_alloc, guest_free,
-    pass_by_value,
+    nested, pass_by_value,
 };
 use crate::error::Result;
 use crate::machine::Machine;
@@ -341,9 +341,13 @@ impl<T: GuestType> GuestRustVec<T> {
             if !within_limit::<T>(self.len) {
                 return Err(container_error("Guest Rust Vec is too large"));
             }
-            for i in len..self.len {
-                T::free_at(m, self.slot(i))?;
-            }
+            let this = &*self;
+            nested(|| {
+                for i in len..this.len {
+                    T::free_at(m, this.slot(i))?;
+                }
+                Ok(())
+            })?;
         }
         self.len = len;
         Ok(())
@@ -447,7 +451,7 @@ impl<T: GuestType> GuestType for GuestRustVec<T> {
 impl<T: GuestPod + ToHost> ToHost for GuestRustVec<T> {
     type Host = Vec<T::Host>;
     fn to_host(&self, m: &Machine) -> Result<Vec<T::Host>> {
-        self.view(m)?.iter().map(|v| v.to_host(m)).collect()
+        nested(|| self.view(m)?.iter().map(|v| v.to_host(m)).collect())
     }
 }
 
