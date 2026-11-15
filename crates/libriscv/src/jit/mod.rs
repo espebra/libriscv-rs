@@ -466,15 +466,19 @@ pub(crate) mod tests {
     /// iteration rebuilds the page from changed bytes. The rebuilds are
     /// interpreted (each would take a compilation of milliseconds) until
     /// one stays valid for `jit_background_slice` instructions, which none
-    /// does here.
+    /// does here. (Nor does the instructions their rebuilds are charged
+    /// make them hot.)
     #[test]
     fn code_rewritten_in_a_loop_is_not_compiled_each_time() {
         const J_BACK_12: u32 = 0xFF5F_F06F; // jal x0, -12
+        // Rebuilds past the free allowance are charged 1024 instructions
+        // (a page) each.
+        const FUEL: u64 = 6_000_000;
         let page = [SW_T1_PAGE, addi(6, 6, 1), FENCE_I, J_BACK_12];
-        let (expected, _) = run_page(&page, false, false, 1 << 20, 30_000);
+        let (expected, _) = run_page(&page, false, false, 1 << 20, FUEL);
         assert!(expected.1[6] > 5000, "{expected:?}");
         for background in [false, true] {
-            let (got, compiles) = run_page(&page, true, background, 1 << 20, 30_000);
+            let (got, compiles) = run_page(&page, true, background, 1 << 20, FUEL);
             assert_eq!(got, expected, "background {background}");
             if cfg!(target_arch = "x86_64") && !background {
                 // The main segment and the page's first segment.
@@ -597,7 +601,8 @@ pub(crate) mod tests {
             .collect();
             m.init_execute_area(&entry, V).unwrap();
             m.cpu.jump(V).unwrap();
-            let result = m.try_simulate(3001, 0).map_err(|e| e.to_string());
+            // Rebuilds past the free allowance are charged 1024 each.
+            let result = m.try_simulate(1_000_001, 0).map_err(|e| e.to_string());
             let compiles = COMPILES.with(std::cell::Cell::get) - before;
             let state = (result, m.cpu.reg(6), m.cpu.pc(), m.instruction_counter());
             (state, compiles)

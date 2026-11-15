@@ -1297,6 +1297,22 @@ Deliberate, permanent differences in paging:
   bytes (`OUT_OF_MEMORY` otherwise): C++ would decode e.g. a guest's
   `mprotect(PROT_EXEC)` of 64 × `memory_max` of attribute-only pages,
   exhausting host memory.
+- Rebuilding a stale execute segment is charged as instructions, `len / 4`
+  for its `len` bytes (as `flush_execute_segments` charges, which C++ does
+  too), beyond a free allowance of 1 MiB of rebuilds per machine
+  (`cpu::FREE_REBUILD_BYTES`). C++ rebuilds for free, and a rebuild copies,
+  hashes and decodes the whole executable area around the PC: a guest
+  alternating FENCE.I and jumps into a large executable area made the host
+  decode megabytes per guest instruction (security review: 200
+  instructions took 436 ms), and `stale_restart_pc` only catches the same
+  PC going stale again. The dispatcher halts at the charge once it reaches
+  the limit, before the new block (or slice end; charges don't count
+  towards making deferred JIT compilations hot). Programs that rebuild less
+  than the allowance (`runtime_code`, `fence_i_observes_stores_...`) keep
+  C++'s counts. Segments for pages that had none aren't charged: there are
+  at most `MAX_EXECUTE_SEGS` of them, and dynamic executables create theirs
+  (`ld.so` mapping libraries) with C++'s counts. `Machine::penalize`
+  saturates instead of wrapping.
 - Slow-path accesses that cross a page boundary use both pages (C++ reads
   or writes past the end of a heap page; for arena pages, as here, the
   next arena bytes).

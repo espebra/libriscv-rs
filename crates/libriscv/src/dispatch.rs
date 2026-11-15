@@ -109,6 +109,10 @@ pub(crate) struct DispatchState {
 struct Slice {
     end: u64,
     max: u64,
+    /// Instructions charged for segment rebuilds during the slice: they
+    /// don't make deferred compilations hot (a rebuild of a large area
+    /// mustn't get itself compiled by its own charge).
+    charged: u64,
 }
 
 impl DispatchState {
@@ -161,7 +165,11 @@ fn begin_slice(m: &mut Machine, counter: u64, max: u64) -> u64 {
     if end >= max {
         return max;
     }
-    m.dispatch.slice = Some(Slice { end, max });
+    m.dispatch.slice = Some(Slice {
+        end,
+        max,
+        charged: 0,
+    });
     end
 }
 
@@ -943,7 +951,11 @@ impl Machine {
             }) || self.memory.jit_deferred();
             let end = counter.saturating_add(slice_len);
             let limit = if pending && end < max {
-                self.dispatch.slice = Some(Slice { end, max });
+                self.dispatch.slice = Some(Slice {
+                    end,
+                    max,
+                    charged: 0,
+                });
                 end
             } else {
                 max
@@ -959,8 +971,8 @@ impl Machine {
                 // Deferred compilations: the instructions of this slice (it
                 // may have begun after `counter`, see `begin_slice`).
                 let begun = s.end.saturating_sub(slice_len).max(counter);
-                self.memory
-                    .run_deferred_jit(c.value.saturating_sub(begun), slice_len);
+                let executed = c.value.saturating_sub(begun).saturating_sub(s.charged);
+                self.memory.run_deferred_jit(executed, slice_len);
                 max = s.max;
                 // At this check, the real limit is reached too: an
                 // uninterrupted run would halt here as well.
@@ -999,7 +1011,11 @@ impl Machine {
         let mut pc = pc;
         // We need an execute segment matching the current PC.
         if !(pc >= self.cpu.exec.exec_begin() && pc < self.cpu.exec.exec_end()) {
-            pc = self.next_execute_segment(pc)?;
+            let charge;
+            (pc, charge) = self.next_execute_segment(pc)?;
+            if self.charge_rebuild(&mut c, charge) {
+                return Ok((c, pc));
+            }
         }
         loop {
             let exec = Arc::clone(&self.cpu.exec);
@@ -1031,7 +1047,11 @@ impl Machine {
                     if let Some(stopped) = self.stop_in_other_segment(self.dispatch.pc, c) {
                         return Ok(stopped);
                     }
-                    pc = self.next_execute_segment(self.dispatch.pc)?;
+                    let charge;
+                    (pc, charge) = self.next_execute_segment(self.dispatch.pc)?;
+                    if self.charge_rebuild(&mut c, charge) {
+                        return Ok((c, pc));
+                    }
                     // The new segment may be compiling in the background.
                     #[cfg(feature = "jit")]
                     if self.dispatch.jit_spawned && self.dispatch.slice.is_none() {
@@ -1047,6 +1067,20 @@ impl Machine {
                 }
             }
         }
+    }
+
+    /// Charge a segment rebuild (`next_execute_segment`; not C++, see
+    /// `FREE_REBUILD_BYTES`). True if that reaches the chain's limit: the
+    /// dispatcher then halts before the new block, as at a limit check.
+    fn charge_rebuild(&mut self, c: &mut Counter, charge: u64) -> bool {
+        if charge == 0 {
+            return false;
+        }
+        c.value = c.value.saturating_add(charge);
+        if let Some(s) = &mut self.dispatch.slice {
+            s.charged = s.charged.saturating_add(charge);
+        }
+        c.value >= c.max
     }
 
     /// Precise handler for any instruction (C++ `CPU::execute(format_t)`).

@@ -694,3 +694,132 @@ fn fib_in_pie_executable() {
     m.simulate(MAX_INSTRUCTIONS).unwrap();
     assert_eq!(m.return_value() as i64, 12_586_269_025);
 }
+
+/// A guest that maps `area` executable bytes at 0x100000 and calls a
+/// FENCE.I; ret stub at its start `calls` times. The FENCE.I makes the stub's
+/// segment stale, and leaving it (the ret) rebuilds it from the whole area:
+/// a rebuild per call. Returns the
+/// machine (run with `limit`), whether the run hit the limit, and the calls
+/// made (in s2).
+fn rebuild_loop(area: u64, calls: i32, limit: u64) -> (Machine, bool, u64) {
+    const fn i(op: u32, f3: u32, rd: u32, rs1: u32, imm: i32) -> u32 {
+        ((imm as u32 & 0xFFF) << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | op
+    }
+    const fn addi(rd: u32, rs1: u32, imm: i32) -> u32 {
+        i(0x13, 0, rd, rs1, imm)
+    }
+    const fn lui(rd: u32, imm20: u32) -> u32 {
+        (imm20 << 12) | (rd << 7) | 0x37
+    }
+    const fn sw(rs1: u32, rs2: u32, imm: i32) -> u32 {
+        let imm = imm as u32;
+        (((imm >> 5) & 0x7F) << 25)
+            | (rs2 << 20)
+            | (rs1 << 15)
+            | (2 << 12)
+            | ((imm & 0x1F) << 7)
+            | 0x23
+    }
+    const ECALL: u32 = 0x73;
+    let (ra, t0, s0, s1, s2) = (1, 5, 8, 9, 18);
+    let (a0, a1, a2, a3, a4, a5, a7) = (10, 11, 12, 13, 14, 15, 17);
+    let area_pages = u32::try_from(area / PAGE_SIZE).unwrap();
+    let program = [
+        // mmap(0x100000, area, RWX, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED)
+        addi(a7, 0, 222),
+        lui(a0, 0x100),
+        lui(a1, area_pages),
+        addi(a2, 0, 7),
+        addi(a3, 0, 0x32),
+        addi(a4, 0, -1),
+        addi(a5, 0, 0),
+        ECALL,
+        addi(s0, a0, 0),
+        // The stub: fence.i (0x100F); ret (0x8067)
+        lui(t0, 1),
+        addi(t0, t0, 0xF),
+        sw(s0, t0, 0),
+        lui(t0, 8),
+        addi(t0, t0, 0x67),
+        sw(s0, t0, 4),
+        addi(s1, 0, calls),
+        // loop: call the stub, count the call
+        i(0x67, 0, ra, s0, 0),
+        addi(s2, s2, 1),
+        addi(s1, s1, -1),
+        // bne s1, x0, loop (-12)
+        0xFE04_9AE3,
+        // exit(0)
+        addi(a7, 0, 93),
+        addi(a0, 0, 0),
+        ECALL,
+    ];
+    let code: Vec<u8> = program.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut m = Machine::new(
+        &[],
+        MachineOptions {
+            memory_max: 64 << 20,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    m.setup_linux_syscalls(false, false);
+    m.init_execute_area(&code, 0x10000).unwrap();
+    m.cpu.jump(0x10000).unwrap();
+    let timed_out = match m.simulate(limit) {
+        Ok(()) => false,
+        Err(e) => {
+            assert_eq!(e.kind, ExceptionKind::MaxInstructionsReached, "{e}");
+            true
+        }
+    };
+    let calls = m.cpu.reg(s2);
+    (m, timed_out, calls)
+}
+
+/// Rebuilding a stale execute segment copies and decodes the whole
+/// executable area. It's charged per byte (beyond a free allowance; not
+/// C++), so a FENCE.I loop over a large area runs into a small instruction
+/// limit after a rebuild instead of decoding megabytes per guest
+/// instruction (security review finding 2).
+#[test]
+fn stale_segment_rebuilds_count_towards_the_instruction_limit() {
+    const AREA: u64 = 4 << 20;
+    let (m, timed_out, calls) = rebuild_loop(AREA, 1000, 200);
+    assert!(timed_out);
+    // The first call creates the segment and rebuilds it: charged
+    // (4 MiB - 1 MiB allowance) / 4, far beyond the limit.
+    assert!(calls <= 1, "{calls} calls");
+    assert!(m.instruction_counter() >= (AREA - (1 << 20)) / 4);
+}
+
+/// The exact charge: the first 1 MiB rebuilt is free (counts stay those of
+/// C++), every further byte costs a quarter instruction, as
+/// `flush_execute_segments` charges.
+#[test]
+fn stale_segment_rebuild_charge_is_a_quarter_instruction_per_byte() {
+    const AREA: u64 = 64 << 10;
+    let run = |calls| {
+        let (m, timed_out, made) = rebuild_loop(AREA, calls, u64::MAX >> 1);
+        assert!(!timed_out);
+        assert_eq!(made, u64::try_from(calls).unwrap());
+        m.instruction_counter()
+    };
+    // 16 calls rebuild 16 times: exactly the 1 MiB allowance, so the 16th
+    // rebuild is free and the 17th is charged.
+    let free = run(16);
+    let per_call = free - run(15);
+    assert!(per_call < 10, "{per_call} instructions per call");
+    assert_eq!(run(17), free + per_call + AREA / 4);
+    assert_eq!(run(20), free + 4 * (per_call + AREA / 4));
+}
+
+/// A huge charge saturates the counter instead of wrapping it around to a
+/// fresh budget.
+#[test]
+fn penalize_saturates() {
+    let mut m = empty(MachineOptions::default());
+    m.set_instruction_counter(u64::MAX - 5);
+    m.penalize(10);
+    assert_eq!(m.instruction_counter(), u64::MAX);
+}
