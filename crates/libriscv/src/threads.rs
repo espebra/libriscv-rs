@@ -14,6 +14,13 @@
 //!   them; in C++ a thread killed while suspended (`tgkill` on another
 //!   thread) leaves a dangling pointer behind.
 //! * If a listed thread has gone anyway, waking it is skipped.
+//! * A thread is in at most one list, and never while it runs. When the
+//!   running thread exits and nothing is suspended, C++ resumes the main
+//!   thread although it is blocked, and leaves it in the blocked list: it
+//!   gains another entry each time it blocks again (host work growing
+//!   without bound), and a later wakeup can queue it while it runs. Here
+//!   resuming a thread takes it off both lists, and queueing a thread that
+//!   is already listed is an error.
 
 use std::collections::BTreeMap;
 
@@ -168,8 +175,30 @@ impl MultiThreading {
 
     fn erase_thread(&mut self, tid: i32) {
         self.threads.remove(&tid);
+        self.unqueue(tid);
+    }
+
+    /// Take `tid` off the suspended and blocked lists.
+    fn unqueue(&mut self, tid: i32) {
         self.suspended.retain(|&t| t != tid);
         self.blocked.retain(|&t| t != tid);
+    }
+
+    /// Check that `tid` can be queued: a thread is in at most one list, so
+    /// together they never hold more entries than there are threads.
+    fn check_unqueued(&self, tid: i32) -> Result<()> {
+        let queued = self.suspended.len().saturating_add(self.blocked.len());
+        if queued >= self.threads.len()
+            || self.suspended.contains(&tid)
+            || self.blocked.contains(&tid)
+        {
+            return Err(MachineError::new(
+                ExceptionKind::InvalidProgram,
+                "Thread is already queued",
+                tid as u64,
+            ));
+        }
+        Ok(())
     }
 
     /// Port of `MultiThreading::wakeup_blocked`: move up to `max` threads
@@ -216,12 +245,15 @@ impl Machine {
 
     /// Port of `Thread::suspend(return_value)`: save the current thread's
     /// registers (with `a0` replaced, if given) and queue it.
-    fn thread_suspend(&mut self, return_value: Option<u64>) {
+    fn thread_suspend(&mut self, return_value: Option<u64>) -> Result<()> {
         let regs = self.cpu.regs.clone();
         let Some(mt) = self.mt.as_deref_mut() else {
-            return;
+            return Ok(());
         };
         let tid = mt.current;
+        if mt.threads.contains_key(&tid) {
+            mt.check_unqueued(tid)?;
+        }
         if let Some(t) = mt.threads.get_mut(&tid) {
             t.stored_regs = regs;
             if let Some(v) = return_value {
@@ -229,9 +261,12 @@ impl Machine {
             }
             mt.suspended.push(tid);
         }
+        Ok(())
     }
 
     /// Port of `Thread::resume`: make `tid` current and load its registers.
+    /// Unlike C++, a running thread is in neither list (see the module
+    /// documentation).
     fn thread_resume(&mut self, tid: i32) {
         let Some(mt) = self.mt.as_deref_mut() else {
             return;
@@ -239,12 +274,14 @@ impl Machine {
         if let Some(t) = mt.threads.get(&tid) {
             mt.current = tid;
             self.cpu.regs = t.stored_regs.clone();
+            mt.unqueue(tid);
         }
     }
 
     /// Port of `MultiThreading::wakeup_next`: resume the first suspended
     /// thread, or the main thread if none is (which C++ calls an error, but
-    /// does anyway).
+    /// does anyway). The main thread is then blocked: it leaves the blocked
+    /// list, as if woken up.
     fn thread_wakeup_next(&mut self) {
         let Some(mt) = self.mt.as_deref_mut() else {
             return;
@@ -262,31 +299,34 @@ impl Machine {
     /// Port of `MultiThreading::suspend_and_yield`: let another thread run,
     /// returning `result` to this one when it is resumed. Alone, this just
     /// sets the result. Returns true if another thread was resumed.
-    pub fn suspend_and_yield(&mut self, result: i64) -> bool {
+    pub fn suspend_and_yield(&mut self, result: i64) -> Result<bool> {
         let Some(mt) = self.mt.as_deref() else {
-            return false;
+            return Ok(false);
         };
         if mt.suspended.is_empty() {
             self.set_result(result as u64);
-            return false;
+            return Ok(false);
         }
-        self.thread_suspend(Some(result as u64));
+        self.thread_suspend(Some(result as u64))?;
         self.thread_wakeup_next();
-        true
+        Ok(true)
     }
 
     /// Port of `MultiThreading::block`: block the current thread on
     /// `reason` and resume another one. Returns false (doing nothing) when
     /// no other thread can run.
-    fn thread_block(&mut self, retval: u64, reason: u32, extra: u32) -> bool {
+    fn thread_block(&mut self, retval: u64, reason: u32, extra: u32) -> Result<bool> {
         let regs = self.cpu.regs.clone();
         let Some(mt) = self.mt.as_deref_mut() else {
-            return false;
+            return Ok(false);
         };
         if mt.suspended.is_empty() {
-            return false;
+            return Ok(false);
         }
         let tid = mt.current;
+        if mt.threads.contains_key(&tid) {
+            mt.check_unqueued(tid)?;
+        }
         if let Some(t) = mt.threads.get_mut(&tid) {
             t.stored_regs = regs;
             t.block_word = reason;
@@ -295,7 +335,7 @@ impl Machine {
             mt.blocked.push(tid);
         }
         self.thread_wakeup_next();
-        true
+        Ok(true)
     }
 
     /// Port of `Thread::exit` for thread `tid`: clear its TID word, remove
@@ -384,7 +424,7 @@ fn syscall_set_robust_list(m: &mut Machine) -> Result<()> {
 }
 
 fn syscall_sched_yield(m: &mut Machine) -> Result<()> {
-    m.suspend_and_yield(0);
+    m.suspend_and_yield(0)?;
     Ok(())
 }
 
@@ -433,7 +473,7 @@ fn syscall_futex(m: &mut Machine) -> Result<()> {
             let is_bitset = op == FUTEX_WAIT_BITSET;
             if m.memory.read_u32(addr)? == val as u32 {
                 // The reason is the (truncated) futex address, as in C++.
-                if m.thread_block(0, addr as u32, if is_bitset { val3 } else { 0 }) {
+                if m.thread_block(0, addr as u32, if is_bitset { val3 } else { 0 })? {
                     return Ok(());
                 }
                 // Nothing else can run, so waiting would deadlock. Like
@@ -443,7 +483,7 @@ fn syscall_futex(m: &mut Machine) -> Result<()> {
                 return Ok(());
             }
             // Not blocked, but yielding may be necessary
-            m.suspend_and_yield(-EAGAIN);
+            m.suspend_and_yield(-EAGAIN)?;
         }
         FUTEX_WAKE | FUTEX_WAKE_BITSET => {
             let is_bitset = op == FUTEX_WAKE_BITSET;
@@ -481,9 +521,9 @@ fn clone_thread(
     Ok(tid)
 }
 
-fn finish_clone(m: &mut Machine, tid: i32) {
+fn finish_clone(m: &mut Machine, tid: i32) -> Result<()> {
     // Store the return value for the parent: the child's TID
-    m.thread_suspend(Some(tid as u64));
+    m.thread_suspend(Some(tid as u64))?;
     // Activate the child (C++ Thread::activate), which returns 0
     if let Some(mt) = m.mt.as_deref_mut()
         && let Some(t) = mt.threads.get(&tid)
@@ -493,6 +533,7 @@ fn finish_clone(m: &mut Machine, tid: i32) {
         m.cpu.set_reg(REG_SP, t.stored_regs.get(REG_SP));
     }
     m.set_result(0);
+    Ok(())
 }
 
 /// clone. C++ reads the arguments of glibc's `__clone(fn, stack, flags,
@@ -510,8 +551,7 @@ fn syscall_clone(m: &mut Machine) -> Result<()> {
     let tls = m.sysarg(5);
     let ctid = m.sysarg(6);
     let tid = clone_thread(m, flags, stack, ptid, tls, ctid)?;
-    finish_clone(m, tid);
-    Ok(())
+    finish_clone(m, tid)
 }
 
 /// clone3(struct clone_args*, size)
@@ -554,8 +594,7 @@ fn syscall_clone3(m: &mut Machine) -> Result<()> {
             t.clear_tid = u64::from_le_bytes(set_tid);
         }
     }
-    finish_clone(m, tid);
-    Ok(())
+    finish_clone(m, tid)
 }
 
 /// prlimit64: report a 2 MiB stack and 1024 files, as in C++.

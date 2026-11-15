@@ -1600,9 +1600,10 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   truncates the address to an `int`.
 - A futex wait that would deadlock (no other runnable thread) writes 8
   zero bytes at the futex address and returns 0. When the running thread
-  exits or blocks and nothing is suspended, the main thread is resumed
-  even if it's blocked. Exiting threads clear their TID word but don't wake
-  futex waiters; futex timeouts are ignored.
+  exits and nothing is suspended, the main thread is resumed even if it's
+  blocked (it leaves the blocked list here; see below). Exiting threads
+  clear their TID word but don't wake futex waiters; futex timeouts are
+  ignored.
 - `getrandom` of more than 256 bytes returns -1 (not an errno) and charges
   20k instructions per byte; `uname` says "RISC-V C++ Emulator";
   `readlinkat` with a buffer over 1024 bytes is `ENOMEM`; `nanosleep`
@@ -1634,6 +1635,15 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   killing a suspended thread (`tgkill`) leaves a dangling pointer in C++'s
   scheduler lists, here the thread is removed from them; a signal number
   above 64 throws `std::out_of_range`, here it's `ILLEGAL_OPERATION`.
+- Not reproduced (C++ bug, as far as the port's reading of `threads.hpp`
+  goes): the main thread resumed while blocked (above) stays in C++'s
+  blocked list, so it gains an entry each time it blocks again (a guest
+  grows the list, and the host work of every exit and wakeup that scans
+  it, without bound) and a futex wake can queue it while it runs, giving
+  it two schedulable instances. Here resuming a thread takes it off both
+  lists, a thread is in at most one of them, and queueing a listed thread
+  is an `INVALID_PROGRAM` error. Programs that never reach that state
+  schedule exactly as in C++.
 
 ### Native heap and libc fast path
 

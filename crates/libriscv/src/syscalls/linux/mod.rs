@@ -906,7 +906,7 @@ fn syscall_nanosleep(m: &mut Machine) -> Result<()> {
     }
     // Hand the time over to the other guest threads.
     m.set_result(result);
-    m.suspend_and_yield(result as i64);
+    m.suspend_and_yield(result as i64)?;
     Ok(())
 }
 
@@ -923,7 +923,7 @@ fn syscall_clock_nanosleep(m: &mut Machine) -> Result<()> {
         m.copy_to_guest(g_rem, &timespec_bytes(0, 0))?;
     }
     m.set_result(result);
-    m.suspend_and_yield(result as i64);
+    m.suspend_and_yield(result as i64)?;
     Ok(())
 }
 
