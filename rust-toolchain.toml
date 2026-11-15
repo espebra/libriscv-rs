@@ -4,3 +4,5 @@
 [toolchain]
 channel = "nightly-2026-09-28"
 components = ["rustfmt", "clippy"]
+# The Rust guests of the tests and examples (`testutil::build_rust`).
+targets = ["riscv64gc-unknown-linux-gnu"]

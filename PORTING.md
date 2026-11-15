@@ -143,6 +143,11 @@ the handlers also use `feature(rust_preserve_none_cc)` and `feature(fn_align)`
 The feature is still flagged *incomplete* upstream, so a miscompile is
 possible; the difftests and instruction-count checks are the safety net.
 
+The pin also lists the `riscv64gc-unknown-linux-gnu` target, so that
+`rustup toolchain install` (and so CI) gets the standard library the Rust
+guests of the tests and examples are built with (`testutil::build_rust`,
+linked with the RISC-V cross gcc).
+
 Bumping the pin is a deliberate change of its own: update `rust-toolchain.toml`,
 run the full test suite including `--ignored`, re-run the benchmarks and record
 any change in Baseline. If `become` stabilises, move to stable and drop the
