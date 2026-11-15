@@ -1634,6 +1634,14 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   killing a suspended thread (`tgkill`) leaves a dangling pointer in C++'s
   scheduler lists, here the thread is removed from them; a signal number
   above 64 throws `std::out_of_range`, here it's `ILLEGAL_OPERATION`.
+- Not reproduced (C++ bugs): `nanosleep` and `clock_nanosleep` charge one
+  instruction per microsecond requested, computed in C++ in an `int64_t`
+  that overflows (undefined) for requests of 292 years and more; here the
+  charge saturates (`u64::MAX / 1000` at most), so `tv_sec = 2^55` isn't
+  free while the host sleeps. Smaller requests charge exactly what C++
+  does. C++ clamps only the seconds to `NANOSLEEP_MAX_SECONDS`, so a host
+  sleep could last almost two; here the whole sleep is clamped, while the
+  request `nanosleep` writes back is still C++'s (seconds clamped).
 
 ### Native heap and libc fast path
 
