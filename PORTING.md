@@ -1097,8 +1097,15 @@ these were for on CoreMark.
   native code instead of compiling it again (`jit::reuse`): C++ compiles
   again, but a Cranelift compile takes milliseconds per page, and a loop
   around a FENCE.I made the host spend that every iteration (`vmfuzzer`:
-  754 compiles, 6 s, in 1500 instructions). Code that really changed is
-  still compiled anew each time.
+  754 compiles, 6 s, in 1500 instructions). A rebuild from changed code
+  is interpreted at first and compiled once it is hot: when it has stayed
+  valid while the machine ran `jit_background_slice` instructions (the
+  dispatcher runs in slices while such a segment exists, and each slice
+  counts; `DecodedSegment::defer_jit`). Code rewritten in a loop is then
+  never compiled, and the host time a guest takes stays proportional to
+  its instructions; code generated once and then run is compiled after a
+  slice, as if in the background. Only rebuilds are deferred: a segment
+  for pages that had none is compiled when it's created, as before.
 - **ELF loading:** segments are copied in through the page table (so they
   can be anywhere, e.g. `-Ttext-segment` above the arena) and get their
   program header's attributes (`protect_segments`), or RWX.

@@ -30,6 +30,8 @@
 use std::collections::BTreeMap;
 #[cfg(feature = "jit")]
 use std::sync::OnceLock;
+#[cfg(feature = "jit")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
@@ -153,6 +155,18 @@ pub struct DecodedSegment {
     /// or `None` if nothing was compiled.
     #[cfg(feature = "jit")]
     jit_done: OnceLock<Option<Arc<DecodedSegment>>>,
+    /// How to compile this segment once it is hot, if its compilation was
+    /// deferred: a rebuild of a stale segment whose code changed (see
+    /// [`defer_jit`](Self::defer_jit)).
+    #[cfg(feature = "jit")]
+    deferred: Option<Box<crate::jit::Deferred>>,
+    /// Instructions run while it was deferred (and not stale).
+    #[cfg(feature = "jit")]
+    deferred_run: AtomicU64,
+    /// Its deferred compilation was started (by one of the machines
+    /// holding it).
+    #[cfg(feature = "jit")]
+    deferred_claimed: AtomicBool,
 }
 
 impl DecodedSegment {
@@ -171,6 +185,12 @@ impl DecodedSegment {
             jit_started: AtomicBool::new(false),
             #[cfg(feature = "jit")]
             jit_done: OnceLock::new(),
+            #[cfg(feature = "jit")]
+            deferred: None,
+            #[cfg(feature = "jit")]
+            deferred_run: AtomicU64::new(0),
+            #[cfg(feature = "jit")]
+            deferred_claimed: AtomicBool::new(false),
         }
     }
 
@@ -204,6 +224,9 @@ impl DecodedSegment {
             native: None,
             jit_started: AtomicBool::new(false),
             jit_done: OnceLock::new(),
+            deferred: None,
+            deferred_run: AtomicU64::new(0),
+            deferred_claimed: AtomicBool::new(false),
         }
     }
 
@@ -213,6 +236,43 @@ impl DecodedSegment {
     #[cfg(feature = "jit")]
     pub(crate) fn begin_background_jit(&self) {
         self.jit_started.store(true, Ordering::Release);
+    }
+
+    /// Compile this segment (as `deferred` says) only once it is hot:
+    /// after it has stayed valid while the machine ran `jit_background_slice`
+    /// instructions ([`run_deferred`](Self::run_deferred)). Until then it is
+    /// interpreted.
+    #[cfg(feature = "jit")]
+    pub(crate) fn defer_jit(&mut self, deferred: crate::jit::Deferred) {
+        self.deferred = Some(Box::new(deferred));
+    }
+
+    /// True while this segment's compilation is deferred: not started yet,
+    /// and the segment isn't stale (then it never is).
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_deferred(&self) -> bool {
+        self.deferred.is_some()
+            && !self.deferred_claimed.load(Ordering::Acquire)
+            && !self.is_stale()
+    }
+
+    /// Count `executed` instructions run while this segment's compilation
+    /// is deferred, and start the compilation once they reach `hot`.
+    #[cfg(feature = "jit")]
+    pub(crate) fn run_deferred(self: &Arc<Self>, executed: u64, hot: u64) {
+        let Some(deferred) = self.deferred.as_deref() else {
+            return;
+        };
+        if !self.jit_deferred() {
+            return;
+        }
+        let run = self
+            .deferred_run
+            .fetch_add(executed, Ordering::Relaxed)
+            .saturating_add(executed);
+        if run >= hot && !self.deferred_claimed.swap(true, Ordering::AcqRel) {
+            crate::jit::compile_deferred(self, deferred);
+        }
     }
 
     /// Publish the result of this segment's background compilation (C++
@@ -433,6 +493,12 @@ impl DecodedSegment {
             jit_started: AtomicBool::new(false),
             #[cfg(feature = "jit")]
             jit_done: OnceLock::new(),
+            #[cfg(feature = "jit")]
+            deferred: None,
+            #[cfg(feature = "jit")]
+            deferred_run: AtomicU64::new(0),
+            #[cfg(feature = "jit")]
+            deferred_claimed: AtomicBool::new(false),
         };
         let (cache, dst) = seg.decode_execute_range(vaddr, end, n_entries);
         seg.cache = cache.into_boxed_slice();

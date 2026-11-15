@@ -716,7 +716,9 @@ impl Memory {
                 None => None,
             };
             // A rebuild of a stale segment from the same code reuses its
-            // JIT code.
+            // JIT code. One from changed code is compiled once it's hot:
+            // code rewritten in a loop (a FENCE.I each time) would otherwise
+            // cost a compilation (milliseconds) every iteration.
             #[cfg(feature = "jit")]
             let reused = cached.is_none()
                 && jit
@@ -726,16 +728,24 @@ impl Memory {
             #[cfg(feature = "jit")]
             let compile = cached.is_none() && jit && !translated && !reused;
             #[cfg(feature = "jit")]
+            let compile_now = compile && rebuilt_from.is_none();
+            #[cfg(feature = "jit")]
             if let Some(compiled) = cached {
                 crate::jit::install(&mut segment, compiled);
-            } else if compile && !background {
+            } else if compile && !compile_now {
+                segment.defer_jit(crate::jit::Deferred {
+                    layout,
+                    save: save.clone(),
+                    background,
+                });
+            } else if compile_now && !background {
                 crate::jit::attach(&mut segment, layout, save.as_ref());
             }
             #[cfg(not(feature = "jit"))]
             let _ = (translated, rebuilt_from);
             let segment = Arc::new(segment);
             #[cfg(feature = "jit")]
-            if compile && background {
+            if compile_now && background {
                 crate::jit::spawn_background(&segment, layout, save.clone());
             }
             Ok(segment)
@@ -816,6 +826,25 @@ impl Memory {
             .iter()
             .chain(self.exec.iter().flatten())
             .any(|s| s.jit_outstanding())
+    }
+
+    /// True while one of the execute segments waits to become hot before it
+    /// is compiled ([`DecodedSegment::defer_jit`]).
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_deferred(&self) -> bool {
+        self.main_exec
+            .iter()
+            .chain(self.exec.iter().flatten())
+            .any(|s| s.jit_deferred())
+    }
+
+    /// Count `executed` instructions for the segments whose compilation is
+    /// deferred, compiling those that reach `hot`.
+    #[cfg(feature = "jit")]
+    pub(crate) fn run_deferred_jit(&self, executed: u64, hot: u64) {
+        for segment in self.main_exec.iter().chain(self.exec.iter().flatten()) {
+            segment.run_deferred(executed, hot);
+        }
     }
 
     /// Switch every execute segment to its JIT-compiled copy, where a

@@ -86,6 +86,29 @@ pub(crate) struct Save {
     pub verbose: bool,
 }
 
+/// How to compile a segment whose compilation was deferred until it is hot
+/// ([`DecodedSegment::defer_jit`]).
+#[derive(Debug)]
+pub(crate) struct Deferred {
+    pub layout: MemoryLayout,
+    pub save: Option<Save>,
+    /// On a new thread (`MachineOptions::jit_background`), or right away.
+    pub background: bool,
+}
+
+/// Compile `segment`, whose compilation was deferred, publishing the result
+/// as a background compilation does: every machine holding the segment
+/// switches to the compiled copy at its next slice.
+pub(crate) fn compile_deferred(segment: &Arc<DecodedSegment>, deferred: &Deferred) {
+    if deferred.background {
+        spawn_background(segment, deferred.layout, deferred.save.clone());
+    } else {
+        segment.begin_background_jit();
+        let compiled = compile_and_load(segment, deferred.layout, deferred.save.as_ref());
+        segment.finish_background_jit(compiled);
+    }
+}
+
 /// Compile `exec` and patch its decoder entries to enter the native code
 /// (saving the code to `save`). Leaves `exec` untouched if nothing could
 /// be compiled.
@@ -294,6 +317,118 @@ pub(crate) mod tests {
         let mut state = m.cpu.registers().all().to_vec();
         state.extend([m.cpu.pc(), m.instruction_counter(), m.max_instructions()]);
         (result, state)
+    }
+
+    /// Runs `page` at `V + 0x1000` (read, write, execute; reached from a
+    /// main segment at `V`, which never goes stale) with `t2` pointing at
+    /// it: the state, and the compilations it took on this thread.
+    fn run_page(
+        page: &[u32],
+        jit: bool,
+        background: bool,
+        slice: u64,
+        fuel: u64,
+    ) -> ((Result<bool, String>, Vec<u64>), usize) {
+        let lp = V + 0x1000;
+        let bytes: Vec<u8> = page.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut m = Machine::new(
+            &[],
+            MachineOptions {
+                memory_max: 1 << 20,
+                jit,
+                jit_background: background,
+                jit_background_slice: slice,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        m.memory.memcpy(lp, &bytes).unwrap();
+        let rwx = crate::memory::PageAttributes {
+            read: true,
+            write: true,
+            exec: true,
+            ..Default::default()
+        };
+        m.memory.set_page_attr(lp, 0x1000, rwx).unwrap();
+        m.cpu.set_reg(7, lp);
+        let before = COMPILES.with(std::cell::Cell::get);
+        // lui t0, lp; jalr x0, 0(t0)
+        let entry: Vec<u8> = [
+            (lp as u32 & 0xFFFF_F000) | (5 << 7) | 0x37,
+            (5 << 15) | 0x67,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        m.init_execute_area(&entry, V).unwrap();
+        m.cpu.jump(V).unwrap();
+        let result = m.try_simulate(fuel, 0).map_err(|e| e.to_string());
+        if background {
+            m.wait_for_jit();
+        }
+        let compiles = COMPILES.with(std::cell::Cell::get) - before;
+        let mut state = m.cpu.registers().all().to_vec();
+        state.extend([m.cpu.pc(), m.instruction_counter()]);
+        if let Ok(page) = m.memory.memview(lp, 0x100) {
+            state.extend(page.iter().map(|&b| u64::from(b)));
+        }
+        ((result, state), compiles)
+    }
+
+    const FENCE_I: u32 = 0x100F;
+    /// `sw t1, 0x40(t2)`: changes the page's code bytes (past the code).
+    const SW_T1_PAGE: u32 = (2 << 25) | (6 << 20) | (7 << 15) | (2 << 12) | 0x23;
+
+    /// Code that changes its own page and runs FENCE.I in a loop: every
+    /// iteration rebuilds the page from changed bytes. The rebuilds are
+    /// interpreted (each would take a compilation of milliseconds) until
+    /// one stays valid for `jit_background_slice` instructions, which none
+    /// does here.
+    #[test]
+    fn code_rewritten_in_a_loop_is_not_compiled_each_time() {
+        const J_BACK_12: u32 = 0xFF5F_F06F; // jal x0, -12
+        let page = [SW_T1_PAGE, addi(6, 6, 1), FENCE_I, J_BACK_12];
+        let (expected, _) = run_page(&page, false, false, 1 << 20, 30_000);
+        assert!(expected.1[6] > 5000, "{expected:?}");
+        for background in [false, true] {
+            let (got, compiles) = run_page(&page, true, background, 1 << 20, 30_000);
+            assert_eq!(got, expected, "background {background}");
+            if cfg!(target_arch = "x86_64") && !background {
+                // The main segment and the page's first segment.
+                assert_eq!(compiles, 2);
+            }
+        }
+    }
+
+    /// A rebuild from changed code that stays valid is compiled once it is
+    /// hot, and runs natively from then on.
+    #[test]
+    fn a_rebuilt_segment_that_stays_valid_is_compiled_once_hot() {
+        const J_BACK_4: u32 = 0xFFDF_F06F; // jal x0, -4
+        // Change the page once (t1 isn't 0, so its bytes do change), then
+        // loop.
+        let page = [
+            addi(6, 0, 0x55),
+            SW_T1_PAGE,
+            FENCE_I,
+            addi(10, 10, 1),
+            J_BACK_4,
+        ];
+        let (expected, _) = run_page(&page, false, false, 1000, 20_000);
+        for background in [false, true] {
+            ENTRIES.with_borrow_mut(Vec::clear);
+            let (got, compiles) = run_page(&page, true, background, 1000, 20_000);
+            assert_eq!(got, expected, "background {background}");
+            // In the background the code may arrive after the run: only the
+            // results are compared then.
+            if cfg!(target_arch = "x86_64") && !background {
+                // The main segment, the page, and its rebuild, which then
+                // runs natively.
+                assert_eq!(compiles, 3);
+                let loop_pc = V + 0x1000 + 12;
+                assert!(ENTRIES.with_borrow(|e| e.contains(&loop_pc)));
+            }
+        }
     }
 
     /// A `jalr` after a constant whose target is the `jalr` itself: the

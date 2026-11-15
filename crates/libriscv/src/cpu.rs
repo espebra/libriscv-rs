@@ -145,8 +145,9 @@ impl Machine {
                 .create_execute_segment(code, begin, false, false, rebuilt_from)?;
         // Compiling in the background: the dispatcher has to run in slices
         // to switch to the native code (`dispatch_sliced`).
+        // So does one deferred until it is hot (to count towards it).
         #[cfg(feature = "jit")]
-        if self.cpu.exec.jit_outstanding() {
+        if self.cpu.exec.jit_outstanding() || self.cpu.exec.jit_deferred() {
             self.dispatch.jit_spawned = true;
         }
         Ok(&self.cpu.exec)
