@@ -18,7 +18,7 @@ one of them.
 | `guestfuzzer` | | the guest C++ containers (`std::string`, `vector`, `unordered_map`, `variant`): host operations on objects whose bytes the input supplies |
 | `rustguestfuzzer` | | the Rust guest collections of the scripting API (`GuestRust*`: `String`, `Vec`, `Box`, enums, attribute maps, and the examples' recursive attribute tree): host operations, including the recursive frees of the guest's drop glue, on objects whose bytes the input supplies. Needs no Rust guest |
 | `arenafuzzer` | | the memory arena's contents through writes and discards, against a plain byte array (with `--features jit`, the mapped arena whose discards drop pages) |
-| `vmcallfuzzer` | | VM calls with host arguments, nested preemption from system calls, dyncalls, and the system call argument readers |
+| `vmcallfuzzer` | | VM calls with host arguments, nested preemption from system calls, dyncalls, and the system call argument readers (the Rust scripting API's too: `&str`, `GuestRustStr`, `GuestSlice`, `ByPointer`, `GuestPtr` to Rust collections) |
 | `jitdifffuzzer` | | the JIT against the interpreter (`--features jit`): registers, PC, counter, error and memory must match exactly. Inputs where the JIT may legitimately differ are skipped: NaN-producing FP arithmetic (NaN bits are the host's). Compares only on x86-64, the JIT's only host so far |
 
 The ELF-based targets put the code at 0x10000 and a zero-filled read-write

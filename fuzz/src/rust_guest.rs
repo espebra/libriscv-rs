@@ -41,6 +41,30 @@ libriscv::guest_rust_enum! {
 type RustValue = GuestRustEnum<Value, u64>;
 type Attrs = GuestRustAttributes<RustValue>;
 
+libriscv::guest_rust_enum! {
+    /// A flat value with a host mirror: maps of these copy to the host
+    /// (`to_map`).
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Flat => HostFlat {
+        Nil(()),
+        Int(i64),
+        Str(GuestRustString),
+    }
+}
+type FlatValue = GuestRustEnum<Flat, u64>;
+type FlatMap = GuestPtr<GuestRustAttributes<FlatValue>>;
+
+libriscv::guest_rust_enum! {
+    /// `#[repr(C, u32)] enum Small { A, B(u32), C(u16) }`: a 4-byte tag.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Small {
+        A(()),
+        B(u32),
+        C(u16),
+    }
+}
+type SmallValue = GuestPtr<GuestRustEnum<Small, u32>>;
+
 type Str = GuestPtr<GuestRustString>;
 type Words = GuestPtr<GuestRustVec<u32>>;
 type Strings = GuestPtr<GuestRustVec<GuestRustString>>;
@@ -51,12 +75,16 @@ type ListBox = GuestPtr<GuestRustBox<GuestRustVec<RustValue>>>;
 /// A string longer than any small capacity, so it reallocates.
 const LONG: &str = "a string long enough to make the vector grow more than once";
 
+/// The collection types [`operate`] views the object as.
+const TYPES: u8 = 12;
+
 /// One operation on the object at [`OBJECT`], viewed as one of the
-/// collection types: `op >> 3` picks the type, `op & 7` the operation.
-/// Errors are expected; panics (and stack overflows) are bugs.
+/// collection types: `(op >> 3) % TYPES` picks the type, `op & 7` the
+/// operation. Errors are expected; panics (and stack overflows) are bugs.
 fn operate(m: &mut Machine, op: u8) -> libriscv::Result<()> {
+    use libriscv::guest::{GuestType, ToHost};
     let arg = u64::from(op);
-    match op >> 3 {
+    match (op >> 3) % TYPES {
         0 => {
             let s = Str::new(OBJECT);
             match op & 7 {
@@ -72,7 +100,7 @@ fn operate(m: &mut Machine, op: u8) -> libriscv::Result<()> {
                 5 => {
                     let _ = (s.len(m)?, s.capacity(m)?);
                 }
-                6 => s.clear(m)?,
+                6 => s.assign(m, LONG)?,
                 _ => s.free(m)?,
             }
         }
@@ -111,7 +139,6 @@ fn operate(m: &mut Machine, op: u8) -> libriscv::Result<()> {
                 3 => v.truncate(m, (arg & 1) as usize)?,
                 4 => v.reserve(m, (arg & 7) as usize)?,
                 5 => {
-                    use libriscv::guest::ToHost;
                     let _ = v.get(m)?.to_host(m)?;
                 }
                 6 => v.clear(m)?,
@@ -207,7 +234,6 @@ fn operate(m: &mut Machine, op: u8) -> libriscv::Result<()> {
                 }
                 5 => {
                     if let Some(mut old) = map.remove(m, "key")? {
-                        use libriscv::guest::GuestType;
                         old.free_value(m)?;
                     }
                 }
@@ -226,6 +252,99 @@ fn operate(m: &mut Machine, op: u8) -> libriscv::Result<()> {
                     }
                 }
                 _ => list.free(m)?,
+            }
+        }
+        7 => {
+            let v = SmallValue::new(OBJECT);
+            match op & 7 {
+                0 => {
+                    let _ = v.discriminant(m)?;
+                }
+                1 => {
+                    if let Some(b) = v.variant::<u32>(m)? {
+                        let _ = b.get(m)?;
+                    }
+                }
+                2 => {
+                    let _ = v.get(m)?.get::<u16>();
+                }
+                3 => {
+                    let _ = v.insert::<u16, _>(m, &(arg as u16))?;
+                }
+                4 => {
+                    let _ = v.insert::<u32, _>(m, &(arg as u32))?;
+                }
+                _ => v.free(m)?,
+            }
+        }
+        8 => {
+            let map = FlatMap::new(OBJECT);
+            match op & 7 {
+                0 | 1 => {
+                    let _ = map.get(m)?.to_map(m)?;
+                }
+                2 => {
+                    let attrs = map.get(m)?;
+                    for entry in attrs.iter(m)? {
+                        let (_, value) = entry?;
+                        let _ = value.get(m)?.to_host(m)?;
+                    }
+                }
+                3 => map.extend(
+                    m,
+                    [
+                        ("a", FlatValue::new(Flat::Int(1))),
+                        ("key", FlatValue::new(Flat::Nil(()))),
+                        ("z", FlatValue::new(Flat::Int(arg as i64))),
+                    ],
+                )?,
+                4 => {
+                    let _ = map.insert(m, LONG, &FlatValue::new(Flat::Int(2)))?;
+                }
+                5 => {
+                    if let Some(mut old) = map.remove(m, "a")? {
+                        old.free_value(m)?;
+                    }
+                }
+                6 => map.clear(m)?,
+                _ => map.get(m)?.free(m)?,
+            }
+        }
+        9 => {
+            let b = GuestPtr::<GuestRustBoxedSlice<GuestRustString>>::new(OBJECT);
+            match op & 7 {
+                0 | 1 => {
+                    let _ = b.get(m)?.to_host(m)?;
+                }
+                2 => {
+                    let _ = b.len(m)?;
+                }
+                3 | 4 => {
+                    let strings = [GuestRustString::from_str(m, LONG)?];
+                    b.assign(m, &strings[..])?;
+                }
+                _ => b.free(m)?,
+            }
+        }
+        10 => {
+            let v = GuestPtr::<GuestRustVec<GuestRustVec<u8>>>::new(OBJECT);
+            match op & 7 {
+                0 | 1 => {
+                    let _ = v.get(m)?.to_host(m)?;
+                }
+                2 => {
+                    let bytes = GuestRustVec::<u8>::from_slice(m, LONG.as_bytes())?;
+                    v.push(m, &bytes)?;
+                }
+                3 => {
+                    if let Some(mut last) = v.pop(m)? {
+                        last.free(m)?;
+                    }
+                }
+                4 => v.truncate(m, (arg & 1) as usize)?,
+                5 => v.reserve(m, (arg & 7) as usize)?,
+                6 => v.clear(m)?,
+                _ => v.free(m)?,
             }
         }
         _ => {
@@ -311,7 +430,7 @@ mod tests {
         // The cycle: the object's list is at OBJECT + 0x40, holding OBJECT.
         // (A failed free may have nulled boxes on the way: fresh memory for
         // each.)
-        for op in [32 | 7, 56, 56 | 7] {
+        for op in [32 | 7, 88, 88 | 7] {
             let mut m = rust_machine(&[0; 0x100]).unwrap();
             link(&mut m, OBJECT, OBJECT + 0x40, OBJECT);
             assert!(operate(&mut m, op).is_err(), "op {op}");
@@ -323,6 +442,6 @@ mod tests {
         for i in 0..1000 {
             link(&mut m, at(i), at(i) + 0x8000, at(i + 1));
         }
-        assert!(operate(&mut m, 56).is_err());
+        assert!(operate(&mut m, 88).is_err());
     }
 }
