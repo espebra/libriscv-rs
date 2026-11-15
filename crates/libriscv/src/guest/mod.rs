@@ -113,6 +113,46 @@ pub(crate) const fn container_error(message: &'static str) -> MachineError {
     MachineError::new(ExceptionKind::IllegalOperation, message, 0)
 }
 
+/// How deeply guest objects may nest, in pointers followed (a `Box` to a
+/// `Vec` of enums holding `Box`es...), for the operations that walk them
+/// recursively: freeing, the way the guest's drop glue does, and copying
+/// to the host. The guest controls every pointer, so the nesting can be
+/// arbitrarily deep, or a cycle; without a limit, the host's recursion
+/// overflows its stack, which aborts the process. Real data nests nowhere
+/// near this deep.
+pub const MAX_NESTING: u32 = 128;
+
+thread_local! {
+    /// The pointers the current recursive operation has followed.
+    static NESTING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `f`, one pointer deeper into guest objects than its caller, or
+/// fail if that is deeper than [`MAX_NESTING`].
+pub(crate) fn nested<R>(f: impl FnOnce() -> Result<R>) -> Result<R> {
+    /// Back out of the level however `f` ends.
+    struct Level;
+    impl Drop for Level {
+        fn drop(&mut self) {
+            NESTING.with(|d| d.set(d.get().saturating_sub(1)));
+        }
+    }
+    let depth = NESTING.with(|d| {
+        let depth = d.get().saturating_add(1);
+        d.set(depth);
+        depth
+    });
+    let _level = Level;
+    if depth > MAX_NESTING {
+        return Err(MachineError::new(
+            ExceptionKind::IllegalOperation,
+            "Guest objects nest too deeply",
+            MAX_NESTING as u64,
+        ));
+    }
+    f()
+}
+
 /// Allocate from the native heap; C++ throws `std::bad_alloc` on a null
 /// result (where it checks).
 pub(crate) fn guest_alloc(m: &mut Machine, size: usize) -> Result<u64> {
