@@ -17,6 +17,9 @@
 //! Without either feature [`NativeCode`] has no variants: no segment ever
 //! has native code, and the dispatcher never enters any.
 
+#[cfg(feature = "jit")]
+use std::sync::Arc;
+
 use crate::decoder_cache::DecodedSegment;
 use crate::dispatch::Handler;
 use crate::error::{ExceptionKind, MachineError};
@@ -125,8 +128,10 @@ impl NativeExit {
 #[derive(Debug)]
 pub(crate) enum NativeCode {
     /// Compiled by the Cranelift JIT, in this process or (cached) earlier.
+    /// Shared: a segment rebuilt from the same bytes reuses it (see
+    /// [`jit::reuse`](crate::jit::reuse)).
     #[cfg(feature = "jit")]
-    Jit(libriscv_jit_rt::CodeMemory),
+    Jit(Arc<libriscv_jit_rt::CodeMemory>),
     /// Translated to Rust ahead of time.
     #[cfg(feature = "aot")]
     Aot(crate::aot::AotCode),
@@ -217,6 +222,20 @@ impl NativeSegment {
             NativeCode::Jit(_) => false,
             #[cfg(feature = "aot")]
             NativeCode::Aot(_) => true,
+        }
+    }
+
+    /// The JIT code and the decoder entries patched to enter it, for
+    /// [`jit::reuse`](crate::jit::reuse). `None` for AOT translations.
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_code(&self) -> Option<(Arc<libriscv_jit_rt::CodeMemory>, Vec<usize>)> {
+        match self.code {
+            NativeCode::Jit(ref code) => Some((
+                Arc::clone(code),
+                self.original.iter().map(|&(i, _)| i).collect(),
+            )),
+            #[cfg(feature = "aot")]
+            NativeCode::Aot(_) => None,
         }
     }
 

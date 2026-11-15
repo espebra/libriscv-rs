@@ -570,12 +570,16 @@ impl Memory {
     /// an identical live segment of another machine is reused instead
     /// (see [`decoder_cache::shared_segment`]). The program's `initial`
     /// segment gets the libc fast path (`MachineOptions::libc_fastpath`).
+    ///
+    /// `rebuilt_from` is the stale segment this one replaces, if any: its
+    /// JIT code is reused if it still fits ([`crate::jit::reuse`]).
     pub(crate) fn create_execute_segment(
         &mut self,
         code: &[u8],
         vaddr: u64,
         execute_only: bool,
         initial: bool,
+        rebuilt_from: Option<&DecodedSegment>,
     ) -> Result<Arc<DecodedSegment>> {
         // Check the slot first: decoding (or compiling) for nothing is slow.
         if self.main_exec.is_some() && self.exec.len() >= MAX_EXECUTE_SEGS {
@@ -711,8 +715,16 @@ impl Memory {
                 }
                 None => None,
             };
+            // A rebuild of a stale segment from the same code reuses its
+            // JIT code.
             #[cfg(feature = "jit")]
-            let compile = cached.is_none() && jit && !translated;
+            let reused = cached.is_none()
+                && jit
+                && !translated
+                && patches.ebreak_locations.is_empty()
+                && rebuilt_from.is_some_and(|old| crate::jit::reuse(&mut segment, old, layout));
+            #[cfg(feature = "jit")]
+            let compile = cached.is_none() && jit && !translated && !reused;
             #[cfg(feature = "jit")]
             if let Some(compiled) = cached {
                 crate::jit::install(&mut segment, compiled);
@@ -720,7 +732,7 @@ impl Memory {
                 crate::jit::attach(&mut segment, layout, save.as_ref());
             }
             #[cfg(not(feature = "jit"))]
-            let _ = translated;
+            let _ = (translated, rebuilt_from);
             let segment = Arc::new(segment);
             #[cfg(feature = "jit")]
             if compile && background {

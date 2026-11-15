@@ -289,6 +289,13 @@ impl DecodedSegment {
     pub const fn is_execute_only(&self) -> bool {
         self.execute_only
     }
+    /// The instruction bytes the segment was decoded from (after patching).
+    #[cfg(feature = "jit")]
+    pub(crate) fn code(&self) -> &[u8] {
+        self.data
+            .get(4..self.data.len().saturating_sub(4))
+            .unwrap_or_default()
+    }
     pub fn is_stale(&self) -> bool {
         self.stale.load(Ordering::Relaxed)
     }

@@ -123,15 +123,26 @@ impl Machine {
     ///
     /// Like C++, this does not copy the code into guest memory.
     pub fn init_execute_area(&mut self, code: &[u8], begin: u64) -> Result<&DecodedSegment> {
+        self.init_execute_area_from(code, begin, None)
+    }
+
+    /// [`init_execute_area`](Self::init_execute_area) for a segment
+    /// replacing the stale segment `rebuilt_from`.
+    fn init_execute_area_from(
+        &mut self,
+        code: &[u8],
+        begin: u64,
+        rebuilt_from: Option<&DecodedSegment>,
+    ) -> Result<&DecodedSegment> {
         if code.len() < 4 {
             return Err(MachineError::trigger(
                 ExceptionKind::ExecutionSpaceProtectionFault,
                 begin,
             ));
         }
-        self.cpu.exec = self
-            .memory
-            .create_execute_segment(code, begin, false, false)?;
+        self.cpu.exec =
+            self.memory
+                .create_execute_segment(code, begin, false, false, rebuilt_from)?;
         // Compiling in the background: the dispatcher has to run in slices
         // to switch to the native code (`dispatch_sliced`).
         #[cfg(feature = "jit")]
@@ -176,6 +187,12 @@ impl Machine {
             ));
         }
 
+        // The stale segment, compiled if a background compilation finished:
+        // the rebuild may reuse its native code.
+        #[cfg(feature = "jit")]
+        let rebuilt_from = found.as_ref().map(DecodedSegment::latest);
+        #[cfg(not(feature = "jit"))]
+        let rebuilt_from: Option<Arc<DecodedSegment>> = None;
         // Evict stale execute segments.
         if let Some(segment) = found {
             // If we already rebuilt for this exact PC and it's stale again,
@@ -198,7 +215,8 @@ impl Machine {
                 pc,
             ));
         };
-        let segment = self.init_execute_area(&code, base * PAGE_SIZE)?;
+        let segment =
+            self.init_execute_area_from(&code, base * PAGE_SIZE, rebuilt_from.as_deref())?;
         // The rebuild produced a usable segment, so re-arm the guard.
         if !segment.is_stale() {
             self.cpu.stale_restart_pc = u64::MAX;

@@ -1088,7 +1088,13 @@ these were for on CoreMark.
   (at most `memory_max` bytes, see the differences). FENCE.I and
   `riscv_flush_icache` mark segments stale, which then get rebuilt the
   same way. The host code page is an execute-only page, not a segment
-  made at load time.
+  made at load time. With the JIT, a rebuild from the same bytes at the
+  same address (for the same memory layout) reuses the stale segment's
+  native code instead of compiling it again (`jit::reuse`): C++ compiles
+  again, but a Cranelift compile takes milliseconds per page, and a loop
+  around a FENCE.I made the host spend that every iteration (`vmfuzzer`:
+  754 compiles, 6 s, in 1500 instructions). Code that really changed is
+  still compiled anew each time.
 - **ELF loading:** segments are copied in through the page table (so they
   can be anywhere, e.g. `-Ttext-segment` above the arena) and get their
   program header's attributes (`protect_segments`), or RWX.
