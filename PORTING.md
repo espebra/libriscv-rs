@@ -1114,7 +1114,16 @@ these were for on CoreMark.
   it through the page table and finishes the block with the interpreter's
   handlers (the block is already counted), so results and counts don't
   depend on the JIT. (With an N-bit address space, native code never
-  reaches the page table: see "JIT".)
+  reaches the page table: see "JIT".) The checks are branches, which a
+  CPU may speculate past (Spectre v1), so the accesses a check covers use
+  the base register through `select_spectre_guard` (a conditional move,
+  never speculated) on the check's own comparison: when it fails, the
+  base is a constant that keeps every covered offset inside the window.
+  Entry table lookups clamp their slot the same way. Even speculatively,
+  guest code reads nothing outside the arena and calls no pointer outside
+  the table, for one move per check; no real address changes. (Clamping
+  every access instead cost CoreMark 27%.) Masked (N-bit) accesses need
+  no guard. C++ asmjit has none.
 
 Dynamic executables: `rvlinux` loads the program's `PT_INTERP` (falling
 back to `/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1`) as the
@@ -1414,7 +1423,10 @@ are declared by hand (like `dlopen`), not through the `libc` crate, for
 the architectures whose flag values they spell out. Nothing else changes: the arena is still
 one contiguous `[u8]`, so the interpreter's `arena_read`/`arena_write`,
 the JIT's base-pointer addressing and AOT code are untouched, and the cost
-is all at machine creation.
+is all at machine creation. On Linux the arena lies between two 1 MiB
+inaccessible guards (`GUARD`, `PROT_NONE` address space), so that an
+access just outside it faults instead of reaching other host memory:
+defense in depth under native code's own checks.
 
 The mapping also lets a discard of the arena (`memdiscard`: `madvise
 (MADV_DONTNEED)`, anonymous `mmap`, `munmap`) do what C++ does: hand whole

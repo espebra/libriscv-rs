@@ -749,6 +749,46 @@ pub(crate) mod tests {
 
     /// Large segments are compiled on several threads; the image must be
     /// the one a single thread compiles.
+    /// Guest accesses and entry table lookups take their address through a
+    /// conditional move (`select_spectre_guard`), so that a mispredicted
+    /// bounds check can't reach outside the arena or the table, even
+    /// speculatively.
+    #[test]
+    fn accesses_and_table_lookups_are_guarded_against_speculation() {
+        let code: Vec<u8> = [
+            (2 << 12) | (11 << 7) | (10 << 15) | 0x03,  // lw a1, 0(a0)
+            (2 << 12) | (11 << 20) | (13 << 15) | 0x23, // sw a1, 0(a3)
+            (12 << 15) | 0x67,                          // jalr x0, 0(a2)
+            JSELF,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let mut m = Machine::new(
+            &[],
+            MachineOptions {
+                memory_max: 1 << 20,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        m.init_execute_area(&code, V).unwrap();
+        let exec = m.cpu.current_execute_segment();
+        let a = crate::codegen::region::analyse(exec);
+        super::emit::CLIF.with_borrow_mut(|c| *c = Some(Vec::new()));
+        let image = super::emit::compile_on(exec, &a, m.memory.native_layout(), 1);
+        let clif = super::emit::CLIF
+            .with_borrow_mut(Option::take)
+            .unwrap_or_default();
+        if image.is_none() {
+            return; // no JIT on this host
+        }
+        let guards = clif.concat().matches("select_spectre_guard").count();
+        // The load's check, the store's (another base register) and the
+        // indirect jump's table lookup.
+        assert!(guards >= 3, "{guards} guards in:\n{}", clif.concat());
+    }
+
     #[test]
     fn compiling_on_several_threads_gives_the_same_image() {
         // Many regions: compiled ADDIs separated by system calls (which

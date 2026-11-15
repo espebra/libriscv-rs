@@ -410,6 +410,13 @@ fn relocate(image: &mut [u8], at: usize, kind: Reloc, what: i64) -> Option<()> {
     Some(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: when set, the IR of every region compiled on this thread.
+    pub(crate) static CLIF: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Most threads compiling one segment's regions.
 const MAX_COMPILE_THREADS: usize = 16;
 /// Regions per thread below which more threads don't pay off.
@@ -442,8 +449,16 @@ fn compile_regions(
             ctx.clear();
             ctx.func =
                 Function::with_name_signature(UserFuncName::user(0, r as u32), tail_signature());
-            let object = RegionEmitter::emit(segment, r, &mut ctx.func, &mut fctx, isa)
-                .and_then(|()| compile_function(&mut ctx, isa));
+            let object =
+                RegionEmitter::emit(segment, r, &mut ctx.func, &mut fctx, isa).and_then(|()| {
+                    #[cfg(test)]
+                    CLIF.with_borrow_mut(|c| {
+                        if let Some(c) = c {
+                            c.push(ctx.func.display().to_string());
+                        }
+                    });
+                    compile_function(&mut ctx, isa)
+                });
             let Some(object) = object else {
                 failed.store(true, Relaxed);
                 break;
@@ -642,6 +657,7 @@ fn trampoline(
         let table = b
             .ins()
             .load(I64, host_flags(), state, JitState::OFFSET_TABLE);
+        let slot = spectre_slot(&mut b, in_table, slot);
         let byte_off = b.ins().ishl_imm_s(slot, 3);
         let addr = b.ins().iadd(table, byte_off);
         b.ins().brif(
@@ -721,8 +737,10 @@ struct RegionEmitter<'a, 'f> {
     /// emitted.
     pos: usize,
     /// `[load, store][base register]`: the span of offsets an earlier check
-    /// in this straight-line run covers for accesses through that register.
-    checked: [[Option<Span>; 32]; 2],
+    /// in this straight-line run covers for accesses through that register,
+    /// and the register's value guarded by that check (see
+    /// [`Self::guest_addr`]), which those accesses use.
+    checked: [[Option<(Span, Value)>; 32]; 2],
     /// `(kind, pc, counter)`: store the registers, then leave.
     exit: Block,
     /// `(kind, pc, counter)`: leave; the registers are already stored.
@@ -1208,6 +1226,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                 .b
                 .ins()
                 .load(I64, host_flags(), st, JitState::OFFSET_TABLE);
+            let slot = spectre_slot(&mut self.b, in_table, slot);
             let byte_off = self.b.ins().ishl_imm_s(slot, 3);
             let addr = self.b.ins().iadd(table, byte_off);
             let func = self.b.ins().load(I64, host_flags(), addr, 0);
@@ -1258,9 +1277,9 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
     /// earlier check covers has none of its own.
     fn guest_addr(&mut self, rs1: u32, imm: i64, write: bool, pc: u64) -> Value {
         let base = self.reg(rs1);
-        let addr = self.b.ins().iadd_imm_s(base, imm);
         let mask = self.layout.mask;
         if mask != 0 {
+            let addr = self.b.ins().iadd_imm_s(base, imm);
             let index = if mask == u64::from(u32::MAX) {
                 // A 32-bit zero extension, without materialising the mask.
                 let low = self.b.ins().ireduce(I32, addr);
@@ -1272,24 +1291,25 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
         }
         let reg = (rs1 & 31) as usize;
         let within = |span: Option<Span>| span.is_some_and(|(lo, hi)| lo <= imm && imm <= hi);
-        let covered_by = |kind: usize| {
-            within(
-                self.checked
-                    .get(kind)
-                    .and_then(|k| k.get(reg))
-                    .copied()
-                    .flatten(),
-            )
+        let covering = |kind: usize| {
+            self.checked
+                .get(kind)
+                .and_then(|k| k.get(reg))
+                .copied()
+                .flatten()
+                .filter(|&(span, _)| within(Some(span)))
         };
         // A store check also covers loads when every writable address is
         // readable.
         let stores_cover_loads = window_within(self.layout.write, self.layout.read);
         let covered = if write {
-            covered_by(1)
+            covering(1)
         } else {
-            covered_by(0) || (stores_cover_loads && covered_by(1))
+            covering(0).or_else(|| covering(1).filter(|_| stores_cover_loads))
         };
-        if !covered {
+        let guarded = if let Some((_, guarded)) = covered {
+            guarded
+        } else {
             let (loads, stores) = self.check_spans(rs1);
             // A load inside the span of the stores that follow it is checked
             // with them: it lies between two of their addresses, so it is
@@ -1317,14 +1337,26 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                 win_len.saturating_sub(span) as i64,
             );
             self.exit_if(outside, EXIT_SLOW, ExitPc::Const(pc));
+            // Spectre v1: the check is a branch, which the CPU may speculate
+            // past. The accesses it covers use the base register through a
+            // conditional move on the same comparison, which isn't
+            // speculated: when the check fails, the base is `win_base - lo`,
+            // so that `base + k` for every covered offset k in lo..=hi lies
+            // inside the window (the check only passes when the span fits
+            // in it). When it passes, the base is the register: no address
+            // changes, and the guard costs one move per check.
+            let safe = self.b.ins().iconst(I64, (win_base as i64).wrapping_sub(lo));
+            let guarded = self.b.ins().select_spectre_guard(outside, safe, base);
             if let Some(slot) = self
                 .checked
                 .get_mut(usize::from(as_store))
                 .and_then(|k| k.get_mut(reg))
             {
-                *slot = Some((lo, hi));
+                *slot = Some(((lo, hi), guarded));
             }
-        }
+            guarded
+        };
+        let addr = self.b.ins().iadd_imm_s(guarded, imm);
         self.b.ins().iadd(self.arena, addr)
     }
 
@@ -1934,6 +1966,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
             .b
             .ins()
             .load(I64, host_flags(), st, JitState::OFFSET_TABLE);
+        let slot = spectre_slot(&mut self.b, in_table, slot);
         let byte_off = self.b.ins().ishl_imm_s(slot, 3);
         let addr = self.b.ins().iadd(table, byte_off);
         let func = self.b.ins().load(I64, host_flags(), addr, 0);
@@ -2353,6 +2386,16 @@ enum Callee {
 enum ExitPc {
     Const(u64),
     Value(Value),
+}
+
+/// The entry table slot `slot`, or 0 (there is always a slot 0: a segment
+/// has at least one decoder entry) when `in_table` is false, chosen with a
+/// conditional move: a lookup a mispredicted bounds check lets through
+/// speculatively stays in the table (Spectre v1), so no guest value picks
+/// the function pointer the code then calls.
+fn spectre_slot(b: &mut FunctionBuilder<'_>, in_table: Value, slot: Value) -> Value {
+    let zero = b.ins().iconst(I64, 0);
+    b.ins().select_spectre_guard(in_table, slot, zero)
 }
 
 /// True if the window `inner` lies inside `outer` and isn't empty.
