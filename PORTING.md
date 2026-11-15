@@ -1634,6 +1634,14 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   killing a suspended thread (`tgkill`) leaves a dangling pointer in C++'s
   scheduler lists, here the thread is removed from them; a signal number
   above 64 throws `std::out_of_range`, here it's `ILLEGAL_OPERATION`.
+- Not reproduced (C++ leak, as far as the port can tell without the C++
+  tree): per-thread signal state (altstack, the registers a handler
+  interrupted) stays in C++'s map after its thread exits, and TIDs aren't
+  reused, so a guest grows host memory (about 1 KB a thread, outside
+  `memory_max`) by creating threads that touch it. Here a thread's state
+  goes when it exits, and `sigaltstack` without a new stack (and
+  `rt_sigreturn` without a delivered signal) reads the default state
+  without creating any. The guest sees the same values.
 
 ### Native heap and libc fast path
 

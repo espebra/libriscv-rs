@@ -137,9 +137,29 @@ impl Signals {
         ))
     }
 
-    /// Per-thread state, created on first use.
+    /// Per-thread state, created on first use. For reading, use
+    /// [`thread_state`](Self::thread_state), which doesn't create it.
     pub fn per_thread(&mut self, tid: i32) -> &mut SignalPerThread {
         self.per_thread.entry(tid).or_default()
+    }
+
+    /// Per-thread state, if thread `tid` has any (an altstack it set, or
+    /// the state a signal handler interrupted). A thread without any has
+    /// the default state.
+    pub fn thread_state(&self, tid: i32) -> Option<&SignalPerThread> {
+        self.per_thread.get(&tid)
+    }
+
+    /// Forget the state of a thread that exited. C++ keeps it in its map
+    /// forever, and TIDs aren't reused, so a guest could grow host memory
+    /// (outside `memory_max`) by a kilobyte per thread it creates.
+    pub(crate) fn erase_thread(&mut self, tid: i32) {
+        self.per_thread.remove(&tid);
+    }
+
+    /// Number of threads with per-thread state.
+    pub fn threads_with_state(&self) -> usize {
+        self.per_thread.len()
     }
 }
 
@@ -248,7 +268,11 @@ impl Machine {
             .reg(REG_SP)
             .wrapping_add(frame::SIGINFO_SIZE as u64);
         let mut gregs = [0u8; 32 * 8];
-        let saved = self.signals().per_thread(tid).sigret.clone();
+        let saved = self
+            .signals()
+            .thread_state(tid)
+            .map(|pt| pt.sigret.clone())
+            .unwrap_or_default();
         if self
             .copy_from_guest(&mut gregs, uctx_addr.wrapping_add(frame::MCONTEXT as u64))
             .is_err()
