@@ -205,7 +205,8 @@ fn operate(m: &mut Machine, op: u8) -> libriscv::Result<()> {
                     let _ = v.insert::<GuestRustString, _>(m, LONG)?;
                 }
                 6 => {
-                    let list = GuestRustVec::<RustValue>::from_slice(m, &[RustValue::new(Value::Int(1))])?;
+                    let list =
+                        GuestRustVec::<RustValue>::from_slice(m, &[RustValue::new(Value::Int(1))])?;
                     let boxed = GuestRustBox::new(m, &list)?;
                     let _ = v.insert::<GuestRustBox<GuestRustVec<RustValue>>, _>(m, &boxed)?;
                 }

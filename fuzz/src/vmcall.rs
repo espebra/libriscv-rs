@@ -4,8 +4,8 @@
 //! parsing (the Rust scripting API's readers included), all against
 //! guest-chosen code and data.
 
-use libriscv::registers::REG_ARG0;
 use libriscv::guest::{GuestPtr, GuestRustStr, GuestRustString, GuestRustVec};
+use libriscv::registers::REG_ARG0;
 use libriscv::{
     Buffer, ByPointer, ExceptionKind, GuestSlice, Machine, MachineError, MachineOptions, OnStack,
 };
@@ -246,7 +246,11 @@ mod tests {
         words64(&mut m, data + 0x20, &[0, 9]);
         words64(&mut m, data + 0x40, &[2, data, 2]);
         words64(&mut m, data + 0x60, &[0, 4, 0]);
-        for (reg, value) in [(REG_ARG0, data + 0x20), (REG_ARG1, data + 0x40), (REG_ARG2, data + 0x60)] {
+        for (reg, value) in [
+            (REG_ARG0, data + 0x20),
+            (REG_ARG1, data + 0x40),
+            (REG_ARG2, data + 0x60),
+        ] {
             m.cpu.set_reg(reg, value);
         }
         m.system_call(SYS_RUST_PTRS as u64).unwrap();
