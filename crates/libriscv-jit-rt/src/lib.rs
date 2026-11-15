@@ -60,9 +60,12 @@
 //! its `jit_cache` module): linked into the host program ([`embedded_units`])
 //! or into a shared object loaded at run time ([`load_shared_object`]). Such
 //! code is trusted exactly like any other native code of the process: it is
-//! not, and cannot be, verified. `libriscv` only uses it for the segment,
-//! memory layout and build it was compiled for, which keeps a stale or
-//! mismatched file from being run by accident, not a malicious one.
+//! not, and cannot be, verified. `libriscv` only uses it for the segment
+//! (whose exact guest code each unit stores), memory layout and build it
+//! was compiled for, which keeps a stale or mismatched file from being run,
+//! but not a malicious one from running its own native code: only load
+//! files you trust. [`effective_uid`] is for `libriscv`'s checks that
+//! cache files and directories belong to the user running it.
 //!
 //! # Translations
 //!
@@ -94,6 +97,20 @@ pub use linked::{
     CachedUnit, LinkedCode, RECORD_MAGIC, RECORD_WORDS, SECTION, SharedObject, TABLE_MAGIC,
     TABLE_SYMBOL, TABLE_WORDS, embedded_units, load_shared_object,
 };
+
+/// The process's effective user ID: `libriscv` only loads cached code from
+/// (and saves it to) files and directories this user owns.
+#[cfg(unix)]
+pub fn effective_uid() -> u32 {
+    #[allow(unsafe_code)]
+    // SAFETY: the POSIX declaration of `geteuid` (`uid_t` is `u32` on
+    // Linux and macOS). It has no preconditions and cannot fail, so it is
+    // declared `safe`.
+    unsafe extern "C" {
+        safe fn geteuid() -> u32;
+    }
+    geteuid()
+}
 
 /// The largest guest memory access generated code makes, in bytes.
 pub const MAX_ACCESS: u64 = 8;

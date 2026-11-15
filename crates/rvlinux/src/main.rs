@@ -465,7 +465,11 @@ fn main() -> ExitCode {
 /// The JIT cache directory for a dynamic executable: the code of the
 /// dynamic linker (the initial segment) and of the pinned libraries is
 /// the same in every program, so the JIT saves it the first time and uses
-/// it from then on. The program's own code is never cached.
+/// it from then on. The program's own code is never cached, nor anything
+/// the program wrote into the pinned slots (libriscv saves only segments
+/// whose bytes are those of the pinned file mapped there). The initial
+/// segment is always `DYNAMIC_LINKER`: the program's `PT_INTERP` never
+/// chooses the host file.
 #[cfg(feature = "jit")]
 fn jit_cache_dir(args: &CliArgs, is_dynamic: bool) -> Option<libriscv::jit_cache::CacheDir> {
     if !is_dynamic || !args.jit || args.no_jit_cache {

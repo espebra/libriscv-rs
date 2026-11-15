@@ -163,11 +163,13 @@ fn compile_and_load(
 ) -> Option<Compiled> {
     let image = compile(exec, layout)?;
     if let Some(save) = save {
+        // Saved with the code it was compiled from, which cached code must
+        // match to be used.
         if let Some(output) = &save.output {
-            output.record(save.key, &image);
+            output.record(save.key, &image, exec.code());
         }
         if let Some(file) = &save.file {
-            cache::save_file(save.key, &image, file, save.verbose);
+            cache::save_file(save.key, &image, exec.code(), file, save.verbose);
         }
     }
     image.load()
