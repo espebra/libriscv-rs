@@ -1082,7 +1082,12 @@ fn syscall_sigaltstack(m: &mut Machine) -> Result<()> {
     let ss = m.sysarg(0);
     let old_ss = m.sysarg(1);
     let tid = m.gettid();
-    let current = m.signals().per_thread(tid).stack;
+    // Reading doesn't create per-thread state.
+    let current = m
+        .signals()
+        .thread_state(tid)
+        .map(|pt| pt.stack)
+        .unwrap_or_default();
     if old_ss != 0 {
         m.copy_to_guest(old_ss, &current.to_bytes())?;
     }

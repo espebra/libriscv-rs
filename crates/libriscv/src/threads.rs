@@ -355,6 +355,10 @@ impl Machine {
             if let Some(mt) = self.mt.as_deref_mut() {
                 mt.erase_thread(tid);
             }
+            // Its altstack and saved signal state go with it.
+            if let Some(signals) = self.signals.as_deref_mut() {
+                signals.erase_thread(tid);
+            }
             // Exiting the main thread is a process exit: no wakeup.
             if exiting_myself {
                 self.thread_wakeup_next();

@@ -1654,6 +1654,14 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   lists, a thread is in at most one of them, and queueing a listed thread
   is an `INVALID_PROGRAM` error. Programs that never reach that state
   schedule exactly as in C++.
+- Not reproduced (C++ leak, as far as the port can tell without the C++
+  tree): per-thread signal state (altstack, the registers a handler
+  interrupted) stays in C++'s map after its thread exits, and TIDs aren't
+  reused, so a guest grows host memory (about 1 KB a thread, outside
+  `memory_max`) by creating threads that touch it. Here a thread's state
+  goes when it exits, and `sigaltstack` without a new stack (and
+  `rt_sigreturn` without a delivered signal) reads the default state
+  without creating any. The guest sees the same values.
 
 ### Native heap and libc fast path
 
