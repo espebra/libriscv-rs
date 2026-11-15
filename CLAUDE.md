@@ -11,7 +11,9 @@ plan and the C++ → Rust file mapping live there.
 - C++ reference emulator (the test oracle): `../libriscv/emulator/rvlinux`.
 - CoreMark sources (difftest and benchmark): `../coremark` (or `$COREMARK_DIR`).
 - `crates/libriscv` — the library. `crates/rvlinux` — CLI. `crates/testutil` —
-  guest cross-compilation and oracle helpers (test-only).
+  guest cross-compilation and oracle helpers (test-only). `examples/asteroids` —
+  a game on the scripting API; its RISC-V guest (`guest/`) is a separate cargo
+  project that the example builds.
 
 ## Commands
 
@@ -24,6 +26,7 @@ cargo test --workspace --no-default-features # interpreter only: no Cranelift, n
 cargo test --workspace --features libriscv/aot-dylib,rvlinux/aot-dylib  # + AOT (needs rustc)
 rvlinux --jit-save-shared x.so prog.elf; rvlinux --jit-load x.so prog.elf   # JIT code cache (also --jit-save-object, RVLINUX_JIT_EMBED)
 rvlinux --aot-save-shared x.so prog.elf; rvlinux --aot-load x.so prog.elf   # AOT: translate to safe Rust (also --aot-save x.rs, RVLINUX_AOT_EMBED)
+cargo run --release -p asteroids             # example game: Rust engine + Rust RV64GCB script (examples/asteroids)
 rvlinux dynamic.elf                          # JIT by default (-n interprets); caches ld.so + system libraries in ~/.cache/rvlinux/jit by itself (--jit-cache-dir, --no-jit-cache)
 ```
 

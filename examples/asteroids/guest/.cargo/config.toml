@@ -1,0 +1,19 @@
+# Read when cargo runs in this directory (the engine builds the guest from
+# here). Override the linker with CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER.
+[build]
+target = "riscv64gc-unknown-linux-gnu"
+
+[target.riscv64gc-unknown-linux-gnu]
+linker = "riscv64-linux-gnu-gcc-14"
+rustflags = [
+    # RV64GC plus B (Zba, Zbb, Zbs), statically linked
+    "-C", "target-feature=+crt-static,+zba,+zbb,+zbs",
+    "-C", "relocation-model=static",
+    # The block memory functions go to the host (host::native_memory!)
+    "-C", "link-arg=-Wl,--wrap=memcpy",
+    "-C", "link-arg=-Wl,--wrap=memset",
+    "-C", "link-arg=-Wl,--wrap=memmove",
+    "-C", "link-arg=-Wl,--wrap=memcmp",
+    "-C", "link-arg=-Wl,--wrap=__memcmpeq",
+    "-C", "link-arg=-Wl,--wrap=bcmp",
+]

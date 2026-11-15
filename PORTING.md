@@ -1128,7 +1128,8 @@ Phase 5) and `insert_non_owned_memory`.
 | Layer | Where | What |
 |---|---|---|
 | Unit | `#[cfg(test)]` in each module | Decoding, helpers, edge cases |
-| Integration | `crates/libriscv/tests/` | Ports of `../libriscv/tests/unit/*.cpp` (Catch2 → `#[test]`); guests built with `testutil::build_and_load`. `linux.rs`: `security.cpp`, Linux cases of `protections.cpp`, threads, signals, the file sandbox, and every system call with random arguments. `paging.rs`: the memory cases of `protections.cpp`, `va_execute.cpp` (code on mprotected and high pages, FENCE.I/`riscv_flush_icache`, constant pools) and `dynamic.cpp` (PIE). `vmcall.rs`: `vmcall.cpp` (the fork case included) and preemption (restoring, clobbering, errors, shared budget, nested under background JIT). `custom.rs`: `custom.cpp`'s custom instruction, and userdata. `dyncall.rs`: `dyncall.cpp`, adapted to dyncalls being system calls (interpreter and JIT, exactly equal). `native.rs`: `native.cpp` (native heap system calls and the guest C++ containers). `native_rust.rs`: `native_rust.cpp` (the guest Rust containers against a Rust guest, built with `testutil::build_rust`; needs the `riscv64gc-unknown-linux-gnu` target of the pinned toolchain). `brutal.rs`: `brutal.cpp` (forks, stepping a few instructions at a time, copy-on-write and page cache cases) plus fork snapshots, forks of forks, forking from threads and fork page accounting |
+| Integration | `crates/libriscv/tests/` | Ports of `../libriscv/tests/unit/*.cpp` (Catch2 → `#[test]`); guests built with `testutil::build_and_load`. `linux.rs`: `security.cpp`, Linux cases of `protections.cpp`, threads, signals, the file sandbox, and every system call with random arguments. `paging.rs`: the memory cases of `protections.cpp`, `va_execute.cpp` (code on mprotected and high pages, FENCE.I/`riscv_flush_icache`, constant pools) and `dynamic.cpp` (PIE). `vmcall.rs`: `vmcall.cpp` (the fork case included) and preemption (restoring, clobbering, errors, shared budget, nested under background JIT). `custom.rs`: `custom.cpp`'s custom instruction, and userdata (`with_userdata` included). `dyncall.rs`: `dyncall.cpp`, adapted to dyncalls being system calls (interpreter and JIT, exactly equal). `native.rs`: `native.cpp` (native heap system calls and the guest C++ containers). `native_rust.rs`: `native_rust.cpp` (the guest Rust containers against a Rust guest, built with `testutil::build_rust`; needs the `riscv64gc-unknown-linux-gnu` target of the pinned toolchain). `brutal.rs`: `brutal.cpp` (forks, stepping a few instructions at a time, copy-on-write and page cache cases) plus fork snapshots, forks of forks, forking from threads and fork page accounting |
+| Example | `examples/asteroids/tests/headless.rs` | The example game played without a terminal: frames at a fixed rate with scripted input, the JIT against the interpreter frame by frame (screens and instruction counts), heap balance across frames. Builds the Rust guest with cargo; skipped without the guest toolchain |
 | Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Static and dynamic glibc C and C++ programs (stdio, malloc, threads incl. `test_threads.cpp`, condvars, abort, a fault with a signal handler, timeouts; dynamic ones run under `ld.so`), code generated at runtime (mprotect, FENCE.I, pages far outside the arena, `dlopen`, an execute fault), `getrusage`'s page accounting, the prebuilt Rust/Zig/newlib fixtures (Go: output only, its count varies under the oracle too) and glibc CoreMark, and `--libc-fastpath` (the guest of `libc_fastpath.cpp` calling every patched function, the glibc C and C++ programs, timeouts, and faults inside patched functions). Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics; RV64IM and RV64IMC+Zcb with Zba/Zbb/Zbc/Zbs/Zicond/Zbkb for bit manipulation; RV64IMFD and RV64IMAFDC+Zcb with Zfhmin/Zfa for floating point; CoreMark (soft-float, F/D, F/D+B), whose clock is the instruction counter so its whole output is compared. `rvlinux --call` (a VM call after the program exits). Each scenario is one test per Rust configuration (`<name>::interp`, `::jit`, `::jit_upfront`), and long fuel loops are split, so the harness runs them concurrently |
 | Instruction | ports of `../libriscv/tests/instructions/` | Per-instruction checks incl. RVC (`test_rv32c.cpp` → `tests/rvc.rs`, widened to RV64) |
 | ISA | `../libriscv/tests/rva23/` | Needs a full RVA23 toolchain; run by hand |
@@ -1715,16 +1716,34 @@ itself, so:
   system call here (see "JIT"): no `a7`, and the asm operands are only the
   registers the host touches. The native heap and memory functions and the
   test's own host functions are plain system call handlers.
+- Beyond C++, for host functions called by Rust guests: a guest `&str`
+  argument (pointer and length) is a `SysArg` both as a borrowed,
+  UTF-8-checked `&str` and as an unread `GuestRustStr`; and
+  `Machine::with_userdata` lends a handler its userdata and the machine at
+  once, so it can change its state with what it borrows from guest memory
+  (`userdata_mut` borrows the whole machine). The userdata moves out and
+  back, without allocating.
+- `examples/asteroids` is a worked example of the whole layer: the game of
+  `../libloong/examples/gamedev`, with a Rust engine and the game logic as
+  a Rust RV64GCB script. Its `guest/src/host.rs` is the guest half:
+  `host_functions!` turns declarations into safe functions over naked
+  dyncall stubs, with the register counts computed from the argument types
+  (a `&str` is two integer registers, `f32` one FP register), and
+  `native_heap!`/`native_memory!` hand the global allocator and memcpy and
+  friends to the host. One file of system call numbers (`src/api.rs`) is
+  included by both sides. Its headless tests play the game under the
+  interpreter and the JIT, which must agree on every frame and instruction
+  count.
 
 ### Phase 3 — Embedding API
 
-- [x] `install_syscall_handler`, typed `sysarg`/`sysargs`/`return_value`, `set_result(_or_error)` (`sysargs.rs`: `SysArg`/`SysResult` traits, tuples of up to 8; `ByPointer<T>` for C++'s pointer-to-struct arguments)
+- [x] `install_syscall_handler`, typed `sysarg`/`sysargs`/`return_value`, `set_result(_or_error)` (`sysargs.rs`: `SysArg`/`SysResult` traits, tuples of up to 8; `ByPointer<T>` for C++'s pointer-to-struct arguments; Rust guests' `&str`, not in C++)
 - [x] `address_of` (ELF symbols), `vmcall`, `preempt` (restoring and clobbering), `setup_call`, `default_exit_function`, `rvlinux --call` (`machine_vmcall.hpp`, `machine_inline.hpp`, `CPU::preempt_internal`); see "VM calls"
 - [ ] Call-depth handling
 - [ ] `PreparedCall` (`prepared_call.hpp`)
 - [x] Guest memory views, `copy_to/from_guest`, `memstring`, `stack_push` (`memory/helpers.rs`: `Buffer`/`membuffer`, `strlen`, `memstring_view`, `memview`/`memview_mut` with `maxlen`, typed `memarray`/`memspan`/`try_memarray` as `GuestSlice`/`GuestSliceMut` over `GuestPod`, `try_memmove`, both `memcmp`s, machine-to-machine `memcpy_from`, `read_value`/`write_value`; `stack_push_value`)
 - [x] Printer / stdin / rdtime hooks
-- [x] Userdata (`set_userdata`/`get_userdata`), custom instructions (`on_unimplemented_instruction`); see "Architecture decisions"
+- [x] Userdata (`set_userdata`/`get_userdata`; `with_userdata`, not in C++), custom instructions (`on_unimplemented_instruction`); see "Architecture decisions"
 - [x] Fork with CoW (`machine.cpp`, `cpu.cpp`, `memory.cpp` `machine_loader`), page caches; see "Fork". (C++ `Memory::reset()` is empty: nothing to port)
 - [ ] Serialize/deserialize (`serialize.cpp`)
 - [ ] Ports of `tests/unit/{dynamic,examples,checksum,pcrel,png}.cpp` (`exceptions.cpp`: done, `tests/exceptions.rs`) (`rvbuffer.cpp` and `custom.cpp`'s "Take custom system arguments": done, `tests/guest_memory.rs`; "Custom instruction": done, `tests/custom.rs`) (`dyncall.cpp`: done, `tests/dyncall.rs`) (`crc32c.cpp`: the CRC32-C case, in `decoder_cache.rs`) (`vmcall.cpp`: done, `tests/vmcall.rs`; `brutal.cpp`: done except memory traps, `tests/brutal.rs`)

@@ -17,8 +17,9 @@
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
+use libriscv::guest::GuestRustStr;
 use libriscv::memory::{PAGE_SIZE, PageAttributes};
-use libriscv::registers::{REG_ARG0, REG_SP};
+use libriscv::registers::{REG_ARG0, REG_ARG1, REG_SP};
 use libriscv::{
     Buffer, ByPointer, ExceptionKind, GuestPod, GuestSlice, MEMVIEW_MAX, Machine, MachineOptions,
 };
@@ -411,10 +412,24 @@ fn sysargs_and_set_result() {
     m.set_result_or_error(42);
     assert_eq!(m.return_value(), 42);
 
+    // A Rust &str: pointer and length, checked to be UTF-8.
+    let text = m.stack_push("blåbær".as_bytes()).unwrap();
+    let bad = m.stack_push(b"\xff\xfe").unwrap();
+    for (i, v) in [text, 8, bad, 2].into_iter().enumerate() {
+        m.cpu.set_reg(REG_ARG0 + i as u32, v);
+    }
+    let (good, raw): (&str, GuestRustStr) = m.sysargs().unwrap();
+    assert_eq!(good, "blåbær");
+    assert_eq!(raw, GuestRustStr::from_raw_parts(bad, 2));
+    assert!(m.sysarg_as::<&str>(2).is_err());
+    assert_eq!(raw.to_string_lossy(&m).unwrap(), "\u{fffd}\u{fffd}");
+
     // Arguments in unreadable memory are errors, not panics.
     m.cpu.set_reg(REG_ARG0, 0);
     assert_eq!(m.sysarg_as::<String>(0).unwrap_err().kind, FAULT);
     assert_eq!(m.sysarg_as::<ByPointer<Pair>>(0).unwrap_err().kind, FAULT);
+    m.cpu.set_reg(REG_ARG1, 4);
+    assert_eq!(m.sysarg_as::<&str>(0).unwrap_err().kind, FAULT);
 }
 
 /// custom.cpp: `enum ArgType`, `struct SystemArg` (a 64-byte union and a

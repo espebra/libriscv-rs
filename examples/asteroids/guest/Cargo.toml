@@ -1,0 +1,20 @@
+# The game script: a Rust program for RV64GCB Linux, run by the engine in
+# ../ (which builds it). Not part of the engine's workspace: it is built for
+# riscv64gc-unknown-linux-gnu, with the settings in .cargo/config.toml.
+[package]
+name = "asteroids-guest"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "asteroids-guest"
+path = "src/main.rs"
+
+[workspace]
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+panic = "abort"

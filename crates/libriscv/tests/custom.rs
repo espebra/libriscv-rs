@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use libriscv::registers::REG_ARG0;
+use libriscv::registers::{REG_ARG0, REG_SP};
 use libriscv::{ExceptionKind, Instr, Machine, MachineError, MachineOptions};
 
 const MAX_MEMORY: u64 = 8 << 20;
@@ -182,4 +182,39 @@ fn userdata() {
     // Forks don't get the userdata, as in C++ (nor the printer).
     let fork = machine.fork().unwrap();
     assert!(!fork.has_userdata());
+}
+
+/// `with_userdata`: the userdata and the machine at once, so a handler can
+/// change its state with what it reads from guest memory.
+#[test]
+fn with_userdata() {
+    const LOG: usize = 400;
+    let mut machine = Machine::new(&[], MachineOptions::default()).unwrap();
+    // No userdata, or of another type: f isn't called.
+    assert_eq!(machine.with_userdata(|_: &mut Vec<String>, _| 1), None);
+    machine.set_userdata(5u32);
+    assert_eq!(machine.with_userdata(|_: &mut Vec<String>, _| 1), None);
+    assert_eq!(machine.userdata::<u32>(), Some(&5));
+
+    machine.set_userdata(Vec::<String>::new());
+    machine.install_syscall_handler(LOG, |m| {
+        m.with_userdata(|log: &mut Vec<String>, m| {
+            // Inside, the machine has no userdata of its own.
+            assert!(!m.has_userdata());
+            let (text,): (&str,) = m.sysargs()?;
+            log.push(text.to_owned());
+            Ok(())
+        })
+        .unwrap()
+    });
+    machine.cpu.set_reg(REG_SP, 0x10_0000);
+    let addr = machine.stack_push(b"logged").unwrap();
+    machine.cpu.set_reg(REG_ARG0, addr);
+    machine.cpu.set_reg(REG_ARG0 + 1, 6);
+    machine.system_call(LOG as u64).unwrap();
+    machine.system_call(LOG as u64).unwrap();
+    assert_eq!(
+        machine.userdata::<Vec<String>>().unwrap(),
+        &["logged", "logged"]
+    );
 }

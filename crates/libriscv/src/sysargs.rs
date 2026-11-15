@@ -7,6 +7,8 @@
 //! | `f32`, `f64` | `float`, `double` | one FP register (`fa0`..) |
 //! | `String` | `std::string` | pointer: [`Memory::memstring`] (lossy UTF-8) |
 //! | `&[u8]` | `std::string_view` | pointer and length: [`Memory::memview`] |
+//! | `&str` | (Rust `&str`) | pointer and length, UTF-8 checked: [`GuestRustStr::to_str`] |
+//! | [`GuestRustStr`] | (Rust `&str`) | pointer and length, not read yet |
 //! | [`Buffer`] | `riscv::Buffer` | pointer and length: [`Memory::membuffer`] |
 //! | [`GuestSlice<T>`] | `std::span<const T>` | pointer and element count: [`Memory::memspan`] |
 //! | [`ByPointer<T>`] | other standard-layout types | pointer, value copied out |
@@ -15,8 +17,11 @@
 //! [`Memory::memview`]: crate::Memory::memview
 //! [`Memory::membuffer`]: crate::Memory::membuffer
 //! [`Memory::memspan`]: crate::Memory::memspan
+//! [`GuestRustStr`]: crate::guest::GuestRustStr
+//! [`GuestRustStr::to_str`]: crate::guest::GuestRustStr::to_str
 
 use crate::error::Result;
+use crate::guest::GuestRustStr;
 use crate::machine::Machine;
 use crate::memory::{Buffer, GuestPod, GuestSlice, MEMVIEW_MAX};
 use crate::registers::REG_ARG0;
@@ -116,6 +121,23 @@ impl<'a> SysArg<'a> for &'a [u8] {
         let addr = args.next_int(m);
         let len = args.next_int(m);
         m.memory.memview(addr, len)
+    }
+}
+/// A Rust guest's `&str`: pointer and length (the ABI passes the two
+/// halves in separate registers), borrowed from guest memory and checked
+/// to be UTF-8 (Rust guarantees it, but a guest can lie): an error when it
+/// isn't. Not in C++.
+impl<'a> SysArg<'a> for &'a str {
+    fn read(m: &'a Machine, args: &mut ArgCursor) -> Result<Self> {
+        GuestRustStr::read(m, args)?.to_str(m)
+    }
+}
+/// A Rust guest's `&str`, not yet read: pointer and length. Not in C++.
+impl SysArg<'_> for GuestRustStr {
+    fn read(m: &Machine, args: &mut ArgCursor) -> Result<Self> {
+        let ptr = args.next_int(m);
+        let len = args.next_int(m);
+        Ok(Self::from_raw_parts(ptr, len))
     }
 }
 /// C++ `riscv::Buffer`: pointer and length,

@@ -1,0 +1,23 @@
+[package]
+name = "asteroids"
+description = "Asteroid Dodge: a terminal game whose logic is a Rust script in a libriscv machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+default = ["jit"]
+# Compiles the script with the Cranelift JIT. Without it
+# (`--no-default-features`), the script is interpreted.
+jit = ["libriscv/jit"]
+
+[dependencies]
+libriscv = { workspace = true, features = ["ext-a", "ext-c", "ext-f"] }
+
+[dev-dependencies]
+testutil.workspace = true
+
+[lints]
+workspace = true

@@ -412,6 +412,39 @@ impl Machine {
         let data: Box<dyn Any> = self.userdata.take()?;
         data.downcast().ok().map(|b| *b)
     }
+    /// Run `f` with the userdata of type `T` and the machine, both
+    /// mutably: for a system call handler that changes its own state while
+    /// it reads its arguments or guest memory, which borrow the machine
+    /// (`userdata_mut` would borrow all of it). The userdata is moved out of
+    /// the machine while `f` runs and back afterwards (no allocation), so
+    /// inside `f` the machine has none, and userdata that `f` sets is
+    /// dropped in favour of it. `None`, without calling `f`, unless there
+    /// is userdata of type `T`.
+    ///
+    /// ```no_run
+    /// # struct Screen; impl Screen { fn text(&mut self, _: i32, _: i32, _: &str) {} }
+    /// fn draw_text(m: &mut libriscv::Machine) -> libriscv::Result<()> {
+    ///     m.with_userdata(|screen: &mut Screen, m| {
+    ///         let (x, y, text): (i32, i32, &str) = m.sysargs()?;
+    ///         screen.text(x, y, text);
+    ///         Ok(())
+    ///     })
+    ///     .unwrap_or(Ok(()))
+    /// }
+    /// ```
+    pub fn with_userdata<T: Any, R>(
+        &mut self,
+        f: impl FnOnce(&mut T, &mut Self) -> R,
+    ) -> Option<R> {
+        let mut data = self.userdata.take()?;
+        let Some(value) = data.downcast_mut::<T>() else {
+            self.userdata = Some(data);
+            return None;
+        };
+        let result = f(value, self);
+        self.userdata = Some(data);
+        Some(result)
+    }
     /// True if there is userdata (of any type).
     pub fn has_userdata(&self) -> bool {
         self.userdata.is_some()
