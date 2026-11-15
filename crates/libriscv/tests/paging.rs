@@ -695,70 +695,68 @@ fn fib_in_pie_executable() {
     assert_eq!(m.return_value() as i64, 12_586_269_025);
 }
 
-/// A guest that maps `area` executable bytes at 0x100000 and calls a
-/// FENCE.I; ret stub at its start `calls` times. The FENCE.I makes the stub's
-/// segment stale, and leaving it (the ret) rebuilds it from the whole area:
-/// a rebuild per call. Returns the
-/// machine (run with `limit`), whether the run hit the limit, and the calls
-/// made (in s2).
-fn rebuild_loop(area: u64, calls: i32, limit: u64) -> (Machine, bool, u64) {
-    const fn i(op: u32, f3: u32, rd: u32, rs1: u32, imm: i32) -> u32 {
-        ((imm as u32 & 0xFFF) << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | op
-    }
-    const fn addi(rd: u32, rs1: u32, imm: i32) -> u32 {
-        i(0x13, 0, rd, rs1, imm)
-    }
-    const fn lui(rd: u32, imm20: u32) -> u32 {
-        (imm20 << 12) | (rd << 7) | 0x37
-    }
-    const fn sw(rs1: u32, rs2: u32, imm: i32) -> u32 {
-        let imm = imm as u32;
-        (((imm >> 5) & 0x7F) << 25)
-            | (rs2 << 20)
-            | (rs1 << 15)
-            | (2 << 12)
-            | ((imm & 0x1F) << 7)
-            | 0x23
-    }
-    const ECALL: u32 = 0x73;
-    let (ra, t0, s0, s1, s2) = (1, 5, 8, 9, 18);
-    let (a0, a1, a2, a3, a4, a5, a7) = (10, 11, 12, 13, 14, 15, 17);
+// Hand-assembled guests decoding execute segments at runtime.
+const fn itype_(op: u32, f3: u32, rd: u32, rs1: u32, imm: i32) -> u32 {
+    ((imm as u32 & 0xFFF) << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | op
+}
+const fn addi(rd: u32, rs1: u32, imm: i32) -> u32 {
+    itype_(0x13, 0, rd, rs1, imm)
+}
+const fn lui(rd: u32, imm20: u32) -> u32 {
+    (imm20 << 12) | (rd << 7) | 0x37
+}
+const fn sw(rs1: u32, rs2: u32, imm: i32) -> u32 {
+    let imm = imm as u32;
+    (((imm >> 5) & 0x7F) << 25) | (rs2 << 20) | (rs1 << 15) | (2 << 12) | ((imm & 0x1F) << 7) | 0x23
+}
+const fn jalr(rd: u32, rs1: u32) -> u32 {
+    itype_(0x67, 0, rd, rs1, 0)
+}
+const fn bne(rs1: u32, rs2: u32, offset: i32) -> u32 {
+    let o = offset as u32;
+    (((o >> 12) & 1) << 31)
+        | (((o >> 5) & 0x3F) << 25)
+        | (rs2 << 20)
+        | (rs1 << 15)
+        | (1 << 12)
+        | (((o >> 1) & 0xF) << 8)
+        | (((o >> 11) & 1) << 7)
+        | 0x63
+}
+const ECALL: u32 = 0x73;
+const RA: u32 = 1;
+const T0: u32 = 5;
+const S0: u32 = 8;
+const S1: u32 = 9;
+const S2: u32 = 18;
+const A0: u32 = 10;
+const A1: u32 = 11;
+const A7: u32 = 17;
+
+/// `mmap(addr, area, RWX, flags)` into a0 (`addr` page-aligned, below 2 GiB).
+fn mmap_rwx(addr: u32, area: u64, flags: i32) -> [u32; 8] {
     let area_pages = u32::try_from(area / PAGE_SIZE).unwrap();
-    let program = [
-        // mmap(0x100000, area, RWX, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED)
-        addi(a7, 0, 222),
-        lui(a0, 0x100),
-        lui(a1, area_pages),
-        addi(a2, 0, 7),
-        addi(a3, 0, 0x32),
-        addi(a4, 0, -1),
-        addi(a5, 0, 0),
+    [
+        addi(A7, 0, 222),
+        lui(A0, addr >> 12),
+        lui(A1, area_pages),
+        addi(12, 0, 7),
+        addi(13, 0, flags),
+        addi(14, 0, -1),
+        addi(15, 0, 0),
         ECALL,
-        addi(s0, a0, 0),
-        // The stub: fence.i (0x100F); ret (0x8067)
-        lui(t0, 1),
-        addi(t0, t0, 0xF),
-        sw(s0, t0, 0),
-        lui(t0, 8),
-        addi(t0, t0, 0x67),
-        sw(s0, t0, 4),
-        addi(s1, 0, calls),
-        // loop: call the stub, count the call
-        i(0x67, 0, ra, s0, 0),
-        addi(s2, s2, 1),
-        addi(s1, s1, -1),
-        // bne s1, x0, loop (-12)
-        0xFE04_9AE3,
-        // exit(0)
-        addi(a7, 0, 93),
-        addi(a0, 0, 0),
-        ECALL,
-    ];
+    ]
+}
+
+/// Run `program` (at 0x10000) with `free_decode_bytes` and `limit`: the
+/// machine, whether it hit the limit, and the calls it counted in s2.
+fn run_decoding_guest(program: &[u32], free_decode_bytes: u64, limit: u64) -> (Machine, bool, u64) {
     let code: Vec<u8> = program.iter().flat_map(|w| w.to_le_bytes()).collect();
     let mut m = Machine::new(
         &[],
         MachineOptions {
             memory_max: 64 << 20,
+            free_decode_bytes,
             ..Default::default()
         },
     )
@@ -773,45 +771,131 @@ fn rebuild_loop(area: u64, calls: i32, limit: u64) -> (Machine, bool, u64) {
             true
         }
     };
-    let calls = m.cpu.reg(s2);
+    let calls = m.cpu.reg(S2);
     (m, timed_out, calls)
 }
 
+/// A guest that maps `area` executable bytes at 0x100000 and calls a
+/// FENCE.I; ret stub at its start `calls` times. The first call creates
+/// the stub's segment; the FENCE.I makes it stale, and leaving it (the ret)
+/// rebuilds it from the whole area: a decode per call, plus the first.
+fn rebuild_loop(area: u64, calls: i32, free_decode_bytes: u64, limit: u64) -> (Machine, bool, u64) {
+    let mut program = mmap_rwx(0x100000, area, 0x32).to_vec(); // MAP_FIXED
+    program.extend([
+        addi(S0, A0, 0),
+        // The stub: fence.i (0x100F); ret (0x8067)
+        lui(T0, 1),
+        addi(T0, T0, 0xF),
+        sw(S0, T0, 0),
+        lui(T0, 8),
+        addi(T0, T0, 0x67),
+        sw(S0, T0, 4),
+        addi(S1, 0, calls),
+        // loop: call the stub, count the call
+        jalr(RA, S0),
+        addi(S2, S2, 1),
+        addi(S1, S1, -1),
+        bne(S1, 0, -12),
+        // exit(0)
+        addi(A7, 0, 93),
+        addi(A0, 0, 0),
+        ECALL,
+    ]);
+    run_decoding_guest(&program, free_decode_bytes, limit)
+}
+
 /// Rebuilding a stale execute segment copies and decodes the whole
-/// executable area. It's charged per byte (beyond a free allowance; not
-/// C++), so a FENCE.I loop over a large area runs into a small instruction
-/// limit after a rebuild instead of decoding megabytes per guest
-/// instruction (security review finding 2).
+/// executable area. Past the free allowance (16 MiB by default; not C++)
+/// it's charged per byte, so a FENCE.I loop over a large area runs into a
+/// small instruction limit after a few rebuilds instead of decoding
+/// megabytes per guest instruction (security review finding 2).
 #[test]
 fn stale_segment_rebuilds_count_towards_the_instruction_limit() {
     const AREA: u64 = 4 << 20;
-    let (m, timed_out, calls) = rebuild_loop(AREA, 1000, 200);
+    let free = MachineOptions::default().free_decode_bytes;
+    assert_eq!(free, libriscv::FREE_DECODE_BYTES);
+    let (m, timed_out, calls) = rebuild_loop(AREA, 1000, free, 200);
     assert!(timed_out);
-    // The first call creates the segment and rebuilds it: charged
-    // (4 MiB - 1 MiB allowance) / 4, far beyond the limit.
-    assert!(calls <= 1, "{calls} calls");
-    assert!(m.instruction_counter() >= (AREA - (1 << 20)) / 4);
+    // The first call decodes twice, each further one once: the allowance
+    // is used up during the third call, the fourth is charged far beyond
+    // the limit.
+    assert!(calls <= free / AREA, "{calls} calls");
+    assert!(m.instruction_counter() >= AREA / 4);
 }
 
-/// The exact charge: the first 1 MiB rebuilt is free (counts stay those of
-/// C++), every further byte costs a quarter instruction, as
+/// The exact charge: the allowance is free (counts stay those of C++),
+/// every further byte costs a quarter instruction, as
 /// `flush_execute_segments` charges.
 #[test]
-fn stale_segment_rebuild_charge_is_a_quarter_instruction_per_byte() {
+fn segment_decodes_past_the_allowance_cost_a_quarter_instruction_per_byte() {
     const AREA: u64 = 64 << 10;
     let run = |calls| {
-        let (m, timed_out, made) = rebuild_loop(AREA, calls, u64::MAX >> 1);
+        let (m, timed_out, made) = rebuild_loop(AREA, calls, 16 * AREA, u64::MAX >> 1);
         assert!(!timed_out);
         assert_eq!(made, u64::try_from(calls).unwrap());
         m.instruction_counter()
     };
-    // 16 calls rebuild 16 times: exactly the 1 MiB allowance, so the 16th
-    // rebuild is free and the 17th is charged.
-    let free = run(16);
-    let per_call = free - run(15);
+    // 15 calls decode 16 times: exactly the allowance, so the 16th decode
+    // is free and the 17th is charged.
+    let free = run(15);
+    let per_call = free - run(14);
     assert!(per_call < 10, "{per_call} instructions per call");
-    assert_eq!(run(17), free + per_call + AREA / 4);
-    assert_eq!(run(20), free + 4 * (per_call + AREA / 4));
+    assert_eq!(run(16), free + per_call + AREA / 4);
+    assert_eq!(run(19), free + 4 * (per_call + AREA / 4));
+}
+
+/// New segments count too: a guest mapping fresh code (each time at the
+/// next address), jumping to it and unmapping it again, in a loop, is
+/// charged for each decode past the allowance, whether or not unmapping
+/// evicts the segment.
+#[test]
+fn new_segments_count_towards_the_instruction_limit() {
+    const AREA: u64 = 1 << 20;
+    const S3: u32 = 19;
+    let area_pages = u32::try_from(AREA / PAGE_SIZE).unwrap();
+    let program = |iterations| {
+        let mut program = vec![addi(S1, 0, iterations), lui(S3, 0x100)];
+        // mmap(s3, area, RWX, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED)
+        let mut body = mmap_rwx(0, AREA, 0x32).to_vec();
+        body[1] = addi(A0, S3, 0);
+        body.extend([
+            addi(S0, A0, 0),
+            // ret
+            lui(T0, 8),
+            addi(T0, T0, 0x67),
+            sw(S0, T0, 0),
+            jalr(RA, S0),
+            addi(S2, S2, 1),
+            // munmap(s0, area)
+            addi(A7, 0, 215),
+            addi(A0, S0, 0),
+            lui(A1, area_pages),
+            ECALL,
+            // s3 += area
+            lui(T0, area_pages),
+            (S3 << 15) | (T0 << 20) | (S3 << 7) | 0x33,
+            addi(S1, S1, -1),
+        ]);
+        let back = -4 * i32::try_from(body.len()).unwrap();
+        program.extend(body);
+        program.extend([bne(S1, 0, back), addi(A7, 0, 93), addi(A0, 0, 0), ECALL]);
+        program
+    };
+    // No allowance: the first jump is charged far beyond the limit.
+    let (m, timed_out, calls) = run_decoding_guest(&program(100), 0, 1000);
+    assert!(timed_out);
+    assert_eq!(calls, 0);
+    assert!(m.instruction_counter() >= AREA / 4);
+    // Past the allowance, each new segment is charged.
+    let count = |free| {
+        let (m, timed_out, calls) = run_decoding_guest(&program(8), free, 1 << 30);
+        assert!(!timed_out);
+        assert_eq!(calls, 8);
+        m.instruction_counter()
+    };
+    let free = count(8 * AREA);
+    assert!(free < 1000, "{free}");
+    assert_eq!(count(5 * AREA), free + 3 * (AREA / 4));
 }
 
 /// A huge charge saturates the counter instead of wrapping it around to a

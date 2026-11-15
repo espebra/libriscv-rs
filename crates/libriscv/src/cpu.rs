@@ -23,27 +23,18 @@ pub struct Cpu {
     pub(crate) exec: Arc<DecodedSegment>,
     /// Guards against no-progress execute segment rebuild loops.
     stale_restart_pc: u64,
-    /// Bytes stale segments may still be rebuilt from without a charge
-    /// (see [`FREE_REBUILD_BYTES`]).
-    free_rebuild_bytes: u64,
+    /// Bytes execute segments may still be decoded from at runtime without
+    /// a charge (`MachineOptions::free_decode_bytes`).
+    free_decode_bytes: u64,
 }
 
-/// Rebuilding a stale execute segment copies, hashes and decodes the whole
-/// executable area around the PC, which a guest can force with a FENCE.I and
-/// a jump. Unlike C++, every rebuilt byte beyond this allowance per machine is
-/// charged as instructions (`len / 4`, as `flush_execute_segments` does), so
-/// rebuild loops run into the instruction limit. The allowance keeps the
-/// counts of programs that rebuild a little code now and then (a guest that
-/// generates code once, the `runtime_code` difftest) identical to C++.
-pub(crate) const FREE_REBUILD_BYTES: u64 = 1 << 20;
-
 impl Cpu {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(free_decode_bytes: u64) -> Self {
         Self {
             regs: Registers::default(),
             exec: Arc::new(DecodedSegment::empty()),
             stale_restart_pc: u64::MAX,
-            free_rebuild_bytes: FREE_REBUILD_BYTES,
+            free_decode_bytes,
         }
     }
 
@@ -55,7 +46,7 @@ impl Cpu {
             regs: self.regs.clone(),
             exec: Arc::clone(&self.exec),
             stale_restart_pc: self.stale_restart_pc,
-            free_rebuild_bytes: self.free_rebuild_bytes,
+            free_decode_bytes: self.free_decode_bytes,
         }
     }
 
@@ -173,9 +164,9 @@ impl Machine {
     /// `pc`, the way code mapped at runtime (by a dynamic linker, a JIT or
     /// FENCE.I-style self-modification) becomes executable. Anything else
     /// is an execute fault. Returns the PC to continue at and the
-    /// instructions to charge for rebuilding a stale segment (not C++, see
-    /// [`FREE_REBUILD_BYTES`]); the caller adds them to its counter and
-    /// checks the limit.
+    /// instructions to charge for decoding a segment (not C++, see
+    /// [`MachineOptions::free_decode_bytes`](crate::MachineOptions::free_decode_bytes));
+    /// the caller adds them to its counter and checks the limit.
     pub(crate) fn next_execute_segment(&mut self, pc: u64) -> Result<(u64, u64)> {
         if let Some(segment) = self.memory.exec_segment_ref(pc)
             && !segment.is_stale()
@@ -212,7 +203,6 @@ impl Machine {
         #[cfg(not(feature = "jit"))]
         let rebuilt_from: Option<Arc<DecodedSegment>> = None;
         // Evict stale execute segments.
-        let rebuild = found.is_some();
         if let Some(segment) = found {
             // If we already rebuilt for this exact PC and it's stale again,
             // trap instead of spinning forever.
@@ -240,17 +230,13 @@ impl Machine {
         if !segment.is_stale() {
             self.cpu.stale_restart_pc = u64::MAX;
         }
-        // Brand-new segments aren't charged: without an eviction there can
-        // be at most `MAX_EXECUTE_SEGS` of them, and dynamic executables
-        // create theirs (ld.so mapping libraries) with C++'s counts.
-        let mut charge = 0;
-        if rebuild {
-            let bytes = code.len() as u64;
-            let free = bytes.min(self.cpu.free_rebuild_bytes);
-            self.cpu.free_rebuild_bytes -= free;
-            charge = (bytes - free) / 4;
-        }
-        Ok((pc, charge))
+        // Charge the decoded bytes past the free allowance (new segments
+        // and rebuilds alike): a quarter instruction per byte, as
+        // `flush_execute_segments` charges.
+        let bytes = code.len() as u64;
+        let free = bytes.min(self.cpu.free_decode_bytes);
+        self.cpu.free_decode_bytes -= free;
+        Ok((pc, (bytes - free) / 4))
     }
 
     /// A jump out of the current segment to a STOP that begins a block of

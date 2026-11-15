@@ -109,8 +109,8 @@ pub(crate) struct DispatchState {
 struct Slice {
     end: u64,
     max: u64,
-    /// Instructions charged for segment rebuilds during the slice: they
-    /// don't make deferred compilations hot (a rebuild of a large area
+    /// Instructions charged for segment decodes during the slice: they
+    /// don't make deferred compilations hot (a decode of a large area
     /// mustn't get itself compiled by its own charge).
     charged: u64,
 }
@@ -1013,7 +1013,7 @@ impl Machine {
         if !(pc >= self.cpu.exec.exec_begin() && pc < self.cpu.exec.exec_end()) {
             let charge;
             (pc, charge) = self.next_execute_segment(pc)?;
-            if self.charge_rebuild(&mut c, charge) {
+            if self.charge_decode(&mut c, charge) {
                 return Ok((c, pc));
             }
         }
@@ -1049,7 +1049,7 @@ impl Machine {
                     }
                     let charge;
                     (pc, charge) = self.next_execute_segment(self.dispatch.pc)?;
-                    if self.charge_rebuild(&mut c, charge) {
+                    if self.charge_decode(&mut c, charge) {
                         return Ok((c, pc));
                     }
                     // The new segment may be compiling in the background.
@@ -1069,10 +1069,10 @@ impl Machine {
         }
     }
 
-    /// Charge a segment rebuild (`next_execute_segment`; not C++, see
-    /// `FREE_REBUILD_BYTES`). True if that reaches the chain's limit: the
+    /// Charge a segment decode (`next_execute_segment`; not C++, see
+    /// `MachineOptions::free_decode_bytes`). True if that reaches the chain's limit: the
     /// dispatcher then halts before the new block, as at a limit check.
-    fn charge_rebuild(&mut self, c: &mut Counter, charge: u64) -> bool {
+    fn charge_decode(&mut self, c: &mut Counter, charge: u64) -> bool {
         if charge == 0 {
             return false;
         }

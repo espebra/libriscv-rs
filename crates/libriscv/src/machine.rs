@@ -142,7 +142,7 @@ impl Machine {
         }
         let (memory, first_segment) = Memory::new(Arc::from(binary), &options)?;
         let mut machine = Self {
-            cpu: Cpu::new(),
+            cpu: Cpu::new(options.free_decode_bytes),
             memory,
             counter: 0,
             max_counter: 0,

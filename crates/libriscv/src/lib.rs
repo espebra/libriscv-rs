@@ -132,6 +132,11 @@ pub use syscalls::fds::{FileDescriptors, IoctlFilter, OpenFile, PathFilter, Stat
 pub use threads::{MAIN_THREAD_TID, MultiThreading, Thread};
 pub use vmcall::{ArgRegs, CallTarget, OnStack, VmCallArg, VmCallArgs};
 
+/// The default [`MachineOptions::free_decode_bytes`]: 16 MiB, several
+/// times the code a dynamic glibc program maps (`ld.so`, `libc`,
+/// `libstdc++`, `libm` and `libgcc_s` have about 4 MiB of text on riscv64).
+pub const FREE_DECODE_BYTES: u64 = 16 << 20;
+
 /// The default [`MachineOptions::jit_background_slice`].
 pub const JIT_BACKGROUND_SLICE: u64 = 1 << 20;
 

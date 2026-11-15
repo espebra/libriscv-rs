@@ -43,6 +43,17 @@ pub struct MachineOptions {
     /// `jit_background_slice` instructions, checking for finished code in
     /// between. Short-lived programs are better off without the JIT.
     pub jit_background: bool,
+    /// Bytes of execute segments the machine may decode at runtime for
+    /// free: segments for code mapped while running (a dynamic linker
+    /// loading libraries, a guest JIT) and rebuilds of stale segments
+    /// (FENCE.I after rewriting code). Each decode copies, hashes and
+    /// decodes the whole executable area around the jump target; past the
+    /// allowance it's charged a quarter instruction per byte, so a guest
+    /// forcing decodes in a loop runs into the instruction limit. C++ never
+    /// charges, so instruction counts match C++ only while within the
+    /// allowance. Segments made at load or with `init_execute_area` don't
+    /// count.
+    pub free_decode_bytes: u64,
     /// Instructions between checks for finished background compilations
     /// (at least 1). Smaller slices switch to native code sooner.
     pub jit_background_slice: u64,
@@ -184,6 +195,7 @@ impl Default for MachineOptions {
             preserve_vector_registers: true,
             jit: false,
             jit_background: false,
+            free_decode_bytes: crate::FREE_DECODE_BYTES,
             jit_background_slice: crate::JIT_BACKGROUND_SLICE,
             jit_automatic_nbit_address_space: false,
             jit_ignore_instruction_limit: false,
