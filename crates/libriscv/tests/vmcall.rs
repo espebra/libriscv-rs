@@ -463,6 +463,81 @@ fn vm_call_and_preemption() {
     vm_call_and_preemption_in(machine(&build(PREEMPT_PROGRAM)));
 }
 
+/// A guest whose `work` calls the host with an inline dyncall (system call
+/// 500, one input, one output) while its own stack frame is live.
+const DYNCALL_PREEMPT_PROGRAM: &str = r#"
+	static inline long host(long x) {
+		register long a0 __asm__("a0") = x;
+		__asm__ volatile (".insn i 0x5b, 7, x17, x25, 500" : "+r"(a0) :: "memory");
+		return a0;
+	}
+
+	/* Scribbles over a stack frame of its own. */
+	__attribute__((used, retain, noinline))
+	long callback(long x) {
+		volatile long buf[16];
+		for (int i = 0; i < 16; i++) buf[i] = x * i;
+		long s = 0;
+		for (int i = 0; i < 16; i++) s += buf[i];
+		return s;
+	}
+
+	__attribute__((noinline))
+	long work(long n) {
+		volatile long locals[8];
+		for (int i = 0; i < 8; i++) locals[i] = n + i;
+		long s = host(n);
+		for (int i = 0; i < 8; i++) s += locals[i] * (i + 1);
+		return s;
+	}
+
+	int main() {
+		long t = 0;
+		for (long i = 0; i < 300; i++) t += work(i);
+		return (int)(t % 1000003);
+	}"#;
+
+/// Preempt into `callback` from the dyncall, and return its result + 1.
+fn dyncall_preempt_handler(m: &mut Machine) -> libriscv::Result<()> {
+    let func = m.address_of("callback").unwrap();
+    let r = m.preempt(15_000, func, m.sysarg(0))?;
+    m.set_result(r.wrapping_add(1));
+    Ok(())
+}
+
+/// A handler can preempt into the guest from a dyncall in the JIT, which
+/// calls handlers from native code: the callback's frame goes below the
+/// caller's live one (the dyncall publishes `sp`), and the JIT re-entered
+/// on the same machine leaves everything as the interpreter does.
+#[test]
+fn preemption_from_a_dyncall_matches_the_interpreter() {
+    if !testutil::need_compiler() {
+        return;
+    }
+    let binary = build(DYNCALL_PREEMPT_PROGRAM);
+    let run = |jit: bool| {
+        let mut m = machine_with(
+            &binary,
+            MachineOptions {
+                jit,
+                ..Default::default()
+            },
+        );
+        m.install_syscall_handler(500, dyncall_preempt_handler);
+        m.simulate(MAX_INSTRUCTIONS).unwrap();
+        (m.return_value(), m.instruction_counter())
+    };
+    let expected = run(false);
+    // sum over n of (callback(n) + 1) + sum of (n + i) * (i + 1)
+    let sum: i64 = (0..300i64)
+        .map(|n| 120 * n + 1 + (0..8).map(|i| (n + i) * (i + 1)).sum::<i64>())
+        .sum();
+    assert_eq!(expected.0 as i64, sum % 1_000_003);
+    if cfg!(feature = "jit") {
+        assert_eq!(run(true), expected);
+    }
+}
+
 #[test]
 fn vm_call_and_stop_instruction() {
     if !testutil::need_compiler() {

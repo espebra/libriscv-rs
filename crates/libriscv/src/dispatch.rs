@@ -450,6 +450,7 @@ pub(crate) extern "rust-preserve-none" fn syscall(
 }
 
 /// What [`run_dyncall`] leaves behind.
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct DyncallDone {
     /// The counter and limit after the handler, the dyncall's block counted.
     pub c: Counter,
@@ -477,18 +478,43 @@ pub(crate) fn run_dyncall(
     c: Counter,
     counts: bool,
 ) -> std::result::Result<DyncallDone, Exit> {
+    match call_dyncall(m, pc, ins, c) {
+        Ok((c, touched)) => Ok(dyncall_done(exec, pc, c, touched, counts)),
+        Err(err) => Err(fault(m, err)),
+    }
+}
+
+/// The handler part of [`run_dyncall`]: the counter and limit after it,
+/// and whether it stopped or penalized the machine, or changed its limit.
+/// The JIT's host call (see `jit::run`).
+#[inline]
+pub(crate) fn call_dyncall(
+    m: &mut Machine,
+    pc: u64,
+    ins: u32,
+    c: Counter,
+) -> Result<(Counter, bool)> {
     let visible_max = m.dispatch.visible_max(c.max);
     m.cpu.regs.pc = pc;
     m.counter = c.value;
     m.max_counter = visible_max;
-    if let Err(err) = m.system_call(crate::Dyncall::index(ins)) {
-        return Err(fault(m, err));
-    }
+    m.system_call(crate::Dyncall::index(ins))?;
     let touched = m.counter != c.value || m.max_counter != visible_max;
     let c = Counter {
         value: m.counter,
         max: chain_max(m),
     };
+    Ok((c, touched))
+}
+
+/// The rest of [`run_dyncall`], after the dyncall at `pc` left `c`.
+pub(crate) fn dyncall_done(
+    exec: &DecodedSegment,
+    pc: u64,
+    c: Counter,
+    touched: bool,
+    counts: bool,
+) -> DyncallDone {
     let ends_block = exec
         .cache
         .get(exec.index(pc))
@@ -501,7 +527,7 @@ pub(crate) fn run_dyncall(
         c.value
             .wrapping_sub(crate::native_code::block_icount(exec, pc.wrapping_add(4)))
     };
-    Ok(DyncallDone {
+    DyncallDone {
         c,
         halt_after: Counter {
             value: retired,
@@ -509,7 +535,7 @@ pub(crate) fn run_dyncall(
         },
         touched,
         ends_block,
-    })
+    }
 }
 
 /// A [`Dyncall`](crate::Dyncall) word: the system call numbered by its
@@ -702,7 +728,7 @@ pub(crate) extern "rust-preserve-none" fn native_enter(
     };
     let mut c = c;
     loop {
-        match jit.run(m, slot, entry_pc, before, c.max) {
+        let (pc, d) = match jit.run(exec, m, slot, entry_pc, before, c.max) {
             NativeExit::Halt { pc, counter } => {
                 return halt(
                     m,
@@ -762,50 +788,13 @@ pub(crate) extern "rust-preserve-none" fn native_enter(
                     value: counter,
                     max: c.max,
                 };
-                let d = match run_dyncall(exec, m, pc, exec.read_u32(pc), at_dyncall, counts) {
-                    Ok(d) => d,
+                match run_dyncall(exec, m, pc, exec.read_u32(pc), at_dyncall, counts) {
+                    Ok(d) => (pc, d),
                     Err(exit) => return exit,
-                };
-                c = d.c;
-                let next = pc.wrapping_add(4);
-                // As in the `dyncall` bytecode: the retired count decides.
-                if d.touched && d.halt_after.overflowed() {
-                    return halt(m, next, d.halt_after);
                 }
-                // The handler may have made the segment stale: leave it.
-                if exec.is_stale() {
-                    return leave_segment(m, next, c);
-                }
-                // The segment's last instruction in the 4-byte layout: its
-                // block ends only because the segment does, and it falls
-                // through into the padding entry after it, without
-                // counting it or checking the limit. (With compressed
-                // instructions the decoder makes that instruction invalid,
-                // so it is never compiled.)
-                if d.ends_block && !exec.is_within(next, 2) {
-                    execute!(exec, cache, exec.index(next), m, pc, c)
-                }
-                // A forced block end checks the limit before the next
-                // block. In the middle of a block, the limit is only
-                // checked at its end, so the block's count crossing it is
-                // no reason to stop here.
-                if d.ends_block && c.overflowed() {
-                    return halt(m, next, d.halt_after);
-                }
-                let si = exec.index(next);
-                if exec.is_within(next, 2) && jit.has_entry(si) {
-                    (slot, entry_pc, before) = (si, next, d.halt_after.value);
-                    continue;
-                }
-                if d.ends_block {
-                    begin_block!(exec, cache, si, m, next, c)
-                }
-                // Finish the block in the interpreter, as after EXIT_SLOW.
-                let e = entry!(exec, cache, si, m, next, c);
-                let handler = jit.original_handler(si).unwrap_or(e.handler);
-                let block_pc = next.wrapping_add(e.block_bytes());
-                become handler(exec, cache, si, m, c, e.instr, block_pc)
             }
+            // The JIT ran it, and couldn't go on after it.
+            NativeExit::Dyncalled { pc, done } => (pc, done),
             NativeExit::Fault(err) => return fault(m, err),
             NativeExit::Unavailable if slot == i => {
                 let handler = jit.original_handler(i).unwrap_or(e.handler);
@@ -818,7 +807,46 @@ pub(crate) extern "rust-preserve-none" fn native_enter(
                 let block_pc = entry_pc.wrapping_add(e.block_bytes());
                 become handler(exec, cache, slot, m, c, e.instr, block_pc)
             }
+        };
+        c = d.c;
+        let next = pc.wrapping_add(4);
+        // As in the `dyncall` bytecode: the retired count decides.
+        if d.touched && d.halt_after.overflowed() {
+            return halt(m, next, d.halt_after);
         }
+        // The handler may have made the segment stale: leave it.
+        if exec.is_stale() {
+            return leave_segment(m, next, c);
+        }
+        // The segment's last instruction in the 4-byte layout: its
+        // block ends only because the segment does, and it falls
+        // through into the padding entry after it, without
+        // counting it or checking the limit. (With compressed
+        // instructions the decoder makes that instruction invalid,
+        // so it is never compiled.)
+        if d.ends_block && !exec.is_within(next, 2) {
+            execute!(exec, cache, exec.index(next), m, pc, c)
+        }
+        // A forced block end checks the limit before the next
+        // block. In the middle of a block, the limit is only
+        // checked at its end, so the block's count crossing it is
+        // no reason to stop here.
+        if d.ends_block && c.overflowed() {
+            return halt(m, next, d.halt_after);
+        }
+        let si = exec.index(next);
+        if exec.is_within(next, 2) && jit.has_entry(si) {
+            (slot, entry_pc, before) = (si, next, d.halt_after.value);
+            continue;
+        }
+        if d.ends_block {
+            begin_block!(exec, cache, si, m, next, c)
+        }
+        // Finish the block in the interpreter, as after EXIT_SLOW.
+        let e = entry!(exec, cache, si, m, next, c);
+        let handler = jit.original_handler(si).unwrap_or(e.handler);
+        let block_pc = next.wrapping_add(e.block_bytes());
+        become handler(exec, cache, si, m, c, e.instr, block_pc)
     }
 }
 

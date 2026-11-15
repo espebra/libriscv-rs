@@ -220,12 +220,15 @@ pub(crate) enum Cond {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JOp {
     Nop,
-    /// A valid [`Dyncall`](crate::Dyncall) word: leave native code to run
-    /// the machine's custom instruction handler with the exact PC and
-    /// counter (C++ asmjit `emit_dyncall` / `execute_counted_dyncall`).
-    /// Native code continues at the next instruction, which is always an
-    /// entry point.
-    Dyncall,
+    /// A valid [`Dyncall`](crate::Dyncall) word: run the system call it
+    /// names with the exact PC and counter (C++ asmjit `emit_dyncall` /
+    /// `execute_counted_dyncall`). The JIT calls the host from native code;
+    /// AOT code leaves for it, and continues at the next instruction,
+    /// which is always an entry point. What it reads and writes is
+    /// [`calls::dyncall_regs`](super::calls::dyncall_regs).
+    Dyncall {
+        word: u32,
+    },
     /// FENCE: a full barrier, like the interpreter.
     Fence,
     /// `rd = value`, without reading any register.
@@ -642,7 +645,9 @@ pub(crate) fn classify(i: Instr, pc: u64) -> Option<JOp> {
         // FENCE.I can make segments stale, and CBO writes memory: both stay
         // in the interpreter.
         FENCE if it.funct3() == 0 => Some(JOp::Fence),
-        crate::Dyncall::OPCODE if crate::Dyncall::valid(i.whole()) => Some(JOp::Dyncall),
+        crate::Dyncall::OPCODE if crate::Dyncall::valid(i.whole()) => {
+            Some(JOp::Dyncall { word: i.whole() })
+        }
         // F and D are compiled when the interpreter has them, and without
         // NaN-boxing (the `debug-checks` build boxes single-precision values).
         #[cfg(all(feature = "ext-f", not(feature = "debug-checks")))]
@@ -1067,9 +1072,9 @@ pub(crate) fn operands(op: JOp) -> Operands {
         ..Default::default()
     };
     match op {
-        // The handler reads and writes the register file: everything the
-        // region wrote is stored on the way out, and reloaded on re-entry.
-        JOp::Nop | JOp::Fence | JOp::Dyncall => Operands::default(),
+        // A dyncall's registers are more than an instruction's: see
+        // `calls::dyncall_regs`.
+        JOp::Nop | JOp::Fence | JOp::Dyncall { .. } => Operands::default(),
         JOp::Const { rd, .. } => int([None, None], Some(rd)),
         JOp::AluImm { rd, rs1, .. } | JOp::Unary { rd, rs1, .. } => {
             int([Some(rs1), None], Some(rd))

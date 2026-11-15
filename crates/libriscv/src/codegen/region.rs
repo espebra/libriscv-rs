@@ -349,7 +349,7 @@ fn form_regions(exec: &DecodedSegment, a: &mut Analysis) {
                 let is_direct_target = jalr == Some(t)
                     || matches!(ins.op, JOp::Branch { target, .. } | JOp::Jal { target, .. } if target == t);
                 // Native code leaves at a dyncall and comes back after it.
-                let after_dyncall = matches!(ins.op, JOp::Dyncall);
+                let after_dyncall = matches!(ins.op, JOp::Dyncall { .. });
                 if Some(r) != own || is_direct_target || after_dyncall {
                     extra.push((r, t));
                 }

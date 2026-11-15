@@ -34,12 +34,42 @@ pub(crate) struct Summary {
     pub writes: RegSet,
 }
 
+/// The registers the handler of the dyncall `word` may read and write:
+/// the argument registers its counts promise (C++ asmjit `emit_dyncall`:
+/// `a0..` inputs and outputs, and `fa0-fa7` in, `fa0-fa1` out unless the
+/// word promises no FP access), and `sp`, so that a handler can make a VM
+/// call on the guest's stack. Native code keeps every other register
+/// where it is during the call, so a handler that reads or writes others
+/// sees (or leaves) what the register file last held.
+pub(crate) fn dyncall_regs(word: u32) -> (RegSet, RegSet) {
+    use crate::Dyncall;
+    const SP: u32 = 2;
+    const A0: u32 = 10;
+    const FA0: u32 = 32 + 10;
+    let run = |first: u32, n: u32| ((1u64 << n) - 1) << first;
+    let (mut reads, mut writes) = (
+        run(A0, Dyncall::inputs(word)) | 1 << SP,
+        run(A0, Dyncall::outputs(word)),
+    );
+    if Dyncall::floats(word) {
+        reads |= run(FA0, Dyncall::MAX_INPUTS);
+        writes |= run(FA0, Dyncall::MAX_OUTPUTS);
+    }
+    (reads, writes)
+}
+
 /// The registers region `r` uses and writes (`x0` excluded). A
 /// single-precision FP write keeps the upper half, so it reads it too.
 pub(crate) fn region_regs(a: &Analysis, r: RegionId) -> Option<(RegSet, RegSet)> {
     let (mut used, mut written) = (0u64, 0u64);
     for &i in &a.regions.get(r)?.insns {
-        let u = operands(a.insns.get(i)?.op);
+        let op = a.insns.get(i)?.op;
+        if let JOp::Dyncall { word } = op {
+            let (reads, writes) = dyncall_regs(word);
+            used |= reads | writes;
+            written |= writes;
+        }
+        let u = operands(op);
         for s in u.x.into_iter().flatten().filter(|&s| s & 31 != 0) {
             used |= 1 << (s & 31);
         }

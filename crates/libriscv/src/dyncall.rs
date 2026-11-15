@@ -17,11 +17,18 @@
 //! with the counts as the guest's promise of which argument registers the
 //! handler reads and writes: an ECALL without `a7`, which never changes PC
 //! (it is never clone-like or an exit), so it doesn't end its block. The
-//! interpreter (the `dispatch::dyncall` bytecode) and the JIT (which leaves
-//! native code for it) both publish the PC, instruction counter and limit
-//! to the handler, and a stop or penalty takes effect right after it, with
-//! the exact count. Indices beyond the system call table go to the
+//! interpreter (the `dispatch::dyncall` bytecode) and the JIT (which calls
+//! the handler from native code) both publish the PC, instruction counter
+//! and limit to the handler, and a stop or penalty takes effect right after
+//! it, with the exact count. Indices beyond the system call table go to the
 //! unhandled system call callback.
+//!
+//! The JIT relies on the promise (as C++ asmjit does): around the call it
+//! synchronizes only the promised argument registers, `fa0-fa7` in and
+//! `fa0-fa1` out unless [`floats`](Dyncall::floats) is clear, and `sp`
+//! (so that a handler can preempt into the guest). A handler that reads
+//! or writes other registers sees, or leaves, whatever the register file
+//! held last, which under the JIT may differ from the interpreter.
 //!
 //! Not in C++, where a dyncall is a custom instruction whose handler the
 //! decoder hook picks, and only asmjit publishes the counter to it
@@ -93,8 +100,7 @@ impl Dyncall {
     /// Synchronize fa0-fa7 inputs and fa0-fa1 outputs. Clearing the bit
     /// promises no guest FP register access by the handler. The embedder
     /// must validate that promise; legacy and existing counted words retain
-    /// FP. (The Rust JIT leaves native code for a dyncall with every
-    /// register stored, so it doesn't rely on the promise.)
+    /// FP. (The JIT relies on it: see [`Dyncall`]'s module docs.)
     pub const fn floats(word: u32) -> bool {
         !Self::is_counted(word) || (word & Self::FLOAT_MASK) != 0
     }

@@ -53,7 +53,8 @@
 //! arena's over-allocation of the first one instead, which lets accesses
 //! near the window edges through; this keeps the interpreter's results.) Besides other region functions, it
 //! only calls the pure floating-point helpers below (Cranelift's libcalls
-//! for rounding and FMA on hosts without SSE4.1 or FMA).
+//! for rounding and FMA on hosts without SSE4.1 or FMA), and the host
+//! call in the state block, for dyncalls (see `RegionEmitter::dyncall`).
 //!
 //! # Floating point
 //!
@@ -225,6 +226,7 @@ pub(crate) fn build_fingerprint() -> Option<u64> {
             JitState::OFFSET_COUNTER,
             JitState::OFFSET_EXIT_PC,
             JitState::OFFSET_EXIT_KIND,
+            JitState::OFFSET_HOST_CALL,
         ] {
             text.push_str(&format!(" {offset}"));
         }
@@ -288,6 +290,15 @@ fn tail_signature() -> Signature {
     for _ in 0..2 {
         sig.returns.push(AbiParam::new(I64));
     }
+    sig
+}
+
+/// The host call's signature (`libriscv_jit_rt::HostCallFn`): `(state,
+/// arg, pc, counter) -> leave`, the platform's C calling convention.
+fn host_signature(isa: &OwnedTargetIsa) -> Signature {
+    let mut sig = Signature::new(isa.default_call_conv());
+    sig.params.extend([AbiParam::new(I64); 4]);
+    sig.returns.push(AbiParam::new(I64));
     sig
 }
 
@@ -735,8 +746,13 @@ struct RegionEmitter<'a, 'f> {
     /// the native caller (a guest return, or on after a callee that left
     /// for the host: `DONE`).
     ret: Option<Block>,
+    /// The block leaving after a host call that said so (see
+    /// [`Self::dyncall`]).
+    host_exit: Option<Block>,
     funcs: HashMap<RegionId, FuncRef>,
     tail_sig: SigRef,
+    /// The host call's signature: `JitState::host_call`.
+    host_sig: SigRef,
     /// The native calls in progress (see [`DEPTH`]).
     depth: Value,
     /// Every region's [`Summary`].
@@ -786,6 +802,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
         let fregs: [Variable; 32] = std::array::from_fn(|_| b.declare_var(I64));
         let counter = b.declare_var(I64);
         let tail_sig = b.import_signature(tail_signature());
+        let host_sig = b.import_signature(host_signature(isa));
 
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
@@ -846,8 +863,10 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
             xfer: HashMap::new(),
             indirect: None,
             ret: None,
+            host_exit: None,
             funcs: HashMap::new(),
             tail_sig,
+            host_sig,
             depth,
             summaries,
             used_set,
@@ -1184,6 +1203,14 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
             self.b.ins().return_(&p);
         }
 
+        if let Some(blk) = self.host_exit {
+            self.b.switch_to_block(blk);
+            self.store_regs();
+            let done = self.b.ins().iconst(I64, DONE as i64);
+            let counter = self.count();
+            self.b.ins().return_(&[done, counter]);
+        }
+
         if let Some(blk) = self.indirect {
             self.b.switch_to_block(blk);
             let p = self.b.block_params(blk).to_vec();
@@ -1376,12 +1403,10 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
         let next = ins.pc.wrapping_add(ins.len);
         match ins.op {
             JOp::Nop => {}
-            JOp::Dyncall => {
-                // Leave with every register stored and the block counted;
-                // the dispatcher runs the handler and re-enters at `next`.
-                let c = self.count();
-                self.leave(EXIT_DYNCALL, ins.pc, c);
-                return Some(false);
+            JOp::Dyncall { word } => {
+                if !self.dyncall(word, ins.pc) {
+                    return Some(false);
+                }
             }
             JOp::Fence => {
                 self.b.ins().fence();
@@ -1945,19 +1970,60 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
         self.native_call_body(Callee::Indirect(func), target, !0, !0, next);
     }
 
-    /// The call itself, for a callee that may read `reads` and write
-    /// `writes`: on return to `next`, enters `next`.
-    fn native_call_body(
-        &mut self,
-        callee: Callee,
-        target: Value,
-        reads: RegSet,
-        writes: RegSet,
-        next: u64,
-    ) {
-        let (store, load) = (self.written_set & reads, self.used_set & writes);
+    /// The dyncall `word` at `pc` (C++ asmjit `emit_dyncall`), in the
+    /// middle of its block (already counted): store the registers its
+    /// handler may read, make the host call (`jit::JitHost`, which runs the
+    /// handler with the exact PC and counter), and reload the counter and
+    /// the registers the handler may write. If the host says so, leave
+    /// with the exit it left in the state block; otherwise go on (returns
+    /// true). A dyncall that ends its block (rare: the segment's last
+    /// instruction, or an over-long block forced to end there) leaves
+    /// with every register stored instead, and the dispatcher runs it
+    /// (`EXIT_DYNCALL`).
+    fn dyncall(&mut self, word: u32, pc: u64) -> bool {
+        let ends_block = self
+            .exec
+            .cache
+            .get(self.exec.index(pc))
+            .is_none_or(|e| e.block_bytes() == 0);
+        if ends_block {
+            let c = self.count();
+            self.leave(EXIT_DYNCALL, pc, c);
+            return false;
+        }
+        let (reads, writes) = calls::dyncall_regs(word);
+        self.store_set(self.written_set & reads);
+        let st = self.state;
+        let host_call = self
+            .b
+            .ins()
+            .load(I64, host_flags(), st, JitState::OFFSET_HOST_CALL);
+        let arg = self.b.ins().iconst(I64, i64::from(word));
+        let pc = self.b.ins().iconst(I64, pc as i64);
+        let c = self.count();
+        let call = self
+            .b
+            .ins()
+            .call_indirect(self.host_sig, host_call, &[st, arg, pc, c]);
+        let leave = self.b.inst_results(call).first().copied();
+        let counter = self
+            .b
+            .ins()
+            .load(I64, host_flags(), st, JitState::OFFSET_COUNTER);
+        self.b.def_var(self.counter, counter);
+        self.load_set(self.used_set & writes);
+        let Some(leave) = leave else { return false };
+        let exit = self.host_exit_block();
+        let cont = self.b.create_block();
+        self.b.ins().brif(leave, exit, &[], cont, &[]);
+        self.b.switch_to_block(cont);
+        true
+    }
+
+    /// Store the registers in `set` (`x0` excluded) to the register files.
+    fn store_set(&mut self, set: RegSet) {
         for n in 1..64u32 {
-            if store >> n & 1 == 0 {
+            if set >> n & 1 == 0 {
                 continue;
             }
             let (v, ptr) = if n < 32 {
@@ -1969,17 +2035,13 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                 .ins()
                 .store(host_flags(), v, ptr, ((n & 31) * 8) as i32);
         }
-        let c = self.count();
-        let depth = self.b.ins().iadd_imm_s(self.depth, 1);
-        let call_args = [self.state, target, c, depth];
-        let call = match callee {
-            Callee::Direct(func) => self.b.ins().call(func, &call_args),
-            Callee::Indirect(func) => self.b.ins().call_indirect(self.tail_sig, func, &call_args),
-        };
-        let results = self.b.inst_results(call).to_vec();
-        let &[ct, cc] = &results[..] else { return };
+    }
+
+    /// Reload the registers in `set` (`x0` excluded) from the register
+    /// files.
+    fn load_set(&mut self, set: RegSet) {
         for n in 1..64u32 {
-            if load >> n & 1 == 0 {
+            if set >> n & 1 == 0 {
                 continue;
             }
             let ptr = if n < 32 {
@@ -1991,15 +2053,47 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                 .b
                 .ins()
                 .load(I64, host_flags(), ptr, ((n & 31) * 8) as i32);
-            // The index is masked to 0..32, so it is always in bounds.
-            #[allow(clippy::indexing_slicing)]
-            let var = if n < 32 {
-                self.regs[(n & 31) as usize]
+            if n < 32 {
+                self.set_reg(n, v);
             } else {
-                self.fregs[(n & 31) as usize]
-            };
-            self.b.def_var(var, v);
+                self.set_freg(n - 32, v);
+            }
         }
+    }
+
+    /// The block leaving after a host call that said so: the registers
+    /// stored, and the exit as the host call left it in the state block.
+    fn host_exit_block(&mut self) -> Block {
+        if let Some(b) = self.host_exit {
+            return b;
+        }
+        let blk = self.b.create_block();
+        self.b.set_cold_block(blk);
+        self.host_exit = Some(blk);
+        blk
+    }
+
+    /// The call itself, for a callee that may read `reads` and write
+    /// `writes`: on return to `next`, enters `next`.
+    fn native_call_body(
+        &mut self,
+        callee: Callee,
+        target: Value,
+        reads: RegSet,
+        writes: RegSet,
+        next: u64,
+    ) {
+        self.store_set(self.written_set & reads);
+        let c = self.count();
+        let depth = self.b.ins().iadd_imm_s(self.depth, 1);
+        let call_args = [self.state, target, c, depth];
+        let call = match callee {
+            Callee::Direct(func) => self.b.ins().call(func, &call_args),
+            Callee::Indirect(func) => self.b.ins().call_indirect(self.tail_sig, func, &call_args),
+        };
+        let results = self.b.inst_results(call).to_vec();
+        let &[ct, cc] = &results[..] else { return };
+        self.load_set(self.used_set & writes);
         self.b.def_var(self.counter, cc);
         let at_next = self.b.ins().icmp_imm_s(IntCC::Equal, ct, next as i64);
         let cont = self.b.create_block();
