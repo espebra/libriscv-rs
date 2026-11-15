@@ -424,9 +424,11 @@ fn fmin_fmax_of_two_nans_is_canonical() {
 }
 
 /// The dyncall handlers of [`dyncall_machine`]: system call 500 leaves the
-/// counters alone, 501 also penalizes by one instruction.
+/// counters alone, 501 also penalizes by one instruction, 502 faults once
+/// `a1` has grown past 10000.
 const DYNCALL: u32 = 500;
 const PENALIZING_DYNCALL: u32 = 501;
+const FAULTING_DYNCALL: u32 = 502;
 
 fn dyncall_handler(m: &mut Machine) -> libriscv::Result<()> {
     let a1 = m.cpu.reg(11);
@@ -439,6 +441,17 @@ fn dyncall_machine(code: &[u8], jit: bool) -> Machine {
     m.install_syscall_handler(DYNCALL as usize, dyncall_handler);
     m.install_syscall_handler(PENALIZING_DYNCALL as usize, |m| {
         m.penalize(1);
+        dyncall_handler(m)
+    });
+    m.install_syscall_handler(FAULTING_DYNCALL as usize, |m| {
+        let a1 = m.cpu.reg(11);
+        if a1 > 10_000 {
+            return Err(libriscv::MachineError::new(
+                ExceptionKind::IllegalOperation,
+                "Handler fault",
+                a1,
+            ));
+        }
         dyncall_handler(m)
     });
     m
@@ -488,6 +501,55 @@ fn small_penalties_mid_block_halt_only_at_the_limit() {
     assert_ne!(last.regs[11], 0, "the handler didn't run");
 }
 
+/// A handler's fault leaves native code with the registers, PC and count
+/// the interpreter has.
+#[test]
+fn faulting_dyncalls_mid_block_match_the_interpreter() {
+    let last = compare_dyncalls(&mid_block_dyncalls(FAULTING_DYNCALL), "faulting dyncall");
+    assert_eq!(
+        last.result,
+        Err((ExceptionKind::IllegalOperation, last.regs[11]))
+    );
+}
+
+/// The way scripts call the host: a guest call to a function holding the
+/// dyncall and a `ret` (a native call into another region, whose caller
+/// keeps registers of its own), counted exactly at every limit, with and
+/// without a penalty.
+#[test]
+fn dyncalls_in_called_functions_match_the_interpreter() {
+    for number in [DYNCALL, PENALIZING_DYNCALL, FAULTING_DYNCALL] {
+        #[rustfmt::skip]
+        let program = [
+            itype(0x13, 0, 5, 0, 7),             // li t0, 7
+            rtype(0x33, 0, 0, 10, 10, 5),        // 1: add a0, a0, t0
+            jtype(1, 20),                        //    call stub
+            rtype(0x33, 0, 0, 12, 12, 10),       //    add a2, a2, a0
+            itype(0x13, 0, 5, 5, -1),            //    addi t0, t0, -1
+            btype(1, 5, 0, -16),                 //    bnez t0, 1b
+            jtype(0, 0),                         //    j .
+            Dyncall::encode(number, 2, 2, false), // stub: dyncall
+            itype(0x67, 0, 0, 1, 0),             //    ret
+        ];
+        let last = compare_dyncalls(&words(&program), "dyncall in a called function");
+        assert_ne!(last.regs[11], 0, "the handler didn't run");
+    }
+}
+
+/// A panic in a handler that native code called unwinds out of the run
+/// (it is caught at the host-call boundary, and resumed once native code
+/// has returned).
+#[test]
+fn panics_in_dyncall_handlers_reach_the_caller() {
+    let mut m = machine(&mid_block_dyncalls(504), true);
+    assert!(m.cpu.current_execute_segment().jit_entry_count() > 0);
+    m.install_syscall_handler(504, |_| panic!("handler panic"));
+    m.cpu.jump(V).unwrap();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| m.simulate(1000)));
+    let payload = r.expect_err("the panic reaches the caller");
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"handler panic"));
+}
+
 /// A loop with system call `number` as a dyncall in the middle of its block.
 fn mid_block_dyncalls(number: u32) -> Vec<u8> {
     let addi = itype(0x13, 0, 10, 10, 1); // addi a0, a0, 1
@@ -499,6 +561,72 @@ fn mid_block_dyncalls(number: u32) -> Vec<u8> {
     program.push(btype(1, 6, 0, -40)); // bnez t1, loop
     program.push(jtype(0, 0)); // j .
     words(&program)
+}
+
+/// System call 503 preempts into a function at [`PREEMPT_CALLBACK`] that
+/// spills its return address into a frame of its own, and returns to a
+/// STOP at [`PREEMPT_EXIT`].
+const PREEMPTING_DYNCALL: u32 = 503;
+const PREEMPT_CALLBACK: u64 = V + 0x38;
+const PREEMPT_EXIT: u64 = V + 0x4c;
+
+/// A handler preempting into the guest from a dyncall in a block that
+/// moved `sp` and stored in the new frame: the JIT calls handlers from
+/// native code, and must publish `sp` (preemption runs below it), or the
+/// callback's frame lands on the caller's.
+#[test]
+fn preemption_from_a_dyncall_uses_the_current_stack() {
+    let dyncall = Dyncall::encode(PREEMPTING_DYNCALL, 1, 1, false);
+    #[rustfmt::skip]
+    let program = [
+        itype(0x13, 0, 5, 0, 5),        // li t0, 5
+        itype(0x13, 0, 2, 2, -32),      // 1: addi sp, sp, -32
+        itype(0x13, 0, 6, 5, 0x55),     //    addi t1, t0, 0x55
+        stype(3, 2, 6, 0),              //    sd t1, 0(sp)
+        stype(3, 2, 6, 8),              //    sd t1, 8(sp)
+        dyncall,
+        itype(0x03, 3, 7, 2, 0),        //    ld t2, 0(sp)
+        itype(0x03, 3, 28, 2, 8),       //    ld t3, 8(sp)
+        rtype(0x33, 0, 0, 11, 11, 7),   //    add a1, a1, t2
+        rtype(0x33, 0, 0, 11, 11, 28),  //    add a1, a1, t3
+        itype(0x13, 0, 2, 2, 32),       //    addi sp, sp, 32
+        itype(0x13, 0, 5, 5, -1),       //    addi t0, t0, -1
+        btype(1, 5, 0, -44),            //    bnez t0, 1b
+        jtype(0, 0),                    //    j .
+        itype(0x13, 0, 2, 2, -16),      // PREEMPT_CALLBACK: addi sp, sp, -16
+        stype(3, 2, 1, 0),              //    sd ra, 0(sp)
+        stype(3, 2, 1, 8),              //    sd ra, 8(sp)
+        itype(0x13, 0, 2, 2, 16),       //    addi sp, sp, 16
+        itype(0x67, 0, 0, 1, 0),        //    ret
+        0x7ff0_0073,                    // PREEMPT_EXIT: stop
+        jtype(0, 0),                    //    (not the segment's last instruction)
+    ];
+    let code = words(&program);
+    let preempting = |jit: bool| {
+        let mut m = machine(&code, jit);
+        m.memory.set_exit_address(PREEMPT_EXIT);
+        m.install_syscall_handler(PREEMPTING_DYNCALL as usize, |m| {
+            m.preempt(1000, PREEMPT_CALLBACK, ())?;
+            Ok(())
+        });
+        m
+    };
+    let (mut interp, mut jit) = (preempting(false), preempting(true));
+    assert!(jit.cpu.current_execute_segment().jit_entry_count() > 0);
+    let mut regs = [0; 64];
+    regs[2] = SCRATCH + 0x1000;
+    for fuel in fuels() {
+        let expected = run(&mut interp, &regs, fuel);
+        let got = run(&mut jit, &regs, fuel);
+        assert!(
+            got == expected,
+            "fuel {fuel}:\n{}",
+            describe(&got, &expected)
+        );
+    }
+    let last = run(&mut interp, &regs, 100_000);
+    assert_eq!(last.result, Ok(false), "{last:?}");
+    assert_eq!(last.regs[11], (1..=5).map(|t| 2 * (t + 0x55)).sum::<u64>());
 }
 
 /// A dyncall as the segment's last instruction: in the 4-byte layout the

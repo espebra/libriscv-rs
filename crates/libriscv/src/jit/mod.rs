@@ -22,7 +22,7 @@
 pub(crate) mod cache;
 mod emit;
 
-use libriscv_jit_rt::{CodeMemory, JitState, MemoryLayout};
+use libriscv_jit_rt::{CodeMemory, Host, HostCall, HostParts, MemoryLayout};
 use std::sync::Arc;
 
 pub(crate) use emit::Compiled;
@@ -30,8 +30,10 @@ use emit::Image;
 
 use crate::codegen::region;
 use crate::decoder_cache::DecodedSegment;
+use crate::dispatch::{Counter, call_dyncall, dyncall_done};
+use crate::error::{ExceptionKind, MachineError};
 use crate::machine::Machine;
-use crate::native_code::{NativeCode, NativeExit, NativeSegment};
+use crate::native_code::{EXIT_HOST, NativeCode, NativeExit, NativeSegment};
 
 /// Compile `segment` (for the guest memory layout `layout`, see
 /// [`compile`]) on a new thread (`MachineOptions::jit_background`,
@@ -186,28 +188,109 @@ fn compile(exec: &DecodedSegment, layout: MemoryLayout) -> Option<Image> {
     emit::compile(exec, &analysis, layout)
 }
 
-/// Run the JIT code `code` of the current segment from the block starting
-/// at `pc` (decoder entry `slot`), with the counter as it was *before*
-/// beginning that block.
+/// Run the JIT code `code` of the current segment `exec` from the block
+/// starting at `pc` (decoder entry `slot`), with the counter as it was
+/// *before* beginning that block.
 pub(crate) fn run(
     code: &CodeMemory,
+    exec: &DecodedSegment,
     m: &mut Machine,
     slot: usize,
     pc: u64,
     counter: u64,
     max: u64,
 ) -> NativeExit {
-    let MemoryLayout { read, write, .. } = m.memory.native_layout();
-    let frm = u64::from(m.cpu.regs.fcsr().frm());
-    let (regs, fregs) = m.cpu.regs.x_f_mut();
-    let arena = m.memory.arena_mut();
-    let Some(mut state) = JitState::new(regs, fregs, arena, read, write, max, frm) else {
+    let counts = !code.layout().unlimited;
+    let mut host = JitHost {
+        m,
+        outcome: None,
+        exec,
+        counts,
+    };
+    let Some(exit) = code.enter(&mut host, slot, pc, counter, max) else {
         return NativeExit::Unavailable;
     };
-    if !code.enter(&mut state, slot, pc, counter) {
-        return NativeExit::Unavailable;
+    if exit.kind != EXIT_HOST {
+        return NativeExit::from_raw(exit.kind, exit.pc, exit.counter);
     }
-    NativeExit::from_raw(state.exit_kind, state.exit_pc, state.counter)
+    match host.outcome {
+        Some(Ok((c, touched))) => NativeExit::Dyncalled {
+            pc: exit.pc,
+            done: dyncall_done(exec, exit.pc, c, touched, counts),
+        },
+        Some(Err(err)) => NativeExit::Fault(err),
+        None => NativeExit::Fault(MachineError::trigger(
+            ExceptionKind::UnknownException,
+            exit.pc,
+        )),
+    }
+}
+
+/// The machine as JIT code sees it: its registers and arena, and the host
+/// calls it makes, which are dyncalls in the middle of their block (C++
+/// asmjit `emit_dyncall`; one that ends its block leaves native code
+/// instead, with `EXIT_DYNCALL`). The code stores the registers the
+/// dyncall promises the handler reads (`codegen::calls::dyncall_regs`) and
+/// calls [`Host::call`] with the dyncall word, which runs it as the
+/// dispatcher's dyncall exit does (`dispatch::run_dyncall`). The code goes
+/// on after it unless the handler faulted, stopped the machine (or
+/// penalized it to the limit) or made the segment stale: then it leaves
+/// with `EXIT_HOST`, and the dispatcher continues from `outcome` exactly
+/// as after the dyncall exit.
+struct JitHost<'m, 'e> {
+    m: &'m mut Machine,
+    /// The last dyncall's outcome: [`call_dyncall`]'s.
+    outcome: Option<crate::Result<(Counter, bool)>>,
+    exec: &'e DecodedSegment,
+    /// The code counts instructions (`MemoryLayout::unlimited` is false).
+    counts: bool,
+}
+
+impl Host for JitHost<'_, '_> {
+    #[inline]
+    fn parts(&mut self) -> HostParts<'_> {
+        let MemoryLayout { read, write, .. } = self.m.memory.native_layout();
+        let frm = u64::from(self.m.cpu.regs.fcsr().frm());
+        let (regs, fregs) = self.m.cpu.regs.x_f_mut();
+        HostParts {
+            regs,
+            fregs,
+            arena: self.m.memory.arena_mut(),
+            read,
+            write,
+            frm,
+        }
+    }
+
+    #[inline]
+    fn call(&mut self, call: &mut HostCall) -> bool {
+        let c = Counter {
+            value: call.counter,
+            max: call.max,
+        };
+        call.exit_kind = EXIT_HOST;
+        call.exit_pc = call.pc;
+        let (c, touched) = match call_dyncall(self.m, call.pc, call.arg as u32, c) {
+            Ok(done) => {
+                self.outcome = Some(Ok(done));
+                done
+            }
+            Err(err) => {
+                self.outcome = Some(Err(err));
+                return false;
+            }
+        };
+        call.counter = c.value;
+        call.max = c.max;
+        if self.exec.is_stale() {
+            return false;
+        }
+        // As in the `dyncall` bytecode: the retired count decides.
+        !touched || {
+            let d = dyncall_done(self.exec, call.pc, c, touched, self.counts);
+            !d.halt_after.overflowed()
+        }
+    }
 }
 
 #[cfg(test)]

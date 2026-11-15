@@ -143,6 +143,11 @@ the handlers also use `feature(rust_preserve_none_cc)` and `feature(fn_align)`
 The feature is still flagged *incomplete* upstream, so a miscompile is
 possible; the difftests and instruction-count checks are the safety net.
 
+The pin also lists the `riscv64gc-unknown-linux-gnu` target, so that
+`rustup toolchain install` (and so CI) gets the standard library the Rust
+guests of the tests and examples are built with (`testutil::build_rust`,
+linked with the RISC-V cross gcc).
+
 Bumping the pin is a deliberate change of its own: update `rust-toolchain.toml`,
 run the full test suite including `--ignored`, re-run the benchmarks and record
 any change in Baseline. If `become` stabilises, move to stable and drop the
@@ -418,7 +423,10 @@ arena bounds checks, or the address mask, see "N-bit address space") is
 the trust boundary; the rt crate documents the contract the code generator
 must keep. Besides other region functions, native code only calls
 Cranelift's rounding and FMA libcalls (only used on hosts without SSE4.1
-or FMA). The code is position-independent (`is_pic`), so libcalls go
+or FMA), and the host for dyncalls: through a trampoline pointer in the
+state block, which hands the host (the machine) back all of itself and
+afterwards takes its register files and arena again, leaving native code
+if the arena moved or the code's windows no longer fit (see "Dyncalls"). The code is position-independent (`is_pic`), so libcalls go
 through a GOT: for the JIT, a table appended to the image that points at
 plain Rust helpers in `emit.rs`; for saved code (see "Code cache"), the
 system linker's GOT, pointing at `libm`.
@@ -471,19 +479,19 @@ system linker's GOT, pointing at `libm`.
   numbered by their index, not custom instructions as in C++. A dyncall
   never changes PC (it is never clone-like or an exit), so it doesn't end
   its block: the interpreter runs it mid-block with the `dyncall`
-  bytecode, and native code leaves with `EXIT_DYNCALL` (all registers
-  stored, block counted). Both go through `dispatch::run_dyncall`: the
+  bytecode, and native code calls the handler (see "Dyncalls" below).
+  Both go through `dispatch::run_dyncall`: the
   handler sees the PC, the counter (the block counted, as threaded
   handlers see it) and the limit; a stop, or a penalty that takes the
   count up to the dyncall to the limit, halts at the next instruction with
   that count, while a block whose count merely crosses the limit (penalty
   or not) runs to its end; a segment the handler made
-  stale is left; otherwise the block goes on (native code re-enters at the
-  next instruction, which region formation always makes an entry point).
+  stale is left; otherwise the block goes on.
   An over-long block forced to end at a dyncall keeps the dyncall bytecode
   instead of FUNCBLOCK. So the interpreter and the JIT agree on dyncalls
   exactly, faults and instruction counts included (C++'s interpreter loses
-  a handler's penalty; asmjit doesn't).
+  a handler's penalty; asmjit doesn't), for handlers that keep the
+  dyncall's register promise.
   Native code exits to the interpreter on anything it doesn't compile
   (system calls, CSRs incl. FCSR, atomics, Zfa, Zfhmin, FENCE.I, CBO,
   CLMUL), on faults and at the instruction limit, with exactly the PC,
@@ -515,6 +523,42 @@ system linker's GOT, pointing at `libm`.
   slow-path instructions, and nothing it runs can make a segment stale).
 - x86-64 only for now: AArch64 needs an instruction-cache flush in the rt
   crate. Cranelift's x64 tail calls need `preserve_frame_pointers`.
+
+**Dyncalls** (2026-11-15; C++ asmjit `emit_dyncall`): native code calls
+the handler of a dyncall in the middle of its block itself, instead of
+leaving for the dispatcher (which stored every register, unwound every
+native frame, and re-entered after the handler with all registers
+reloaded and the guest call stack gone). It stores the registers the
+dyncall promises its handler reads (`codegen::calls::dyncall_regs`: the
+`a0..` inputs, `fa0-fa7` unless the word promises no FP access, and `sp`,
+so that a handler can preempt into the guest below the live frames),
+calls the host through `JitState::host_call` with the dyncall word, PC
+and counter, and reloads the counter and the promised outputs. Region
+summaries include those registers, so native callers store and reload
+them around calls into a region with a dyncall. On the host side
+(`jit::JitHost`, a `libriscv_jit_rt::Host`), the call runs the handler
+as the dispatcher would (`dispatch::call_dyncall`) and lets native code
+go on unless the handler faulted, stopped the machine (or penalized it
+to the limit) or made the segment stale; then native code leaves with
+`EXIT_HOST` and the dispatcher continues from the outcome exactly as after
+the dyncall exit. A dyncall that ends its block (the segment's last
+instruction, or an over-long block forced to end there) still leaves
+with `EXIT_DYNCALL`. The rt crate's trampoline catches a handler's panic
+and resumes it once native code has returned, and takes the machine's
+register files and arena again after every call, without revalidating
+them when nothing changed; native code leaves if the arena moved (it and
+its native callers keep the arena pointer in registers), and the process
+aborts if the register files moved (they are inside the borrowed
+machine, so they can't). The handler isn't baked into the code as C++
+does: system call tables are per machine and installed after
+`Machine::new` (which compiles), cached code must stay free of absolute
+host addresses, and a Rust shim is needed anyway to call a Rust-ABI
+`fn(&mut Machine)` with the machine whole, so the shim looks the handler
+up (two instructions of ~180 per call). A loop calling a `dyncall; ret`
+function (`tests/jit.rs`-style, 2^25 calls): 13.8 to 6.7 ns per call
+(the interpreter: 9.9 ns), 320 to 179 instructions. Asteroids
+(`examples/asteroids`, 20 seeds, 4770 frames): 2.31 to 1.74 µs per frame
+with the JIT (the interpreter: 3.8 µs).
 
 **Bounds checks and register pressure** (2026-11-13; the JIT was 18-24%
 behind asmjit on CoreMark 1.0, `--nbit-address-space` closed most of it,
@@ -1809,6 +1853,7 @@ itself, so:
 - [x] JIT: code cache, Cranelift output saved as an object to link in or a shared object to load (`jit_cache`, `rvlinux --jit-save-object`/`--jit-save-shared`/`--jit-load`, `RVLINUX_JIT_EMBED`; the role of C++'s translation cache and embedded translations); see "Code cache" under "JIT"
 - [x] JIT: automatic N-bit address space (`jit_automatic_nbit_address_space`, `rvlinux --nbit-address-space`; port of `nbit_arena.cpp`)
 - [x] JIT: native calls between regions (asmjit `emit_direct_call`, shared with AOT in `codegen::calls`); see "Native calls" under "JIT"
+- [x] JIT: dyncall handlers called from native code (asmjit `emit_dyncall`); see "Dyncalls" under "JIT"
 - [x] AOT: translation to safe Rust (`aot`/`aot-dylib` features, `rvlinux --aot-save`/`--aot-save-shared`/`--aot-load`, `RVLINUX_AOT_EMBED`), structured control flow, region-to-region `become`, native calls (inlined when self-contained, devirtualized for address-taken functions); see "AOT"
 - [ ] JIT: lazy compilation, AArch64 (icache flush in `libriscv-jit-rt`). Lazy compilation matters most for dynamic executables: `libc.so`'s whole executable mapping (1.5 MB) becomes one segment, and compiling it up front takes ~10 s (release)
 

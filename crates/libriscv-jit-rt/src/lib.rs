@@ -15,9 +15,17 @@
 //!   the code generator registered in the entry table (checked at
 //!   construction), never at an arbitrary address.
 //! * Every pointer the code receives comes from a Rust borrow that outlives
-//!   the call ([`JitState::new`]), and the guest-memory windows it may access
-//!   are validated against the arena's real length, including the widest
-//!   (8-byte) access.
+//!   the call (the [`HostParts`] of the [`Host`] it is entered with), and
+//!   the guest-memory windows it may access are validated against the
+//!   arena's real length, including the widest (8-byte) access.
+//! * The code calls back into the host only through the host-call
+//!   trampoline in the state block ([`Host::call`]), which gives the host
+//!   back all of itself. Afterwards the trampoline takes the host's parts
+//!   again and validates them as on entry, and tells the code to leave if
+//!   they no longer fit, or if the arena moved (the code keeps its arena
+//!   pointer in registers, in its callers too). The register files can't
+//!   move: they are inside the host, which stays borrowed; the process
+//!   aborts if a host breaks that.
 //!
 //! What it relies on, and `libriscv`'s code generator must uphold (see its
 //! `jit` module):
@@ -27,17 +35,23 @@
 //!   `addr - write_base < write_len` (stores), unsigned and wrapping, with
 //!   the windows the code was built for ([`MemoryLayout`]): they are
 //!   constants in the code, and [`CodeMemory::enter`] refuses to run it
-//!   unless they lie inside the windows of the [`JitState`]. Or, in code
+//!   unless they lie inside the windows of the host's [`HostParts`]. Or, in code
 //!   built with an address mask `m`, as `arena[addr & m]`, unchecked:
 //!   [`CodeMemory::enter`] refuses to run such code unless `m` plus the
 //!   widest access fits in the arena.
 //! * Only the 32 integer registers behind `regs`, the 32 floating-point
 //!   registers behind `fregs` and the fields of [`JitState`] are accessed
 //!   besides guest memory.
+//! * After a host call, the counter is read from the state block, and if
+//!   the call returned non-zero, the code (and every native caller) leaves
+//!   without touching guest memory, with [`JitState`]'s exit as the host
+//!   call left it.
 //! * Control only moves between functions of the same [`CodeMemory`], by
 //!   tail calls and calls, direct or through the entry table, and every
 //!   function returns to its caller (another function of the same
-//!   [`CodeMemory`], or the trampoline).
+//!   [`CodeMemory`], or the trampoline). The one other call is the host
+//!   call, through the state block's `host_call`, with the state block as
+//!   its first argument.
 //!
 //! # Cached code
 //!
@@ -64,9 +78,10 @@
 //! that machines loaded from the same program share its text and rodata
 //! (see the `arena` module).
 
+use std::any::Any;
 use std::io;
-use std::marker::PhantomData;
 use std::mem::offset_of;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 
 use memmap2::Mmap;
@@ -114,11 +129,70 @@ fn window_within(inner: (u64, u64), outer: (u64, u64)) -> bool {
                 .is_some_and(|(i, o)| i <= o))
 }
 
+/// What generated code runs on: the parts of it the code accesses
+/// directly, and the host calls it makes (`libriscv`'s machine).
+pub trait Host {
+    /// Borrow the register files and guest memory for generated code, with
+    /// the windows of `arena` that loads and stores may touch.
+    fn parts(&mut self) -> HostParts<'_>;
+
+    /// A host call from generated code. The host may change anything but
+    /// where its register files are (the process aborts then);
+    /// `call` carries the counter and limit in and out. Returns true if
+    /// the code may go on; otherwise it leaves with `call`'s exit, as it
+    /// does if the arena moved or the code's windows no longer fit.
+    fn call(&mut self, call: &mut HostCall) -> bool;
+}
+
+/// The parts of a [`Host`] that generated code accesses directly.
+#[derive(Debug)]
+pub struct HostParts<'a> {
+    pub regs: &'a mut [u64; 32],
+    pub fregs: &'a mut [u64; 32],
+    pub arena: &'a mut [u8],
+    /// The `(base, len)` windows of `arena` that loads and stores may touch.
+    pub read: (u64, u64),
+    pub write: (u64, u64),
+    /// The dynamic floating-point rounding mode (FCSR.frm), read-only.
+    pub frm: u64,
+}
+
+/// One host call: what generated code passed, and what it continues
+/// (or leaves) with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostCall {
+    /// The code generator's argument.
+    pub arg: u64,
+    pub pc: u64,
+    /// In and out: the instruction counter.
+    pub counter: u64,
+    /// In and out: the instruction limit.
+    pub max: u64,
+    /// The exit to leave with if the code can't go on.
+    pub exit_kind: u64,
+    pub exit_pc: u64,
+}
+
+/// Where generated code left: the state block's exit fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Exit {
+    /// Why the code returned. Defined by the code generator.
+    pub kind: u64,
+    /// The guest PC (or other data, depending on `kind`).
+    pub pc: u64,
+    /// The instruction counter.
+    pub counter: u64,
+}
+
+/// The host-call trampoline's signature: `(state, arg, pc, counter) ->
+/// leave`, the platform's C calling convention.
+pub type HostCallFn = extern "C" fn(*mut JitState, u64, u64, u64) -> u64;
+
 /// The state block passed to generated code. The layout is shared with the
 /// code generator through the `OFFSET_*` constants.
 #[repr(C)]
 #[derive(Debug)]
-pub struct JitState<'a> {
+pub struct JitState {
     regs: *mut u64,
     fregs: *mut u64,
     arena: *mut u8,
@@ -130,75 +204,151 @@ pub struct JitState<'a> {
     table: *const u64,
     table_len: u64,
     /// The instruction limit.
-    pub max: u64,
+    max: u64,
     /// The dynamic floating-point rounding mode (FCSR.frm), read-only.
-    pub frm: u64,
-    /// On exit: the instruction counter.
-    pub counter: u64,
+    frm: u64,
+    /// On exit: the instruction counter (also after a host call).
+    counter: u64,
     /// On exit: the guest PC (or other data, depending on `exit_kind`).
-    pub exit_pc: u64,
+    exit_pc: u64,
     /// On exit: why the code returned. Defined by the code generator.
-    pub exit_kind: u64,
-    _borrows: PhantomData<(&'a mut [u64; 32], &'a mut [u64; 32], &'a mut [u8])>,
+    exit_kind: u64,
+    /// The host call: `host_trampoline::<H>`.
+    host_call: HostCallFn,
+    // Not accessed by generated code:
+    /// The `H` of `host_trampoline::<H>`, a `&mut H` that outlives the call.
+    host: *mut (),
+    /// The memory layout the code was built for.
+    layout: MemoryLayout,
+    /// A panic in a host call, resumed once the code has returned.
+    panic: Option<Box<dyn Any + Send>>,
 }
 
-impl<'a> JitState<'a> {
-    pub const OFFSET_REGS: i32 = offset_of!(JitState<'static>, regs) as i32;
-    pub const OFFSET_FREGS: i32 = offset_of!(JitState<'static>, fregs) as i32;
-    pub const OFFSET_ARENA: i32 = offset_of!(JitState<'static>, arena) as i32;
-    pub const OFFSET_READ_BASE: i32 = offset_of!(JitState<'static>, read_base) as i32;
-    pub const OFFSET_READ_LEN: i32 = offset_of!(JitState<'static>, read_len) as i32;
-    pub const OFFSET_WRITE_BASE: i32 = offset_of!(JitState<'static>, write_base) as i32;
-    pub const OFFSET_WRITE_LEN: i32 = offset_of!(JitState<'static>, write_len) as i32;
-    pub const OFFSET_TABLE: i32 = offset_of!(JitState<'static>, table) as i32;
-    pub const OFFSET_TABLE_LEN: i32 = offset_of!(JitState<'static>, table_len) as i32;
-    pub const OFFSET_MAX: i32 = offset_of!(JitState<'static>, max) as i32;
-    pub const OFFSET_FRM: i32 = offset_of!(JitState<'static>, frm) as i32;
-    pub const OFFSET_COUNTER: i32 = offset_of!(JitState<'static>, counter) as i32;
-    pub const OFFSET_EXIT_PC: i32 = offset_of!(JitState<'static>, exit_pc) as i32;
-    pub const OFFSET_EXIT_KIND: i32 = offset_of!(JitState<'static>, exit_kind) as i32;
+impl JitState {
+    pub const OFFSET_REGS: i32 = offset_of!(JitState, regs) as i32;
+    pub const OFFSET_FREGS: i32 = offset_of!(JitState, fregs) as i32;
+    pub const OFFSET_ARENA: i32 = offset_of!(JitState, arena) as i32;
+    pub const OFFSET_READ_BASE: i32 = offset_of!(JitState, read_base) as i32;
+    pub const OFFSET_READ_LEN: i32 = offset_of!(JitState, read_len) as i32;
+    pub const OFFSET_WRITE_BASE: i32 = offset_of!(JitState, write_base) as i32;
+    pub const OFFSET_WRITE_LEN: i32 = offset_of!(JitState, write_len) as i32;
+    pub const OFFSET_TABLE: i32 = offset_of!(JitState, table) as i32;
+    pub const OFFSET_TABLE_LEN: i32 = offset_of!(JitState, table_len) as i32;
+    pub const OFFSET_MAX: i32 = offset_of!(JitState, max) as i32;
+    pub const OFFSET_FRM: i32 = offset_of!(JitState, frm) as i32;
+    pub const OFFSET_COUNTER: i32 = offset_of!(JitState, counter) as i32;
+    pub const OFFSET_EXIT_PC: i32 = offset_of!(JitState, exit_pc) as i32;
+    pub const OFFSET_EXIT_KIND: i32 = offset_of!(JitState, exit_kind) as i32;
+    pub const OFFSET_HOST_CALL: i32 = offset_of!(JitState, host_call) as i32;
 
-    /// Borrow the integer and floating-point register files and guest
-    /// memory for one call into generated code. `read` and `write` are the `(base, len)` windows of `arena` that
-    /// loads and stores may touch. Returns `None` if a window (plus the widest
-    /// access) doesn't fit in `arena`.
-    pub fn new(
-        regs: &'a mut [u64; 32],
-        fregs: &'a mut [u64; 32],
-        arena: &'a mut [u8],
-        read: (u64, u64),
-        write: (u64, u64),
-        max: u64,
-        frm: u64,
-    ) -> Option<Self> {
-        let arena_len = u64::try_from(arena.len()).ok()?;
+    /// [`Self::take`] after a host call, which may have changed anything:
+    /// returns false if the code must leave, because the windows no
+    /// longer fit or the arena moved (the code keeps its arena pointer in
+    /// registers). Aborts if the register files moved: the code (or its
+    /// callers) would store them through dangling pointers on the way out.
+    fn retake(&mut self, parts: HostParts<'_>) -> bool {
+        if parts.regs.as_mut_ptr() != self.regs || parts.fregs.as_mut_ptr() != self.fregs {
+            std::process::abort();
+        }
+        self.frm = parts.frm;
+        let arena = parts.arena.as_mut_ptr();
+        // Usually nothing changed: no need to validate it again.
+        if arena == self.arena
+            && parts.arena.len() as u64 == self.arena_len
+            && parts.read == (self.read_base, self.read_len)
+            && parts.write == (self.write_base, self.write_len)
+        {
+            return true;
+        }
+        let moved = arena != self.arena;
+        self.take(parts) && !moved
+    }
+
+    /// Take the pointers and windows from `parts`. Returns false (leaving
+    /// the windows empty) if a window plus the widest access doesn't fit
+    /// in the arena, or the code's layout doesn't fit the windows (see
+    /// [`CodeMemory::enter`]).
+    fn take(&mut self, parts: HostParts<'_>) -> bool {
+        self.regs = parts.regs.as_mut_ptr();
+        self.fregs = parts.fregs.as_mut_ptr();
+        self.arena = parts.arena.as_mut_ptr();
+        self.frm = parts.frm;
+        let Ok(arena_len) = u64::try_from(parts.arena.len()) else {
+            return false;
+        };
         let fits = |(base, len): (u64, u64)| {
             base.checked_add(len)
                 .and_then(|end| end.checked_add(MAX_ACCESS))
                 .is_some_and(|end| end <= arena_len)
         };
-        if !fits(read) || !fits(write) {
-            return None;
-        }
-        Some(Self {
-            regs: regs.as_mut_ptr(),
-            fregs: fregs.as_mut_ptr(),
-            arena: arena.as_mut_ptr(),
-            arena_len,
-            read_base: read.0,
-            read_len: read.1,
-            write_base: write.0,
-            write_len: write.1,
-            table: std::ptr::null(),
-            table_len: 0,
-            max,
-            frm,
-            counter: 0,
-            exit_pc: 0,
-            exit_kind: 0,
-            _borrows: PhantomData,
-        })
+        let layout = &self.layout;
+        let ok = fits(parts.read)
+            && fits(parts.write)
+            && if layout.mask != 0 {
+                layout
+                    .mask
+                    .checked_add(MAX_ACCESS)
+                    .is_some_and(|end| end <= arena_len)
+            } else {
+                window_within(layout.read, parts.read) && window_within(layout.write, parts.write)
+            };
+        let (read, write) = if ok {
+            (parts.read, parts.write)
+        } else {
+            ((0, 0), (0, 0))
+        };
+        self.arena_len = if ok { arena_len } else { 0 };
+        (self.read_base, self.read_len) = read;
+        (self.write_base, self.write_len) = write;
+        ok
     }
+}
+
+/// The host call generated code makes through `JitState::host_call`:
+/// [`Host::call`], then the host's parts again (see the crate
+/// documentation). Returns non-zero if the code must leave, with the exit
+/// in the state block.
+extern "C" fn host_trampoline<H: Host>(
+    state: *mut JitState,
+    arg: u64,
+    pc: u64,
+    counter: u64,
+) -> u64 {
+    // SAFETY: generated code passes the state block it was entered with
+    // (the crate's contract), which `CodeMemory::enter` keeps alive and
+    // doesn't touch while the code runs.
+    #[allow(unsafe_code)]
+    let state = unsafe { &mut *state };
+    // SAFETY: `host` is the `&mut H` that `CodeMemory::enter` was called
+    // with, which outlives the code's run, and nothing else uses it while
+    // the host runs: the code is suspended in this call, and the host's
+    // parts are taken again (and checked not to have moved) before it
+    // touches them again.
+    #[allow(unsafe_code)]
+    let host = unsafe { &mut *state.host.cast::<H>() };
+    let mut call = HostCall {
+        arg,
+        pc,
+        counter,
+        max: state.max,
+        exit_kind: state.exit_kind,
+        exit_pc: pc,
+    };
+    // Unwinding through generated code is impossible: catch, and resume
+    // once the code has returned.
+    let go_on = match catch_unwind(AssertUnwindSafe(|| host.call(&mut call))) {
+        Ok(go_on) => go_on,
+        Err(payload) => {
+            state.panic = Some(payload);
+            false
+        }
+    };
+    let fits = state.retake(host.parts());
+    state.counter = call.counter;
+    state.max = call.max;
+    state.exit_kind = call.exit_kind;
+    state.exit_pc = call.exit_pc;
+    u64::from(!(go_on && fits))
 }
 
 fn invalid(what: &'static str) -> io::Error {
@@ -206,7 +356,7 @@ fn invalid(what: &'static str) -> io::Error {
 }
 
 /// The trampoline's signature: `(state, function, pc, counter)`.
-type Trampoline = extern "C" fn(*mut JitState<'_>, u64, u64, u64);
+type Trampoline = extern "C" fn(*mut JitState, u64, u64, u64);
 
 /// Where the code of a [`CodeMemory`] lives.
 enum Backing {
@@ -354,48 +504,77 @@ impl CodeMemory {
         self.table.get(slot).is_some_and(|&e| e != 0)
     }
 
-    /// Run the function in table slot `slot` with `pc` and `counter` as its
-    /// arguments, until it returns. Returns `false` (without running
-    /// anything) if the slot is empty, if the code's address mask doesn't
-    /// fit in `state`'s arena, or if the code's windows aren't inside
-    /// `state`'s. The results are in `state`.
+    /// Run the function in table slot `slot` on `host` with `pc` and
+    /// `counter` as its arguments and `max` as the instruction limit, until
+    /// it returns. Returns `None` (without running anything) if the slot is
+    /// empty, if the host's windows don't fit its arena, if the code's
+    /// address mask doesn't fit in the arena, or if the code's windows
+    /// aren't inside the host's. A panic in a host call resumes here, once
+    /// the code has returned.
     #[allow(unsafe_code)]
-    pub fn enter(&self, state: &mut JitState<'_>, slot: usize, pc: u64, counter: u64) -> bool {
-        let Some(&function) = self.table.get(slot).filter(|&&e| e != 0) else {
-            return false;
+    pub fn enter<H: Host>(
+        &self,
+        host: &mut H,
+        slot: usize,
+        pc: u64,
+        counter: u64,
+        max: u64,
+    ) -> Option<Exit> {
+        let &function = self.table.get(slot).filter(|&&e| e != 0)?;
+        let host: *mut H = host;
+        let mut state = JitState {
+            regs: std::ptr::null_mut(),
+            fregs: std::ptr::null_mut(),
+            arena: std::ptr::null_mut(),
+            arena_len: 0,
+            read_base: 0,
+            read_len: 0,
+            write_base: 0,
+            write_len: 0,
+            table: self.table.as_ptr(),
+            table_len: self.table.len() as u64,
+            max,
+            frm: 0,
+            counter: 0,
+            exit_pc: 0,
+            exit_kind: 0,
+            host_call: host_trampoline::<H>,
+            host: host.cast(),
+            layout: self.layout,
+            panic: None,
         };
-        let layout = &self.layout;
-        let fits = if layout.mask != 0 {
-            layout
-                .mask
-                .checked_add(MAX_ACCESS)
-                .is_some_and(|end| end <= state.arena_len)
-        } else {
-            window_within(layout.read, (state.read_base, state.read_len))
-                && window_within(layout.write, (state.write_base, state.write_len))
-        };
-        if !fits {
-            return false;
+        // SAFETY: `host` comes from the `&mut H` this function holds for
+        // its whole run; the parts' borrow ends here, leaving their
+        // pointers in `state`, all derived from `host`.
+        if !state.take(unsafe { &mut *host }.parts()) {
+            return None;
         }
-        state.table = self.table.as_ptr();
-        state.table_len = self.table.len() as u64;
         let code = (self.base + self.trampoline) as *const u8;
         // SAFETY: `code` is the start of the trampoline, a function with the
         // platform's C calling convention and the `Trampoline` signature,
         // inside the code, which is executable and stays mapped as long as
         // `self` (its `Backing`: our own mapping, the program itself, or a
-        // shared object that `self` keeps loaded). Its arguments are valid for the whole call: `state` is a
-        // live `&mut` whose pointers come from borrows that outlive it
-        // (`JitState::new`), with `table` pointing at `self.table`, and
-        // `function` is a function start in the same mapping, and a masked
-        // access (`arena[addr & mask]`, at most `MAX_ACCESS` bytes) stays
-        // inside the arena, as does a checked one: the code's windows are
-        // inside `state`'s (both checked above), which `JitState::new`
-        // validated against the arena. What the generated code does
-        // with them is the contract in the crate documentation.
+        // shared object that `self` keeps loaded). Its arguments are valid
+        // for the whole call: `state` lives on this stack frame, its
+        // pointers come from the host's parts, which `take` validated (and
+        // takes again after every host call, see `host_trampoline`), with
+        // `table` pointing at `self.table`, and `function` is a function
+        // start in the same mapping, and a masked access (`arena[addr &
+        // mask]`, at most `MAX_ACCESS` bytes) stays inside the arena, as
+        // does a checked one: the code's windows are inside the host's
+        // (checked by `take`), which `take` validated against the arena.
+        // What the generated code does with them is the contract in the
+        // crate documentation.
         let trampoline = unsafe { std::mem::transmute::<*const u8, Trampoline>(code) };
-        trampoline(state, function, pc, counter);
-        true
+        trampoline(&mut state, function, pc, counter);
+        if let Some(payload) = state.panic.take() {
+            resume_unwind(payload);
+        }
+        Some(Exit {
+            kind: state.exit_kind,
+            pc: state.exit_pc,
+            counter: state.counter,
+        })
     }
 }
 
@@ -403,12 +582,76 @@ impl CodeMemory {
 mod tests {
     use super::*;
 
+    /// Registers and an arena with the given windows; no host calls.
+    struct TestHost {
+        regs: [u64; 32],
+        fregs: [u64; 32],
+        arena: Vec<u8>,
+        read: (u64, u64),
+        write: (u64, u64),
+    }
+
+    impl TestHost {
+        fn new(arena: usize, read: (u64, u64), write: (u64, u64)) -> Self {
+            Self {
+                regs: [0; 32],
+                fregs: [0; 32],
+                arena: vec![0; arena],
+                read,
+                write,
+            }
+        }
+    }
+
+    impl Host for TestHost {
+        fn parts(&mut self) -> HostParts<'_> {
+            HostParts {
+                regs: &mut self.regs,
+                fregs: &mut self.fregs,
+                arena: &mut self.arena,
+                read: self.read,
+                write: self.write,
+                frm: 0,
+            }
+        }
+        fn call(&mut self, _: &mut HostCall) -> bool {
+            false
+        }
+    }
+
+    /// A state block for code built for `layout`, taking `host`'s parts.
+    fn takes(host: &mut TestHost, layout: MemoryLayout) -> bool {
+        let mut state = JitState {
+            regs: std::ptr::null_mut(),
+            fregs: std::ptr::null_mut(),
+            arena: std::ptr::null_mut(),
+            arena_len: 0,
+            read_base: 0,
+            read_len: 0,
+            write_base: 0,
+            write_len: 0,
+            table: std::ptr::null(),
+            table_len: 0,
+            max: 0,
+            frm: 0,
+            counter: 0,
+            exit_pc: 0,
+            exit_kind: 0,
+            host_call: host_trampoline::<TestHost>,
+            host: std::ptr::null_mut(),
+            layout,
+            panic: None,
+        };
+        state.take(host.parts())
+    }
+
     #[test]
-    fn state_windows_are_validated() {
-        let (mut regs, mut fregs) = ([0u64; 32], [0u64; 32]);
-        let mut arena = vec![0u8; 0x2000];
-        let mut new = |read, write| {
-            JitState::new(&mut regs, &mut fregs, &mut arena, read, write, 1, 0).is_some()
+    fn host_windows_are_validated() {
+        let new = |read, write| {
+            takes(
+                &mut TestHost::new(0x2000, read, write),
+                MemoryLayout::default(),
+            )
         };
         assert!(new((0x1000, 0xFF8), (0, 0x1FF8)));
         assert!(!new((0x1000, 0xFF9), (0, 0)));
@@ -443,36 +686,22 @@ mod tests {
     #[test]
     fn masked_code_needs_room_for_its_mask() {
         let code = [0xC3u8; 16]; // never run: `enter` refuses first
-        let (mut regs, mut fregs) = ([0u64; 32], [0u64; 32]);
         // One byte short of mask 0xFFF plus the widest access.
-        let mut arena = vec![0u8; 0x1000 + 6];
-        let mut state =
-            JitState::new(&mut regs, &mut fregs, &mut arena, (0, 0), (0, 0), 0, 0).unwrap();
+        let mut host = TestHost::new(0x1000 + 6, (0, 0), (0, 0));
         let masked = |mask| MemoryLayout {
             mask,
             ..MemoryLayout::default()
         };
         let mem = CodeMemory::new(&code, 0, &[0], masked(0xFFF)).unwrap();
-        assert!(!mem.enter(&mut state, 0, 0, 0));
+        assert!(mem.enter(&mut host, 0, 0, 0, 0).is_none());
         let mem = CodeMemory::new(&code, 0, &[0], masked(u64::MAX)).unwrap();
-        assert!(!mem.enter(&mut state, 0, 0, 0));
+        assert!(mem.enter(&mut host, 0, 0, 0, 0).is_none());
     }
 
     #[test]
     fn checked_code_needs_its_windows_inside_the_state() {
         let code = [0xC3u8; 16]; // never run: `enter` refuses first
-        let (mut regs, mut fregs) = ([0u64; 32], [0u64; 32]);
-        let mut arena = vec![0u8; 0x3000];
-        let mut state = JitState::new(
-            &mut regs,
-            &mut fregs,
-            &mut arena,
-            (0x1000, 0x1000),
-            (0x1800, 0x800),
-            0,
-            0,
-        )
-        .unwrap();
+        let mut host = TestHost::new(0x3000, (0x1000, 0x1000), (0x1800, 0x800));
         let checked = |read, write| MemoryLayout {
             mask: 0,
             read,
@@ -487,7 +716,11 @@ mod tests {
             ((0x1000, 0x1000), (u64::MAX, 2)),
         ] {
             let mem = CodeMemory::new(&code, 0, &[0], checked(read, write)).unwrap();
-            assert!(!mem.enter(&mut state, 0, 0, 0), "{read:x?} {write:x?}");
+            assert!(
+                mem.enter(&mut host, 0, 0, 0, 0).is_none(),
+                "{read:x?} {write:x?}"
+            );
+            assert!(!takes(&mut host, checked(read, write)));
         }
         assert!(window_within((0x1000, 0x1000), (0x1000, 0x1000)));
         assert!(window_within((0x1200, 0x100), (0x1000, 0x1000)));
