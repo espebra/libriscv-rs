@@ -881,7 +881,11 @@ N-bit address space accesses are masked, without checks.
 **Native calls** (2026-11-14; C++ `emit_function_call`). A call (`jal`,
 or `jalr` with a link register, including `auipc`+`jalr` with a constant
 target, `Analysis::jalr_target`, which `-mno-relax` code uses for every
-call) is a Rust call when its return address is a label of the caller's
+call; such a `jalr` jumps without reading its base register, so it is
+never a region entry: not when it's a block start, a direct target or
+itself the target of a constant `jalr`, which `jitdifffuzzer` found
+jumping to itself, and the region size limit never separates it from its
+constant) is a Rust call when its return address is a label of the caller's
 region: regions keep a call's return address (unless
 something calls it: after a `noreturn` call it begins another function)
 and are capped at 512 instructions, since they are whole functions. The

@@ -296,6 +296,45 @@ pub(crate) mod tests {
         (result, state)
     }
 
+    /// A `jalr` after a constant whose target is the `jalr` itself: the
+    /// second time, it is entered with the link it wrote as its base, and
+    /// must jump with that (found by `jitdifffuzzer`).
+    #[test]
+    fn a_constant_jalr_reached_again_uses_its_base_register() {
+        const LUI_A4: u32 = (V as u32) | (14 << 7) | 0x37; // lui a4, V
+        const JALR_A4_4: u32 = (4 << 20) | (14 << 15) | (14 << 7) | 0x67; // jalr a4, 4(a4)
+        // V+4 jumps to itself, then to V+12.
+        let code: Vec<u8> = [LUI_A4, JALR_A4_4, JSELF, addi(10, 10, 1), JSELF]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let run = |jit: bool| {
+            let mut m = Machine::new(
+                &[],
+                MachineOptions {
+                    memory_max: 1 << 20,
+                    jit,
+                    jit_background: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            m.init_execute_area(&code, V).unwrap();
+            m.cpu.jump(V).unwrap();
+            let result = m.try_simulate(100, 0).map_err(|e| e.to_string());
+            (
+                result,
+                m.cpu.reg(10),
+                m.cpu.reg(14),
+                m.cpu.pc(),
+                m.instruction_counter(),
+            )
+        };
+        let interpreted = run(false);
+        assert_eq!(interpreted.1, 1, "{interpreted:?}");
+        assert_eq!(run(true), interpreted);
+    }
+
     /// A loop around a FENCE.I rebuilds its segment every iteration (one
     /// made from executable pages: the main segment is never stale). The
     /// rebuilds reuse the JIT code instead of compiling the unchanged page
