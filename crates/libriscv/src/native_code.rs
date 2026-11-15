@@ -198,6 +198,11 @@ impl NativeSegment {
         exec.native = Some(Self { code, original });
     }
 
+    /// Host bytes of the patch list (the native code is not counted).
+    pub(crate) const fn host_bytes(&self) -> u64 {
+        (self.original.capacity() as u64).saturating_mul(size_of::<(usize, Handler)>() as u64)
+    }
+
     /// The handler entry `i` had before it was patched.
     pub(crate) fn original_handler(&self, i: usize) -> Option<Handler> {
         self.original

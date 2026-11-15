@@ -10,6 +10,18 @@
 pub struct MachineOptions {
     /// Maximum guest memory, rounded down to the page size.
     pub memory_max: u64,
+    /// Most host memory, in bytes, the machine's execute segments may hold
+    /// together: their copies of the code and their decoder caches, about
+    /// 9 bytes per byte of code (one 16-byte entry per 2 bytes; 5 bytes
+    /// without the C extension). A new segment past it fails with
+    /// `OutOfMemory`. `None` (the default) means `memory_max` (after
+    /// rounding), but at least
+    /// [`EXECUTE_SEGMENT_MEMORY_MIN`](crate::memory::EXECUTE_SEGMENT_MEMORY_MIN).
+    /// Shared segments count in full in every machine holding them. Native
+    /// code is not counted; a background compilation briefly holds a second
+    /// copy of the segment. A new segment covering earlier ones evicts
+    /// them. (C++ has no such limit, and keeps covered segments.)
+    pub execute_segment_memory_max: Option<u64>,
     /// Virtual memory reserved for the main stack at construction.
     pub stack_size: u32,
     /// Load the binary as a RISC-V ELF at construction.
@@ -172,6 +184,7 @@ impl Default for MachineOptions {
     fn default() -> Self {
         Self {
             memory_max: 64 << 20,
+            execute_segment_memory_max: None,
             stack_size: 1 << 20,
             load_program: true,
             protect_segments: true,

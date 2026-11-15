@@ -214,6 +214,130 @@ fn page_attributes_are_bounded_by_memory_max() {
     assert!(m.memory.pages_active() <= pages_max);
 }
 
+const RWX: PageAttributes = PageAttributes::rwx(true, true, true);
+
+/// Run the (zeroed, so illegal) instruction at `pc`: the machine first
+/// creates an execute segment from the executable pages around it.
+fn execute_at(m: &mut Machine, pc: u64) -> libriscv::Result<()> {
+    m.cpu.jump(pc)?;
+    m.simulate(1)
+}
+
+/// A machine whose main execute segment is one page at `V`, as an ELF's
+/// would be, so the segments made later are ordinary ones.
+fn with_main_segment(options: MachineOptions) -> Machine {
+    let mut m = empty(options);
+    m.memory.set_page_attr(V, PAGE_SIZE, RWX).unwrap();
+    assert_eq!(kind(execute_at(&mut m, V)), ExceptionKind::IllegalOpcode);
+    assert_eq!(m.memory.execute_segments_count(), 0);
+    m
+}
+
+/// A guest growing an executable area one page at a time, jumping into
+/// each new page, makes each new segment span the whole area. The
+/// segments the new one covers are evicted, so host memory holds one copy
+/// of the area, not one per page, and segments are still created as often
+/// as in C++ before the slots run out.
+#[test]
+fn overlapping_execute_segments_do_not_accumulate() {
+    const AREA: u64 = 0x100000;
+    const AREA_LEN: u64 = 2 << 20;
+    let mut m = with_main_segment(MachineOptions {
+        memory_max: 64 << 20,
+        ..Default::default()
+    });
+    let main = m.memory.execute_segments_memory();
+    m.memory.set_page_attr(AREA, AREA_LEN, RWX).unwrap();
+    assert_eq!(kind(execute_at(&mut m, AREA)), ExceptionKind::IllegalOpcode);
+    let one_copy = m.memory.execute_segments_memory() - main;
+    // About 9 host bytes per byte of code (5 without the C extension).
+    assert!(one_copy > 4 * AREA_LEN && one_copy < 10 * AREA_LEN);
+    let mut end = AREA + AREA_LEN;
+    for i in 1..libriscv::memory::MAX_EXECUTE_SEGS {
+        m.memory.set_page_attr(end, PAGE_SIZE, RWX).unwrap();
+        assert_eq!(kind(execute_at(&mut m, end)), ExceptionKind::IllegalOpcode);
+        end += PAGE_SIZE;
+        assert_eq!(m.memory.execute_segments_count(), i + 1);
+        let total = m.memory.execute_segments_memory();
+        assert!(
+            total < main + one_copy + one_copy / 16,
+            "step {i}: {total} bytes of execute segments"
+        );
+        // The newest segment serves the whole area.
+        let seg = m.memory.exec_segment_for(AREA).unwrap();
+        assert_eq!((seg.exec_begin(), seg.exec_end()), (AREA, end));
+    }
+    // The slots run out as in C++.
+    m.memory.set_page_attr(end, PAGE_SIZE, RWX).unwrap();
+    let err = execute_at(&mut m, end).unwrap_err();
+    assert_eq!(err.kind, ExceptionKind::InvalidProgram);
+}
+
+/// Create disjoint execute segments of `len` bytes, `2 * len` apart from
+/// `0x100000` on, until one fails: it must be for the memory limit, before
+/// `MAX_EXECUTE_SEGS`, with the total never above the limit. Returns how
+/// many were created.
+fn fill_execute_segments(m: &mut Machine, len: u64) -> usize {
+    let limit = m.memory.execute_segments_memory_max();
+    for i in 0..libriscv::memory::MAX_EXECUTE_SEGS {
+        let addr = 0x100000 + 2 * len * i as u64;
+        m.memory.set_page_attr(addr, len, RWX).unwrap();
+        let before = m.memory.execute_segments_memory();
+        match execute_at(m, addr).unwrap_err().kind {
+            ExceptionKind::IllegalOpcode => {
+                assert!(m.memory.execute_segments_memory() <= limit);
+            }
+            ExceptionKind::OutOfMemory => {
+                assert_eq!(m.memory.execute_segments_memory(), before);
+                assert_eq!(m.memory.execute_segments_count(), i);
+                return i;
+            }
+            kind => panic!("segment {i}: {kind:?}"),
+        }
+    }
+    panic!("no limit");
+}
+
+/// Segments that don't overlap count together against
+/// `execute_segment_memory_max`.
+#[test]
+fn execute_segments_are_bounded_by_their_limit() {
+    let options = MachineOptions {
+        memory_max: 64 << 20,
+        execute_segment_memory_max: Some(64 << 20),
+        ..Default::default()
+    };
+    let mut m = with_main_segment(options.clone());
+    assert_eq!(m.memory.execute_segments_memory_max(), 64 << 20);
+    // 9 (5 without the C extension) host bytes per byte of code: 2 MiB of
+    // code each, so 3 (6) fit.
+    let fitted = fill_execute_segments(&mut m, 2 << 20);
+    assert!((3..=6).contains(&fitted), "{fitted}");
+
+    let mut m = with_main_segment(MachineOptions {
+        execute_segment_memory_max: Some(1 << 20),
+        ..options
+    });
+    assert_eq!(m.memory.execute_segments_memory_max(), 1 << 20);
+    let fitted = fill_execute_segments(&mut m, 64 << 10);
+    assert!((1..=3).contains(&fitted), "{fitted}");
+}
+
+/// The limit defaults to `memory_max`, but at least
+/// `EXECUTE_SEGMENT_MEMORY_MIN` (256 MiB).
+#[test]
+fn execute_segment_limit_defaults_to_memory_max() {
+    use libriscv::memory::EXECUTE_SEGMENT_MEMORY_MIN;
+    assert_eq!(EXECUTE_SEGMENT_MEMORY_MIN, 256 << 20);
+    for (memory_max, limit) in [(64 << 20, 256 << 20), (512 << 20, 512 << 20)] {
+        let m = empty(MachineOptions {
+            memory_max,
+            ..Default::default()
+        });
+        assert_eq!(m.memory.execute_segments_memory_max(), limit);
+    }
+}
+
 #[test]
 fn mprotect_cannot_exhaust_host_memory() {
     let mut m = empty(no_arena());
