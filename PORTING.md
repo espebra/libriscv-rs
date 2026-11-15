@@ -1178,12 +1178,22 @@ these were for on CoreMark.
   part of the code's `MemoryLayout` (`unguarded`), so cached code is only
   used with the same one.
 
-Dynamic executables: `rvlinux` loads the program's `PT_INTERP` (falling
-back to `/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1`) as the
+Dynamic executables: `rvlinux` loads
+`/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1` as the
 machine's binary, with argv `[interpreter, program, args...]`, and lets the
 guest open the program and the allow-listed libraries in
 `/lib/riscv64-linux-gnu/` (mapped to `/usr/riscv64-linux-gnu/lib/`), as C++
-`rvlinux` does. `ld.so` maps the program and libraries with
+`rvlinux` does. Deliberate divergence: C++ reads the host file the
+program's `PT_INTERP` names (falling back to that path), so an untrusted
+ELF chose a host file before any sandboxing: `/dev/zero` exhausted host
+memory, a FIFO hung `rvlinux`, and any readable RISC-V ELF (relative paths
+too) became the initial segment. `rvlinux` only accepts a `PT_INTERP`
+ending in `ld-linux-riscv64-lp64d.so.1` (kept as argv[0], so counts still
+match the oracle) and otherwise warns and runs its own linker, with that
+path as argv[0]. The linker is read as a regular file of at most 64 MiB
+(`read_host_file`). Tests: `rvlinux`'s `tests/interpreter.rs` (hand-built
+ELFs naming `/dev/zero`, a FIFO, the program itself, and the canonical
+paths). `ld.so` maps the program and libraries with
 `mmap`/`mprotect`, and their code becomes execute segments when first
 jumped to. Instruction counts match the oracle exactly, also for `dlopen`.
 The allow-listed libraries are pinned (`FileDescriptors::pinned_mappings`,
