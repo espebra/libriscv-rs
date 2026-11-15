@@ -1329,6 +1329,26 @@ Deliberate, permanent differences in paging:
   up to `max(memory_max, 256 MiB)` (or the limit set) of host memory per
   machine on top of guest memory, plus native code with the JIT; with
   many small machines, set the limit lower.
+- Decoding execute segments at runtime (`next_execute_segment`: a new
+  segment for code mapped while running, or the rebuild of a stale one) is
+  charged as instructions, `len / 4` for its `len` bytes (as
+  `flush_execute_segments` charges, which C++ does too), past a free
+  allowance per machine (`MachineOptions::free_decode_bytes`, default
+  `FREE_DECODE_BYTES` = 16 MiB). C++ never charges, and each decode copies,
+  hashes and decodes the whole executable area around the PC: a guest
+  alternating FENCE.I and jumps into a large executable area made the host
+  decode megabytes per guest instruction (security review: 200
+  instructions took 436 ms), and `stale_restart_pc` only catches the same
+  PC going stale again. New segments share the allowance so that no path
+  that drops segments (eviction) makes decoding free. The dispatcher halts
+  at the charge once it reaches the limit, before the new block (or slice
+  end; charges don't count towards making deferred JIT compilations hot).
+  16 MiB is several times what a dynamic glibc program maps at runtime
+  (`ld.so`, `libc`, `libstdc++`, `libm`, `libgcc_s`: about 4 MiB of text
+  on riscv64; static programs, the Go/Rust/Zig fixtures included, decode
+  their code at load, which doesn't count), so the difftests (`runtime_code`
+  rebuilds 8 KiB) keep C++'s counts. `Machine::penalize` saturates instead
+  of wrapping.
 - Slow-path accesses that cross a page boundary use both pages (C++ reads
   or writes past the end of a heap page; for arena pages, as here, the
   next arena bytes).

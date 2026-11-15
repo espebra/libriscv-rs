@@ -142,7 +142,7 @@ impl Machine {
         }
         let (memory, first_segment) = Memory::new(Arc::from(binary), &options)?;
         let mut machine = Self {
-            cpu: Cpu::new(),
+            cpu: Cpu::new(options.free_decode_bytes),
             memory,
             counter: 0,
             max_counter: 0,
@@ -380,9 +380,10 @@ impl Machine {
     pub const fn set_max_instructions(&mut self, value: u64) {
         self.max_counter = value;
     }
-    /// Charge extra instructions (C++ `penalize`).
+    /// Charge extra instructions (C++ `penalize`). Saturating, unlike C++:
+    /// a counter that wrapped would hand the guest a fresh budget.
     pub const fn penalize(&mut self, value: u64) {
-        self.counter = self.counter.wrapping_add(value);
+        self.counter = self.counter.saturating_add(value);
     }
 
     /// Attach a value of your own to the machine, replacing any previous

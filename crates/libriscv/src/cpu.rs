@@ -23,14 +23,18 @@ pub struct Cpu {
     pub(crate) exec: Arc<DecodedSegment>,
     /// Guards against no-progress execute segment rebuild loops.
     stale_restart_pc: u64,
+    /// Bytes execute segments may still be decoded from at runtime without
+    /// a charge (`MachineOptions::free_decode_bytes`).
+    free_decode_bytes: u64,
 }
 
 impl Cpu {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(free_decode_bytes: u64) -> Self {
         Self {
             regs: Registers::default(),
             exec: Arc::new(DecodedSegment::empty()),
             stale_restart_pc: u64::MAX,
+            free_decode_bytes,
         }
     }
 
@@ -42,6 +46,7 @@ impl Cpu {
             regs: self.regs.clone(),
             exec: Arc::clone(&self.exec),
             stale_restart_pc: self.stale_restart_pc,
+            free_decode_bytes: self.free_decode_bytes,
         }
     }
 
@@ -158,8 +163,11 @@ impl Machine {
     /// evicted), a new segment is decoded from the executable pages around
     /// `pc`, the way code mapped at runtime (by a dynamic linker, a JIT or
     /// FENCE.I-style self-modification) becomes executable. Anything else
-    /// is an execute fault. Returns the PC to continue at.
-    pub(crate) fn next_execute_segment(&mut self, pc: u64) -> Result<u64> {
+    /// is an execute fault. Returns the PC to continue at and the
+    /// instructions to charge for decoding a segment (not C++, see
+    /// [`MachineOptions::free_decode_bytes`](crate::MachineOptions::free_decode_bytes));
+    /// the caller adds them to its counter and checks the limit.
+    pub(crate) fn next_execute_segment(&mut self, pc: u64) -> Result<(u64, u64)> {
         if let Some(segment) = self.memory.exec_segment_ref(pc)
             && !segment.is_stale()
         {
@@ -168,7 +176,7 @@ impl Machine {
             }
             // Reached a usable segment, reset the no-progress guard.
             self.cpu.stale_restart_pc = u64::MAX;
-            return Ok(pc);
+            return Ok((pc, 0));
         }
         let found = self.memory.exec_segment_for(pc);
         // Read-fault handlers could be reading PC.
@@ -222,7 +230,13 @@ impl Machine {
         if !segment.is_stale() {
             self.cpu.stale_restart_pc = u64::MAX;
         }
-        Ok(pc)
+        // Charge the decoded bytes past the free allowance (new segments
+        // and rebuilds alike): a quarter instruction per byte, as
+        // `flush_execute_segments` charges.
+        let bytes = code.len() as u64;
+        let free = bytes.min(self.cpu.free_decode_bytes);
+        self.cpu.free_decode_bytes -= free;
+        Ok((pc, (bytes - free) / 4))
     }
 
     /// A jump out of the current segment to a STOP that begins a block of
@@ -257,13 +271,22 @@ impl Machine {
     pub fn simulate_precise(&mut self) -> Result<()> {
         // Always have at least the current segment.
         if !self.cpu.is_executable(self.cpu.regs.pc) {
-            self.next_execute_segment(self.cpu.regs.pc)?;
+            let (_, charge) = self.next_execute_segment(self.cpu.regs.pc)?;
+            self.penalize(charge);
         }
         while self.counter < self.max_counter {
             let mut pc = self.cpu.regs.pc;
             if !self.cpu.exec.is_within(pc, 2) || self.cpu.exec.is_stale() {
                 // Faults if the new location isn't executable.
-                pc = self.next_execute_segment(pc)?;
+                let charge;
+                (pc, charge) = self.next_execute_segment(pc)?;
+                if charge > 0 {
+                    self.penalize(charge);
+                    if self.counter >= self.max_counter {
+                        self.cpu.regs.pc = pc;
+                        break;
+                    }
+                }
             }
             let instr = Instr(self.cpu.exec.read_u32(pc));
             self.execute(instr)?;
