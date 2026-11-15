@@ -113,6 +113,10 @@ pub struct Memory {
     /// (`MachineOptions::jit_ignore_instruction_limit`).
     #[cfg(any(feature = "jit", feature = "aot"))]
     jit_unlimited: bool,
+    /// Native code skips the Spectre guards
+    /// (`MachineOptions::jit_spectre_guards` off).
+    #[cfg(any(feature = "jit", feature = "aot"))]
+    jit_unguarded: bool,
     /// Use cached JIT code (`MachineOptions::jit_cache`).
     #[cfg(feature = "jit")]
     jit_cache: bool,
@@ -284,6 +288,8 @@ impl Memory {
             jit_arena_mask: jit_arena_mask(options, arena_size),
             #[cfg(any(feature = "jit", feature = "aot"))]
             jit_unlimited: options.jit_ignore_instruction_limit,
+            #[cfg(any(feature = "jit", feature = "aot"))]
+            jit_unguarded: !options.jit_spectre_guards,
             #[cfg(feature = "jit")]
             jit_cache: options.jit_cache,
             #[cfg(feature = "jit")]
@@ -367,6 +373,8 @@ impl Memory {
             jit_arena_mask: 0,
             #[cfg(any(feature = "jit", feature = "aot"))]
             jit_unlimited: options.jit_ignore_instruction_limit,
+            #[cfg(any(feature = "jit", feature = "aot"))]
+            jit_unguarded: !options.jit_spectre_guards,
             #[cfg(feature = "jit")]
             jit_cache: options.jit_cache,
             #[cfg(feature = "jit")]
@@ -521,6 +529,7 @@ impl Memory {
             read: (RWREAD_BEGIN, self.read_boundary),
             write: (self.initial_rodata_end, self.write_boundary),
             unlimited: self.jit_unlimited,
+            unguarded: self.jit_unguarded,
         }
     }
     /// The whole arena including the padding page, for native code.

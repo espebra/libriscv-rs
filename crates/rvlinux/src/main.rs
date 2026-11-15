@@ -27,6 +27,7 @@ struct CliArgs {
     jit: bool,
     no_background: bool,
     nbit: bool,
+    no_spectre_guards: bool,
     jit_save_object: Option<PathBuf>,
     jit_save_shared: Option<PathBuf>,
     jit_load: Vec<PathBuf>,
@@ -77,6 +78,11 @@ fn usage(name: &str) {
     if cfg!(any(feature = "jit", feature = "aot")) {
         println!(
             "      --nbit-address-space  Mask arena addresses in native code instead of bounds-checking them"
+        );
+    }
+    if cfg!(feature = "jit") {
+        println!(
+            "      --no-spectre-guards  Don't guard native code against speculation (faster; trusted programs only)"
         );
     }
     if cfg!(feature = "aot") {
@@ -164,6 +170,7 @@ fn parse_args() -> Result<CliArgs, String> {
             "--nbit-address-space" if cfg!(any(feature = "jit", feature = "aot")) => {
                 args.nbit = true;
             }
+            "--no-spectre-guards" if cfg!(feature = "jit") => args.no_spectre_guards = true,
             "--aot-save" if cfg!(feature = "aot") => {
                 args.aot_save = Some(path(&mut it, "--aot-save")?);
             }
@@ -313,6 +320,7 @@ fn main() -> ExitCode {
         // C++ rvlinux compiles in the background by default too.
         jit_background: !args.no_background,
         jit_automatic_nbit_address_space: args.nbit,
+        jit_spectre_guards: !args.no_spectre_guards,
         // C++ rvlinux: `translate_ignore_instruction_limit = !accurate`.
         // Native code then runs without counting; translations and saved
         // JIT code are only used by runs with the same setting.

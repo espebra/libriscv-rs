@@ -764,29 +764,35 @@ pub(crate) mod tests {
         .iter()
         .flat_map(|w| w.to_le_bytes())
         .collect();
-        let mut m = Machine::new(
-            &[],
-            MachineOptions {
-                memory_max: 1 << 20,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        m.init_execute_area(&code, V).unwrap();
-        let exec = m.cpu.current_execute_segment();
-        let a = crate::codegen::region::analyse(exec);
-        super::emit::CLIF.with_borrow_mut(|c| *c = Some(Vec::new()));
-        let image = super::emit::compile_on(exec, &a, m.memory.native_layout(), 1);
-        let clif = super::emit::CLIF
-            .with_borrow_mut(Option::take)
-            .unwrap_or_default();
-        if image.is_none() {
+        // The `select_spectre_guard`s in the code compiled with or without
+        // `jit_spectre_guards`, or `None` without a JIT.
+        let guards = |on: bool| {
+            let mut m = Machine::new(
+                &[],
+                MachineOptions {
+                    memory_max: 1 << 20,
+                    jit_spectre_guards: on,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            m.init_execute_area(&code, V).unwrap();
+            let exec = m.cpu.current_execute_segment();
+            let a = crate::codegen::region::analyse(exec);
+            super::emit::CLIF.with_borrow_mut(|c| *c = Some(Vec::new()));
+            let image = super::emit::compile_on(exec, &a, m.memory.native_layout(), 1);
+            let clif = super::emit::CLIF
+                .with_borrow_mut(Option::take)
+                .unwrap_or_default();
+            image.map(|_| clif.concat().matches("select_spectre_guard").count())
+        };
+        let Some(on) = guards(true) else {
             return; // no JIT on this host
-        }
-        let guards = clif.concat().matches("select_spectre_guard").count();
+        };
         // The load's check, the store's (another base register) and the
         // indirect jump's table lookup.
-        assert!(guards >= 3, "{guards} guards in:\n{}", clif.concat());
+        assert!(on >= 3, "{on} guards");
+        assert_eq!(guards(false), Some(0));
     }
 
     #[test]

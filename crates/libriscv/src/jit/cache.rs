@@ -791,6 +791,7 @@ mod tests {
                 read: (0x1000, 0x2000),
                 write: (0x3000, 0x400),
                 unlimited: false,
+                unguarded: false,
             },
         };
         let image = Image {

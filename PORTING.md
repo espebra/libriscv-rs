@@ -1123,7 +1123,12 @@ these were for on CoreMark.
   guest code reads nothing outside the arena and calls no pointer outside
   the table, for one move per check; no real address changes. (Clamping
   every access instead cost CoreMark 27%.) Masked (N-bit) accesses need
-  no guard. C++ asmjit has none.
+  no guard. C++ asmjit has none. The guards cost about a quarter of
+  CoreMark's native speed with bounds checks (loads wait for their check),
+  so `MachineOptions::jit_spectre_guards` (default on; `rvlinux
+  --no-spectre-guards`) turns them off for trusted guests; the setting is
+  part of the code's `MemoryLayout` (`unguarded`), so cached code is only
+  used with the same one.
 
 Dynamic executables: `rvlinux` loads the program's `PT_INTERP` (falling
 back to `/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1`) as the

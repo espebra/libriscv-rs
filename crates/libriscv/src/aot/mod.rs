@@ -186,7 +186,9 @@ pub fn fingerprint() -> u64 {
 pub(crate) type AotKey = NativeKey;
 
 /// The translation key of the segment `segment` describes.
-pub(crate) fn key(segment: NativeKey) -> AotKey {
+pub(crate) fn key(mut segment: NativeKey) -> AotKey {
+    // Translations are safe Rust: Spectre guards are the JIT's alone.
+    segment.layout.unguarded = false;
     segment.with_build(fingerprint())
 }
 

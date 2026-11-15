@@ -95,6 +95,11 @@ pub struct MemoryLayout {
     pub read: (u64, u64),
     pub write: (u64, u64),
     pub unlimited: bool,
+    /// The code doesn't guard checked accesses and entry table lookups
+    /// against speculation past their bounds checks (Spectre v1), which is
+    /// faster; for guests that are trusted. Baked into the code like the
+    /// rest.
+    pub unguarded: bool,
 }
 
 /// True if the window `inner` lies inside `outer`. An empty window lies
@@ -473,6 +478,7 @@ mod tests {
             read,
             write,
             unlimited: false,
+            unguarded: false,
         };
         for (read, write) in [
             ((0x1000, 0x1001), (0x1800, 0x800)),

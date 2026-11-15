@@ -534,7 +534,7 @@ pub(crate) fn compile_on(
     // `(state, function, pc, counter)`, it enters the `tail` world.
     let mut ctx = Context::new();
     let mut fctx = FunctionBuilderContext::new();
-    ctx.func = trampoline(exec, &isa, &mut fctx);
+    ctx.func = trampoline(exec, layout, &isa, &mut fctx);
     objects.push(compile_function(&mut ctx, &isa)?);
 
     // Link: lay out the functions, then resolve the direct calls. Libcalls
@@ -597,6 +597,7 @@ pub(crate) fn compile_on(
 /// without an entry leaves with `EXIT_INDIRECT`.
 fn trampoline(
     exec: &DecodedSegment,
+    layout: MemoryLayout,
     isa: &OwnedTargetIsa,
     fctx: &mut FunctionBuilderContext,
 ) -> Function {
@@ -657,7 +658,7 @@ fn trampoline(
         let table = b
             .ins()
             .load(I64, host_flags(), state, JitState::OFFSET_TABLE);
-        let slot = spectre_slot(&mut b, in_table, slot);
+        let slot = spectre_slot(&mut b, in_table, slot, layout);
         let byte_off = b.ins().ishl_imm_s(slot, 3);
         let addr = b.ins().iadd(table, byte_off);
         b.ins().brif(
@@ -1226,7 +1227,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                 .b
                 .ins()
                 .load(I64, host_flags(), st, JitState::OFFSET_TABLE);
-            let slot = spectre_slot(&mut self.b, in_table, slot);
+            let slot = spectre_slot(&mut self.b, in_table, slot, self.layout);
             let byte_off = self.b.ins().ishl_imm_s(slot, 3);
             let addr = self.b.ins().iadd(table, byte_off);
             let func = self.b.ins().load(I64, host_flags(), addr, 0);
@@ -1346,7 +1347,11 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
             // in it). When it passes, the base is the register: no address
             // changes, and the guard costs one move per check.
             let safe = self.b.ins().iconst(I64, (win_base as i64).wrapping_sub(lo));
-            let guarded = self.b.ins().select_spectre_guard(outside, safe, base);
+            let guarded = if self.layout.unguarded {
+                base
+            } else {
+                self.b.ins().select_spectre_guard(outside, safe, base)
+            };
             if let Some(slot) = self
                 .checked
                 .get_mut(usize::from(as_store))
@@ -1966,7 +1971,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
             .b
             .ins()
             .load(I64, host_flags(), st, JitState::OFFSET_TABLE);
-        let slot = spectre_slot(&mut self.b, in_table, slot);
+        let slot = spectre_slot(&mut self.b, in_table, slot, self.layout);
         let byte_off = self.b.ins().ishl_imm_s(slot, 3);
         let addr = self.b.ins().iadd(table, byte_off);
         let func = self.b.ins().load(I64, host_flags(), addr, 0);
@@ -2393,7 +2398,16 @@ enum ExitPc {
 /// conditional move: a lookup a mispredicted bounds check lets through
 /// speculatively stays in the table (Spectre v1), so no guest value picks
 /// the function pointer the code then calls.
-fn spectre_slot(b: &mut FunctionBuilder<'_>, in_table: Value, slot: Value) -> Value {
+/// (Not with `layout.unguarded`.)
+fn spectre_slot(
+    b: &mut FunctionBuilder<'_>,
+    in_table: Value,
+    slot: Value,
+    layout: MemoryLayout,
+) -> Value {
+    if layout.unguarded {
+        return slot;
+    }
     let zero = b.ins().iconst(I64, 0);
     b.ins().select_spectre_guard(in_table, slot, zero)
 }
