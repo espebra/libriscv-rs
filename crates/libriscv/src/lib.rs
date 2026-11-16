@@ -49,18 +49,24 @@
 //!
 //! # Toolchain
 //!
-//! Requires the nightly pinned in `rust-toolchain.toml`. Instruction dispatch
-//! uses `become` for guaranteed tail calls, following C++ `tailcall_dispatch.cpp`.
+//! Builds on stable Rust. Instruction dispatch follows C++
+//! `tailcall_dispatch.cpp`: each handler tail-calls the next. On stable these
+//! are ordinary calls that the optimizer turns into jumps, with the
+//! dispatcher bounding how many it chains. The opt-in `nightly-dispatch`
+//! feature, which needs the nightly pinned in `rust-toolchain.toml`, uses
+//! guaranteed tail calls (`become`) and the `preserve_none` calling
+//! convention instead, for the fastest interpreter.
 
 #![forbid(unsafe_code)]
-// Guaranteed tail calls for threaded dispatch (see PORTING.md, "Dispatch").
-// Differential tests check this incomplete compiler feature.
-#![feature(explicit_tail_calls)]
-#![feature(rust_preserve_none_cc)]
-// Align handler entry points to 64-byte cache lines to reduce
-// layout-dependent interpreter performance variation.
-#![feature(fn_align)]
-#![allow(incomplete_features)]
+// Guaranteed tail calls for threaded dispatch (see PORTING.md, "Dispatch"),
+// and handler entry points aligned to 64-byte cache lines to reduce
+// layout-dependent interpreter performance variation. Differential tests
+// check these incomplete compiler features.
+#![cfg_attr(
+    feature = "nightly-dispatch",
+    feature(explicit_tail_calls, rust_preserve_none_cc, fn_align),
+    allow(incomplete_features)
+)]
 
 #[cfg(feature = "aot")]
 pub mod aot;
@@ -103,7 +109,7 @@ pub mod rvv_registers;
 mod signals;
 mod sysargs;
 mod syscalls;
-#[cfg(test)]
+#[cfg(all(test, feature = "nightly-dispatch"))]
 mod tail_call_tests;
 mod threads;
 mod vmcall;
@@ -136,6 +142,19 @@ pub const FREE_DECODE_BYTES: u64 = 16 << 20;
 
 /// The default [`MachineOptions::jit_background_slice`].
 pub const JIT_BACKGROUND_SLICE: u64 = 1 << 20;
+
+/// The default [`MachineOptions::dispatch_slice`]: unbounded with
+/// `nightly-dispatch`, whose tail calls are guaranteed. Otherwise 65536
+/// instructions, or 256 in unoptimized builds, where each handler call takes
+/// a stack frame (~500 bytes): ~125 KiB per chain, well within a test
+/// thread's 2 MiB stack even with nested VM calls.
+pub const DISPATCH_SLICE: u64 = if cfg!(feature = "nightly-dispatch") {
+    u64::MAX
+} else if cfg!(debug_assertions) {
+    1 << 8
+} else {
+    1 << 16
+};
 
 /// Size of the system call handler table, matching C++ `RISCV_SYSCALLS_MAX`.
 pub const SYSCALLS_MAX: usize = 512;

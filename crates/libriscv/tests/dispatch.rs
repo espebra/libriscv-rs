@@ -300,3 +300,170 @@ fn a_breakpoint_after_a_4_byte_instruction_ends_its_block() {
     // Three instructions per round, the breakpoint included.
     assert_eq!(m.cpu.reg(REG_ARG0), 2 * 1000);
 }
+
+/// Host stack depths seen by the system call handler [`record_depth`].
+#[derive(Default)]
+struct Depth {
+    first: usize,
+    deepest: usize,
+    calls: u32,
+}
+
+/// System call 500: record how deep the host stack is.
+fn record_depth(m: &mut Machine) -> libriscv::Result<()> {
+    let local = 0u8;
+    let here = std::hint::black_box(&local) as *const u8 as usize;
+    let d = m.userdata_mut::<Depth>().unwrap();
+    if d.calls == 0 {
+        d.first = here;
+        d.deepest = here;
+    }
+    d.deepest = d.deepest.min(here);
+    d.calls += 1;
+    Ok(())
+}
+
+/// A loop through the handlers that call host code (ECALL, a CSR read, an
+/// atomic through its precise handler) and a branch, `n` times, then stop.
+/// Each iteration records the host stack depth. The atomic is only included
+/// with `ext-a`; without it a `nop` keeps the loop length (and the branch
+/// offset) the same.
+fn depth_program(n: u32) -> Vec<u32> {
+    const RDCYCLE_T0: u32 = 0xC000_22F3; // csrrs t0, cycle, x0
+    const LUI_T2_0X100: u32 = (0x100 << 12) | (7 << 7) | 0x37; // lui t2, 0x100
+    #[cfg(feature = "ext-a")]
+    const AMOADD_W: u32 = (6 << 20) | (7 << 15) | (2 << 12) | 0x2F; // amoadd.w zero, t1, (t2)
+    #[cfg(not(feature = "ext-a"))]
+    const AMOADD_W: u32 = 0x13; // nop: no atomics without ext-a
+    const BNEZ_A0_BACK: u32 = {
+        // bnez a0, -16 (back to the ECALL)
+        let o = -16i32 as u32;
+        (((o >> 12) & 1) << 31)
+            | (((o >> 5) & 0x3F) << 25)
+            | (REG_ARG0 << 15)
+            | (1 << 12)
+            | (((o >> 1) & 0xF) << 8)
+            | (((o >> 11) & 1) << 7)
+            | 0x63
+    };
+    vec![
+        (n << 20) | (REG_ARG0 << 7) | 0x13, // li a0, n
+        li_a7(500),
+        LUI_T2_0X100,
+        ECALL, // loop:
+        RDCYCLE_T0,
+        AMOADD_W,
+        addi_a0(-1i32 as u32 & 0xFFF),
+        BNEZ_A0_BACK,
+        li_a7(2),
+        ECALL,
+        JSELF,
+    ]
+}
+
+/// The growth of the host stack over `n` iterations of [`depth_program`].
+fn stack_growth(n: u32, options: MachineOptions) -> usize {
+    let mut m = Machine::new([].into(), options).unwrap();
+    let code: Vec<u8> = depth_program(n)
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    m.init_execute_area(&code, V).unwrap();
+    m.cpu.jump(V).unwrap();
+    m.set_userdata(Depth::default());
+    m.install_syscall_handler(500, record_depth);
+    m.install_syscall_handler(2, |m| {
+        m.stop();
+        Ok(())
+    });
+    m.simulate(1_000_000).unwrap();
+    let d = m.userdata::<Depth>().unwrap();
+    assert_eq!(d.calls, n);
+    d.first - d.deepest
+}
+
+/// True if handler chains must not grow the host stack at all: tail calls
+/// are guaranteed with `nightly-dispatch`, and otherwise optimized builds
+/// turn them into jumps (unoptimized builds rely on `dispatch_slice`).
+const fn chains_are_flat() -> bool {
+    cfg!(feature = "nightly-dispatch") || !cfg!(debug_assertions)
+}
+
+/// Handler chains do not grow the host stack: each handler tail-calls the
+/// next, including those that run host code first. Without
+/// `nightly-dispatch` that holds only where LLVM turns the calls into jumps
+/// (optimized builds; `cargo test --release` checks it). Unoptimized,
+/// `dispatch_slice` must keep the stack well within a test thread's 2 MiB.
+#[test]
+fn handler_chains_do_not_grow_the_stack() {
+    let growth = stack_growth(2000, MachineOptions::default());
+    if chains_are_flat() {
+        assert!(growth < 1024, "the host stack grew by {growth} bytes");
+    } else {
+        assert!(growth < 1 << 20, "the host stack grew by {growth} bytes");
+    }
+}
+
+/// [`handler_chains_do_not_grow_the_stack`] in and out of native code.
+#[cfg(feature = "jit")]
+#[test]
+fn native_code_chains_do_not_grow_the_stack() {
+    let options = MachineOptions {
+        jit: true,
+        jit_background: false,
+        ..Default::default()
+    };
+    let growth = stack_growth(2000, options);
+    if chains_are_flat() {
+        assert!(growth < 1024, "the host stack grew by {growth} bytes");
+    } else {
+        assert!(growth < 1 << 20, "the host stack grew by {growth} bytes");
+    }
+}
+
+/// Code that differs between the dispatch modes stays in `dispatch/abi.rs`:
+/// the rest of the crate must build on stable Rust, and handlers are written
+/// once for both modes. (The AOT emitter writes `become` into generated code,
+/// and `tail_call_tests.rs` tests it with `nightly-dispatch`.)
+#[test]
+fn nightly_dispatch_syntax_stays_in_abi() {
+    fn visit(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, files);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    visit(&src, &mut files);
+    let allowed = ["dispatch/abi.rs", "aot/emit.rs", "tail_call_tests.rs"];
+    let mut found = Vec::new();
+    for file in files {
+        let rel = file
+            .strip_prefix(&src)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        if allowed.contains(&rel.as_str()) {
+            continue;
+        }
+        for (n, line) in std::fs::read_to_string(&file).unwrap().lines().enumerate() {
+            let code = line.split("//").next().unwrap();
+            if ["become ", "rust-preserve-none", "rustc_align"]
+                .iter()
+                .any(|s| code.contains(s))
+            {
+                found.push(format!("{rel}:{}: {}", n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "outside dispatch/abi.rs:\n{}",
+        found.join("\n")
+    );
+}

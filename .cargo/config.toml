@@ -1,0 +1,9 @@
+# Align every function to a 64-byte cache line on x86-64 hosts. The stable
+# interpreter dispatch cannot align just its handlers (`#[rustc_align]` is
+# nightly-only, used by `nightly-dispatch`), and CoreMark took 15-20% more
+# cycles without it; with it, the stable dispatch is within noise of the
+# nightly one. Costs ~3% of `rvlinux`'s code size. Only applies to builds in
+# this workspace, and not when `RUSTFLAGS` is set. See "Dispatch" in
+# PORTING.md.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "llvm-args=-align-all-functions=6"]

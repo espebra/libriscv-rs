@@ -33,6 +33,9 @@ fn rvlinux() -> &'static Path {
 enum Mode {
     /// The interpreter.
     Interp,
+    /// The interpreter, returning to its dispatch loop every few
+    /// instructions (`--dispatch-slice`): slicing must not be observable.
+    InterpSliced,
     /// `--jit`: compiling in the background (the default).
     #[cfg_attr(not(feature = "jit"), allow(dead_code))]
     Jit,
@@ -59,6 +62,7 @@ fn run_in_mode(mode: Mode, scenario: impl FnOnce()) {
 fn mode_flags(elf: &Path) -> Option<&'static [&'static str]> {
     match MODE.get() {
         Mode::Interp => Some(&[]),
+        Mode::InterpSliced => Some(&["--dispatch-slice", "7"]),
         // Without the cache directory: every run compiles, and none waits
         // at exit to save libc.so (`tests/jit_cache.rs` tests the cache).
         Mode::Jit => Some(&["--jit", "--no-jit-cache"]),
@@ -83,6 +87,10 @@ macro_rules! difftests {
             #[test]
             fn interp() {
                 run_in_mode(Mode::Interp, || difftests!(@call $name $($call)?));
+            }
+            #[test]
+            fn interp_sliced() {
+                run_in_mode(Mode::InterpSliced, || difftests!(@call $name $($call)?));
             }
             #[cfg(feature = "jit")]
             #[test]
@@ -123,7 +131,7 @@ fn diff_jit_output(elf: &Path, flags: &[&str], args: &[&str], jit_output: bool) 
     if let Some(extra) = mode_flags(elf) {
         let mut rust_flags = flags.to_vec();
         rust_flags.extend_from_slice(extra);
-        let output = jit_output || MODE.get() == Mode::Interp;
+        let output = jit_output || matches!(MODE.get(), Mode::Interp | Mode::InterpSliced);
         compare(&reference, elf, &rust_flags, args, output);
     }
     reference

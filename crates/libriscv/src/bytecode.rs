@@ -16,10 +16,11 @@
 //! cold handler that the fast one tail-calls, so the fast handlers carry
 //! no `Result` and need no stack frame.
 
-use crate::decoder_cache::{COMPRESSED, DecodedSegment, DecoderEntry};
-use crate::dispatch::{
-    Counter, Exit, STEP, entry, execute, fault, next_block, overflow_checked_jump,
+use crate::decoder_cache::COMPRESSED;
+use crate::dispatch::abi::{
+    cold_handler, execute, handler, next_block, overflow_checked_jump, tail,
 };
+use crate::dispatch::{STEP, fault};
 use crate::error::{ExceptionKind, MachineError};
 use crate::isa::rvi::{RtypeAlu, sext32};
 use crate::machine::Machine;
@@ -177,19 +178,16 @@ fn set(m: &mut Machine, r: u32, v: u64) {
 /// entries further on (C++ `NEXT_INSTR` is [`STEP`], `NEXT_C_INSTR` is 1).
 macro_rules! sequential {
     ($($(#[$attr:meta])* $name:ident, $step:expr, |$m:ident, $ins:ident| $body:block)*) => {$(
-        $(#[$attr])*
-        #[rustc_align(64)]
-        pub(crate) extern "rust-preserve-none" fn $name(
-            exec: &DecodedSegment,
-            cache: &[DecoderEntry],
-            i: usize,
-            $m: &mut Machine,
-            c: Counter,
-            $ins: u32,
-            pc: u64,
-        ) -> Exit {
-            $body
-            execute!(exec, cache, i + $step, $m, pc, c)
+        handler! {
+            $(#[$attr])*
+            pub(crate) fn $name(f) {
+                {
+                    let $ins = f.ins();
+                    let $m = &mut *f.m;
+                    $body
+                }
+                execute!(f, f.i() + $step)
+            }
         }
     )*};
 }
@@ -343,41 +341,27 @@ sequential! {
     }
 }
 
-/// The register-register bytecodes (C++ `RV32I_BC_OP_*`, `RV64I_BC_OP_*`),
-/// sharing their arithmetic with the precise handlers.
-#[rustc_align(64)]
-pub(crate) extern "rust-preserve-none" fn op<O: RtypeAlu>(
-    exec: &DecodedSegment,
-    cache: &[DecoderEntry],
-    i: usize,
-    m: &mut Machine,
-    c: Counter,
-    ins: u32,
-    pc: u64,
-) -> Exit {
-    let fi = FasterOpType(ins);
-    let v = O::compute(reg(m, fi.rs1()), reg(m, fi.rs2()));
-    set(m, fi.rd(), v);
-    execute!(exec, cache, i + STEP, m, pc, c)
+handler! {
+    /// The register-register bytecodes (C++ `RV32I_BC_OP_*`, `RV64I_BC_OP_*`),
+    /// sharing their arithmetic with the precise handlers.
+    pub(crate) fn op<O: RtypeAlu>(f) {
+        let fi = FasterOpType(f.ins());
+        let v = O::compute(reg(f.m, fi.rs1()), reg(f.m, fi.rs2()));
+        set(f.m, fi.rd(), v);
+        execute!(f, f.i() + STEP)
+    }
 }
 
-/// The CA-format register-register ops that C++ leaves to
-/// `RV32C_BC_FUNCTION` (C.SUB, C.AND, C.SUBW, C.ADDW, C.MUL): `rs1 = rs1 op
-/// rs2`, then the next entry, exactly what that bytecode does.
-#[rustc_align(64)]
-pub(crate) extern "rust-preserve-none" fn c_op<O: RtypeAlu>(
-    exec: &DecodedSegment,
-    cache: &[DecoderEntry],
-    i: usize,
-    m: &mut Machine,
-    c: Counter,
-    ins: u32,
-    pc: u64,
-) -> Exit {
-    let fi = FasterItype(ins);
-    let v = O::compute(reg(m, fi.rs1()), reg(m, fi.rs2()));
-    set(m, fi.rs1(), v);
-    execute!(exec, cache, i + 1, m, pc, c)
+handler! {
+    /// The CA-format register-register ops that C++ leaves to
+    /// `RV32C_BC_FUNCTION` (C.SUB, C.AND, C.SUBW, C.ADDW, C.MUL): `rs1 = rs1 op
+    /// rs2`, then the next entry, exactly what that bytecode does.
+    pub(crate) fn c_op<O: RtypeAlu>(f) {
+        let fi = FasterItype(f.ins());
+        let v = O::compute(reg(f.m, fi.rs1()), reg(f.m, fi.rs2()));
+        set(f.m, fi.rs1(), v);
+        execute!(f, f.i() + 1)
+    }
 }
 
 sequential! {
@@ -394,25 +378,14 @@ sequential! {
     }
 }
 
-/// AUIPC reconstructs its address from the block end (C++ `rv32i_auipc`).
-#[rustc_align(64)]
-pub(crate) extern "rust-preserve-none" fn auipc(
-    exec: &DecodedSegment,
-    cache: &[DecoderEntry],
-    i: usize,
-    m: &mut Machine,
-    c: Counter,
-    ins: u32,
-    pc: u64,
-) -> Exit {
-    let fi = FasterJtype(ins);
-    let block_bytes = entry!(exec, cache, i, m, pc, c).block_bytes();
-    set(
-        m,
-        fi.rd(),
-        pc.wrapping_sub(block_bytes).wrapping_add(fi.upper_imm()),
-    );
-    execute!(exec, cache, i + STEP, m, pc, c)
+handler! {
+    /// AUIPC reconstructs its address from the block end (C++ `rv32i_auipc`).
+    pub(crate) fn auipc(f) {
+        let fi = FasterJtype(f.ins());
+        let here = f.this_pc();
+        set(f.m, fi.rd(), here.wrapping_add(fi.upper_imm()));
+        execute!(f, f.i() + STEP)
+    }
 }
 
 /// Loads: `rs1 = extend(read(rs2 + imm))` (C++ `RV32I_BC_LD*`,
@@ -421,70 +394,57 @@ pub(crate) extern "rust-preserve-none" fn auipc(
 /// raises faults.
 macro_rules! loads {
     ($($(#[$attr:meta])* $name:ident, $cached:ident, $slow:ident, $step:expr, $n:literal, |$m:ident, $rd:ident, $b:ident| $set:expr;)*) => {$(
-        $(#[$attr])*
-        #[rustc_align(64)]
-        pub(crate) extern "rust-preserve-none" fn $name(
-            exec: &DecodedSegment,
-            cache: &[DecoderEntry],
-            i: usize,
-            $m: &mut Machine,
-            c: Counter,
-            ins: u32,
-            pc: u64,
-        ) -> Exit {
-            let fi = FasterItype(ins);
-            let addr = reg($m, fi.rs2()).wrapping_add(fi.signed_imm() as u64);
-            let Some($b) = $m.memory.arena_read::<$n>(addr) else {
-                become $cached(exec, cache, i, $m, c, ins, pc)
-            };
-            let $rd = fi.rs1();
-            $set;
-            execute!(exec, cache, i + $step, $m, pc, c)
+        handler! {
+            $(#[$attr])*
+            pub(crate) fn $name(f) {
+                let fi = FasterItype(f.ins());
+                {
+                    let $m = &mut *f.m;
+                    let addr = reg($m, fi.rs2()).wrapping_add(fi.signed_imm() as u64);
+                    if let Some($b) = $m.memory.arena_read::<$n>(addr) {
+                        let $rd = fi.rs1();
+                        $set;
+                        execute!(f, f.i() + $step)
+                    }
+                }
+                tail!(f, $cached)
+            }
         }
 
-        /// Outside the arena: a page cache hit, without the calls (and
-        /// so the stack frame) of the full page-table path in `$slow`.
-        #[rustc_align(64)]
-        #[inline(never)]
-        extern "rust-preserve-none" fn $cached(
-            exec: &DecodedSegment,
-            cache: &[DecoderEntry],
-            i: usize,
-            $m: &mut Machine,
-            c: Counter,
-            ins: u32,
-            pc: u64,
-        ) -> Exit {
-            let fi = FasterItype(ins);
-            let addr = reg($m, fi.rs2()).wrapping_add(fi.signed_imm() as u64);
-            let Some($b) = $m.memory.read_cached::<$n>(addr) else {
-                become $slow(exec, cache, i, $m, c, ins, pc)
-            };
-            let $rd = fi.rs1();
-            $set;
-            execute!(exec, cache, i + $step, $m, pc, c)
+        handler! {
+            /// Outside the arena: a page cache hit, without the calls (and
+            /// so the stack frame) of the full page-table path in `$slow`.
+            #[inline(never)]
+            fn $cached(f) {
+                let fi = FasterItype(f.ins());
+                {
+                    let $m = &mut *f.m;
+                    let addr = reg($m, fi.rs2()).wrapping_add(fi.signed_imm() as u64);
+                    if let Some($b) = $m.memory.read_cached::<$n>(addr) {
+                        let $rd = fi.rs1();
+                        $set;
+                        execute!(f, f.i() + $step)
+                    }
+                }
+                tail!(f, $slow)
+            }
         }
 
-        #[cold]
-        #[inline(never)]
-        extern "rust-preserve-none" fn $slow(
-            exec: &DecodedSegment,
-            cache: &[DecoderEntry],
-            i: usize,
-            $m: &mut Machine,
-            c: Counter,
-            ins: u32,
-            pc: u64,
-        ) -> Exit {
-            let fi = FasterItype(ins);
-            let addr = reg($m, fi.rs2()).wrapping_add(fi.signed_imm() as u64);
-            let $b = match $m.memory.read_slow::<$n>(addr) {
-                Ok(b) => b,
-                Err(err) => return fault($m, err),
-            };
-            let $rd = fi.rs1();
-            $set;
-            execute!(exec, cache, i + $step, $m, pc, c)
+        cold_handler! {
+            fn $slow(f) {
+                let fi = FasterItype(f.ins());
+                {
+                    let $m = &mut *f.m;
+                    let addr = reg($m, fi.rs2()).wrapping_add(fi.signed_imm() as u64);
+                    let $b = match $m.memory.read_slow::<$n>(addr) {
+                        Ok(b) => b,
+                        Err(err) => return fault($m, err),
+                    };
+                    let $rd = fi.rs1();
+                    $set;
+                }
+                execute!(f, f.i() + $step)
+            }
         }
     )*};
 }
@@ -523,69 +483,56 @@ loads! {
 /// `RV32F_BC_FS*`), with a cold page-table handler like [`loads!`].
 macro_rules! stores {
     ($($(#[$attr:meta])* $name:ident, $cached:ident, $slow:ident, $step:expr, |$m:ident, $rs2:ident| $value:expr;)*) => {$(
-        $(#[$attr])*
-        #[rustc_align(64)]
-        pub(crate) extern "rust-preserve-none" fn $name(
-            exec: &DecodedSegment,
-            cache: &[DecoderEntry],
-            i: usize,
-            $m: &mut Machine,
-            c: Counter,
-            ins: u32,
-            pc: u64,
-        ) -> Exit {
-            let fi = FasterItype(ins);
-            let addr = reg($m, fi.rs1()).wrapping_add(fi.signed_imm() as u64);
-            let $rs2 = fi.rs2();
-            let value = $value;
-            if !$m.memory.arena_write(addr, value) {
-                become $cached(exec, cache, i, $m, c, ins, pc)
+        handler! {
+            $(#[$attr])*
+            pub(crate) fn $name(f) {
+                let fi = FasterItype(f.ins());
+                {
+                    let $m = &mut *f.m;
+                    let addr = reg($m, fi.rs1()).wrapping_add(fi.signed_imm() as u64);
+                    let $rs2 = fi.rs2();
+                    let value = $value;
+                    if !$m.memory.arena_write(addr, value) {
+                        tail!(f, $cached)
+                    }
+                }
+                execute!(f, f.i() + $step)
             }
-            execute!(exec, cache, i + $step, $m, pc, c)
         }
 
-        /// Outside the arena: a page cache hit on a page of its own, like
-        /// the loads' `$cached`.
-        #[rustc_align(64)]
-        #[inline(never)]
-        extern "rust-preserve-none" fn $cached(
-            exec: &DecodedSegment,
-            cache: &[DecoderEntry],
-            i: usize,
-            $m: &mut Machine,
-            c: Counter,
-            ins: u32,
-            pc: u64,
-        ) -> Exit {
-            let fi = FasterItype(ins);
-            let addr = reg($m, fi.rs1()).wrapping_add(fi.signed_imm() as u64);
-            let $rs2 = fi.rs2();
-            let value = $value;
-            if !$m.memory.write_cached(addr, value) {
-                become $slow(exec, cache, i, $m, c, ins, pc)
+        handler! {
+            /// Outside the arena: a page cache hit on a page of its own, like
+            /// the loads' `$cached`.
+            #[inline(never)]
+            fn $cached(f) {
+                let fi = FasterItype(f.ins());
+                {
+                    let $m = &mut *f.m;
+                    let addr = reg($m, fi.rs1()).wrapping_add(fi.signed_imm() as u64);
+                    let $rs2 = fi.rs2();
+                    let value = $value;
+                    if !$m.memory.write_cached(addr, value) {
+                        tail!(f, $slow)
+                    }
+                }
+                execute!(f, f.i() + $step)
             }
-            execute!(exec, cache, i + $step, $m, pc, c)
         }
 
-        #[cold]
-        #[inline(never)]
-        extern "rust-preserve-none" fn $slow(
-            exec: &DecodedSegment,
-            cache: &[DecoderEntry],
-            i: usize,
-            $m: &mut Machine,
-            c: Counter,
-            ins: u32,
-            pc: u64,
-        ) -> Exit {
-            let fi = FasterItype(ins);
-            let addr = reg($m, fi.rs1()).wrapping_add(fi.signed_imm() as u64);
-            let $rs2 = fi.rs2();
-            let value = $value;
-            if let Err(err) = $m.memory.write_slow(addr, value) {
-                return fault($m, err);
+        cold_handler! {
+            fn $slow(f) {
+                let fi = FasterItype(f.ins());
+                {
+                    let $m = &mut *f.m;
+                    let addr = reg($m, fi.rs1()).wrapping_add(fi.signed_imm() as u64);
+                    let $rs2 = fi.rs2();
+                    let value = $value;
+                    if let Err(err) = $m.memory.write_slow(addr, value) {
+                        return fault($m, err);
+                    }
+                }
+                execute!(f, f.i() + $step)
             }
-            execute!(exec, cache, i + $step, $m, pc, c)
         }
     )*};
 }
@@ -618,35 +565,29 @@ stores! {
 #[cfg(feature = "ext-f")]
 macro_rules! fp_arith {
     ($($(#[$attr:meta])* $name:ident, |$a:ident, $b:ident| $e:expr;)*) => {$(
-        $(#[$attr])*
-        #[rustc_align(64)]
-        pub(crate) extern "rust-preserve-none" fn $name(
-            exec: &DecodedSegment,
-            cache: &[DecoderEntry],
-            i: usize,
-            m: &mut Machine,
-            c: Counter,
-            ins: u32,
-            pc: u64,
-        ) -> Exit {
-            use crate::isa::rvfd::{CANONICAL_NAN_F32, NANBOXING, load_u32};
-            let fi = FasterFloatType(ins);
-            let x = m.cpu.regs.fp_bits(fi.rs1());
-            let y = m.cpu.regs.fp_bits(fi.rs2());
-            if fi.func() == 0 {
-                if NANBOXING && ((x >> 32) as u32 != u32::MAX || (y >> 32) as u32 != u32::MAX) {
-                    load_u32(m, fi.rd(), CANONICAL_NAN_F32);
+        handler! {
+            $(#[$attr])*
+            pub(crate) fn $name(f) {
+                use crate::isa::rvfd::{CANONICAL_NAN_F32, NANBOXING, load_u32};
+                let fi = FasterFloatType(f.ins());
+                let m = &mut *f.m;
+                let x = m.cpu.regs.fp_bits(fi.rs1());
+                let y = m.cpu.regs.fp_bits(fi.rs2());
+                if fi.func() == 0 {
+                    if NANBOXING && ((x >> 32) as u32 != u32::MAX || (y >> 32) as u32 != u32::MAX) {
+                        load_u32(m, fi.rd(), CANONICAL_NAN_F32);
+                    } else {
+                        let ($a, $b) = (f32::from_bits(x as u32), f32::from_bits(y as u32));
+                        let r: f32 = $e;
+                        load_u32(m, fi.rd(), r.to_bits());
+                    }
                 } else {
-                    let ($a, $b) = (f32::from_bits(x as u32), f32::from_bits(y as u32));
-                    let r: f32 = $e;
-                    load_u32(m, fi.rd(), r.to_bits());
+                    let ($a, $b) = (f64::from_bits(x), f64::from_bits(y));
+                    let r: f64 = $e;
+                    m.cpu.regs.set_fp_bits(fi.rd(), r.to_bits());
                 }
-            } else {
-                let ($a, $b) = (f64::from_bits(x), f64::from_bits(y));
-                let r: f64 = $e;
-                m.cpu.regs.set_fp_bits(fi.rd(), r.to_bits());
+                execute!(f, f.i() + STEP)
             }
-            execute!(exec, cache, i + STEP, m, pc, c)
         }
     )*};
 }
@@ -668,24 +609,17 @@ fp_arith! {
 /// (forward branches cannot loop).
 macro_rules! branches {
     ($($(#[$attr:meta])* $name:ident, forward: $fw:expr, |$a:ident, $b:ident| $cond:expr;)*) => {$(
-        $(#[$attr])*
-        #[rustc_align(64)]
-        pub(crate) extern "rust-preserve-none" fn $name(
-            exec: &DecodedSegment,
-            cache: &[DecoderEntry],
-            i: usize,
-            m: &mut Machine,
-            c: Counter,
-            ins: u32,
-            pc: u64,
-        ) -> Exit {
-            let fi = FasterItype(ins);
-            let $a = reg(m, fi.rs1());
-            let $b = reg(m, fi.rs2());
-            if $cond {
-                next_block!(exec, cache, i, m, pc, c, fi.signed_imm(), !$fw)
+        handler! {
+            $(#[$attr])*
+            pub(crate) fn $name(f) {
+                let fi = FasterItype(f.ins());
+                let $a = reg(f.m, fi.rs1());
+                let $b = reg(f.m, fi.rs2());
+                if $cond {
+                    next_block!(f, fi.signed_imm(), !$fw)
+                }
+                next_block!(f, 4, false)
             }
-            next_block!(exec, cache, i, m, pc, c, 4, false)
         }
     )*};
 }
@@ -709,156 +643,97 @@ branches! {
     bgeu, forward: false, |a, b| a >= b;
 }
 
-/// C++ `RV32C_BC_BEQZ`. Unlike the 4-byte branches, C++ checks the counter
-/// on forward branches too (`PERFORM_BRANCH`).
-#[rustc_align(64)]
-pub(crate) extern "rust-preserve-none" fn c_beqz(
-    exec: &DecodedSegment,
-    cache: &[DecoderEntry],
-    i: usize,
-    m: &mut Machine,
-    c: Counter,
-    ins: u32,
-    pc: u64,
-) -> Exit {
-    let fi = FasterItype(ins);
-    if reg(m, fi.rs1()) == 0 {
-        next_block!(exec, cache, i, m, pc, c, fi.signed_imm(), true)
+handler! {
+    /// C++ `RV32C_BC_BEQZ`. Unlike the 4-byte branches, C++ checks the counter
+    /// on forward branches too (`PERFORM_BRANCH`).
+    pub(crate) fn c_beqz(f) {
+        let fi = FasterItype(f.ins());
+        if reg(f.m, fi.rs1()) == 0 {
+            next_block!(f, fi.signed_imm(), true)
+        }
+        next_block!(f, 2, false)
     }
-    next_block!(exec, cache, i, m, pc, c, 2, false)
 }
 
-/// C++ `RV32C_BC_BNEZ`
-#[rustc_align(64)]
-pub(crate) extern "rust-preserve-none" fn c_bnez(
-    exec: &DecodedSegment,
-    cache: &[DecoderEntry],
-    i: usize,
-    m: &mut Machine,
-    c: Counter,
-    ins: u32,
-    pc: u64,
-) -> Exit {
-    let fi = FasterItype(ins);
-    if reg(m, fi.rs1()) != 0 {
-        next_block!(exec, cache, i, m, pc, c, fi.signed_imm(), true)
+handler! {
+    /// C++ `RV32C_BC_BNEZ`
+    pub(crate) fn c_bnez(f) {
+        let fi = FasterItype(f.ins());
+        if reg(f.m, fi.rs1()) != 0 {
+            next_block!(f, fi.signed_imm(), true)
+        }
+        next_block!(f, 2, false)
     }
-    next_block!(exec, cache, i, m, pc, c, 2, false)
 }
 
-/// C++ `RV32C_BC_JMP`: the offset is the whole entry.
-#[rustc_align(64)]
-pub(crate) extern "rust-preserve-none" fn c_jmp(
-    exec: &DecodedSegment,
-    cache: &[DecoderEntry],
-    i: usize,
-    m: &mut Machine,
-    c: Counter,
-    ins: u32,
-    pc: u64,
-) -> Exit {
-    next_block!(exec, cache, i, m, pc, c, i64::from(ins as i32), true)
-}
-
-/// C++ `RV32C_BC_JR`: the entry is the register.
-#[rustc_align(64)]
-pub(crate) extern "rust-preserve-none" fn c_jr(
-    exec: &DecodedSegment,
-    cache: &[DecoderEntry],
-    _i: usize,
-    m: &mut Machine,
-    c: Counter,
-    ins: u32,
-    _pc: u64,
-) -> Exit {
-    let target = reg(m, ins) & !1;
-    overflow_checked_jump!(exec, cache, m, target, c)
-}
-
-/// C++ `RV32C_BC_JALR`. Reads the target before writing RA.
-#[rustc_align(64)]
-pub(crate) extern "rust-preserve-none" fn c_jalr(
-    exec: &DecodedSegment,
-    cache: &[DecoderEntry],
-    _i: usize,
-    m: &mut Machine,
-    c: Counter,
-    ins: u32,
-    pc: u64,
-) -> Exit {
-    let target = reg(m, ins);
-    set(m, REG_RA, pc.wrapping_add(2));
-    overflow_checked_jump!(exec, cache, m, target & !1, c)
-}
-
-/// C++ `RV32I_BC_JAL`, with a link register other than `x0`/`ra`.
-#[rustc_align(64)]
-pub(crate) extern "rust-preserve-none" fn jal(
-    exec: &DecodedSegment,
-    cache: &[DecoderEntry],
-    i: usize,
-    m: &mut Machine,
-    c: Counter,
-    ins: u32,
-    pc: u64,
-) -> Exit {
-    let fi = FasterJtype(ins);
-    set(m, fi.rd(), pc.wrapping_add(4));
-    next_block!(exec, cache, i, m, pc, c, fi.signed_imm(), true)
-}
-
-/// C++ `RV32I_BC_FAST_JAL` (JAL with `rd = x0`): the offset is the whole entry.
-#[rustc_align(64)]
-pub(crate) extern "rust-preserve-none" fn fast_jal(
-    exec: &DecodedSegment,
-    cache: &[DecoderEntry],
-    i: usize,
-    m: &mut Machine,
-    c: Counter,
-    ins: u32,
-    pc: u64,
-) -> Exit {
-    next_block!(exec, cache, i, m, pc, c, i64::from(ins as i32), true)
-}
-
-/// C++ `RV32I_BC_FAST_CALL` (JAL with `rd = ra`).
-#[rustc_align(64)]
-pub(crate) extern "rust-preserve-none" fn fast_call(
-    exec: &DecodedSegment,
-    cache: &[DecoderEntry],
-    i: usize,
-    m: &mut Machine,
-    c: Counter,
-    ins: u32,
-    pc: u64,
-) -> Exit {
-    set(m, REG_RA, pc.wrapping_add(4));
-    next_block!(exec, cache, i, m, pc, c, i64::from(ins as i32), true)
-}
-
-/// C++ `RV32I_BC_JALR`.
-#[rustc_align(64)]
-pub(crate) extern "rust-preserve-none" fn jalr(
-    exec: &DecodedSegment,
-    cache: &[DecoderEntry],
-    _i: usize,
-    m: &mut Machine,
-    c: Counter,
-    ins: u32,
-    pc: u64,
-) -> Exit {
-    let fi = FasterItype(ins);
-    // If rs1 == rd, avoid the clobber by computing the address first.
-    let address = reg(m, fi.rs2()).wrapping_add(fi.signed_imm() as u64);
-    if fi.rs1() != 0 {
-        set(m, fi.rs1(), pc.wrapping_add(4));
+handler! {
+    /// C++ `RV32C_BC_JMP`: the offset is the whole entry.
+    pub(crate) fn c_jmp(f) {
+        next_block!(f, i64::from(f.ins() as i32), true)
     }
-    let target = address & !1;
-    if !COMPRESSED && target & 0x3 != 0 {
-        return fault(
-            m,
-            MachineError::trigger(ExceptionKind::MisalignedInstruction, target),
-        );
+}
+
+handler! {
+    /// C++ `RV32C_BC_JR`: the entry is the register.
+    pub(crate) fn c_jr(f) {
+        let target = reg(f.m, f.ins()) & !1;
+        overflow_checked_jump!(f, target)
     }
-    overflow_checked_jump!(exec, cache, m, target, c)
+}
+
+handler! {
+    /// C++ `RV32C_BC_JALR`. Reads the target before writing RA.
+    pub(crate) fn c_jalr(f) {
+        let target = reg(f.m, f.ins());
+        let link = f.end_pc().wrapping_add(2);
+        set(f.m, REG_RA, link);
+        overflow_checked_jump!(f, target & !1)
+    }
+}
+
+handler! {
+    /// C++ `RV32I_BC_JAL`, with a link register other than `x0`/`ra`.
+    pub(crate) fn jal(f) {
+        let fi = FasterJtype(f.ins());
+        let link = f.end_pc().wrapping_add(4);
+        set(f.m, fi.rd(), link);
+        next_block!(f, fi.signed_imm(), true)
+    }
+}
+
+handler! {
+    /// C++ `RV32I_BC_FAST_JAL` (JAL with `rd = x0`): the offset is the whole entry.
+    pub(crate) fn fast_jal(f) {
+        next_block!(f, i64::from(f.ins() as i32), true)
+    }
+}
+
+handler! {
+    /// C++ `RV32I_BC_FAST_CALL` (JAL with `rd = ra`).
+    pub(crate) fn fast_call(f) {
+        let link = f.end_pc().wrapping_add(4);
+        set(f.m, REG_RA, link);
+        next_block!(f, i64::from(f.ins() as i32), true)
+    }
+}
+
+handler! {
+    /// C++ `RV32I_BC_JALR`.
+    pub(crate) fn jalr(f) {
+        let fi = FasterItype(f.ins());
+        // If rs1 == rd, avoid the clobber by computing the address first.
+        let address = reg(f.m, fi.rs2()).wrapping_add(fi.signed_imm() as u64);
+        if fi.rs1() != 0 {
+            let link = f.end_pc().wrapping_add(4);
+            set(f.m, fi.rs1(), link);
+        }
+        let target = address & !1;
+        if !COMPRESSED && target & 0x3 != 0 {
+            return fault(
+                f.m,
+                MachineError::trigger(ExceptionKind::MisalignedInstruction, target),
+            );
+        }
+        overflow_checked_jump!(f, target)
+    }
 }

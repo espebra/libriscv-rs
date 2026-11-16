@@ -63,6 +63,15 @@ pub struct MachineOptions {
     /// Instructions between checks for completed background compilations,
     /// clamped to at least 1. Smaller slices reduce the delay before native execution.
     pub jit_background_slice: u64,
+    /// The interpreter returns to its dispatch loop at the first
+    /// instruction-limit check after this many instructions, clamped to at
+    /// least 1. Results and instruction counts do not depend on it.
+    ///
+    /// Without the `nightly-dispatch` feature, instruction handlers chain
+    /// through ordinary calls in tail position. Optimized builds turn these
+    /// into jumps; where that does not happen (unoptimized builds), this
+    /// bounds the host stack they use. Default: [`DISPATCH_SLICE`](crate::DISPATCH_SLICE).
+    pub dispatch_slice: u64,
     /// Mask native guest addresses with `arena_size - 1` instead of checking
     /// bounds (C++ `translate_automatic_nbit_address_space`). Applies to JIT code
     /// and translations generated through `aot_output`.
@@ -179,6 +188,7 @@ impl Default for MachineOptions {
             jit_background: false,
             free_decode_bytes: crate::FREE_DECODE_BYTES,
             jit_background_slice: crate::JIT_BACKGROUND_SLICE,
+            dispatch_slice: crate::DISPATCH_SLICE,
             jit_automatic_nbit_address_space: false,
             jit_ignore_instruction_limit: false,
             jit_spectre_guards: true,

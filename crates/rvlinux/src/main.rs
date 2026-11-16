@@ -42,6 +42,7 @@ struct CliArgs {
     allowed_files: Vec<String>,
     fuel: Option<u64>,
     memory_mib: Option<u64>,
+    dispatch_slice: Option<u64>,
     call_function: Option<String>,
     program: PathBuf,
     guest_args: Vec<String>,
@@ -72,6 +73,9 @@ fn usage(name: &str) {
     );
     println!(
         "      --libc-fastpath  Hot-patch memcpy, memset, strlen etc. with native implementations"
+    );
+    println!(
+        "      --dispatch-slice amt  Return to the dispatch loop every amt instructions (testing)"
     );
     if cfg!(any(feature = "jit", feature = "aot")) {
         println!(
@@ -196,6 +200,9 @@ fn parse_args() -> Result<CliArgs, String> {
             "--libc-fastpath" => args.libc_fastpath = true,
             "-f" | "--fuel" => args.fuel = Some(num(&mut it, "--fuel")?),
             "-m" | "--memory" => args.memory_mib = Some(num(&mut it, "--memory")?),
+            "--dispatch-slice" => {
+                args.dispatch_slice = Some(num(&mut it, "--dispatch-slice")?);
+            }
             "-c" | "--call" => {
                 let func = it
                     .next()
@@ -346,6 +353,7 @@ fn main() -> ExitCode {
         #[cfg(feature = "aot")]
         aot_output: aot_output.clone(),
         libc_fastpath: args.libc_fastpath,
+        dispatch_slice: args.dispatch_slice.unwrap_or(libriscv::DISPATCH_SLICE),
         // One machine per process: nothing to share the program's
         // read-only memory with; skip image creation.
         use_shared_rodata: false,

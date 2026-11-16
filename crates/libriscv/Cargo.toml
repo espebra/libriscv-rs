@@ -16,6 +16,12 @@ ext-c = []
 ext-f = []
 # The vector extension (RVV 1.0, Zvbb, Zvfhmin); its conversions need F.
 ext-v = ["ext-f"]
+# The fastest interpreter dispatch: guaranteed tail calls (`become`), the
+# `preserve_none` calling convention and aligned handlers. Needs the nightly
+# pinned in `rust-toolchain.toml`. Without it the crate builds on stable Rust,
+# with the same handlers chained by ordinary tail calls. See "Dispatch" in
+# PORTING.md.
+nightly-dispatch = []
 # Software FCSR rounding-mode/flags emulation (C++: RISCV_FCSR). Not ported
 # yet (C++ needs long double for it): enabling it is a compile error.
 fcsr = []
@@ -36,8 +42,9 @@ jit = [
 # Ahead-of-time translation to safe Rust (the counterpart of C++'s binary
 # translation to C): `libriscv::aot`. No dependencies and no unsafe code;
 # translations compiled into the program are registered with
-# `aot::register`. See "AOT" in PORTING.md.
-aot = []
+# `aot::register`. See "AOT" in PORTING.md. The generated Rust uses `become`,
+# so it needs the pinned nightly too, like `nightly-dispatch`.
+aot = ["nightly-dispatch"]
 # Loading translations compiled into shared objects
 # (`aot::load_shared_object`), through `libriscv-jit-rt`.
 aot-dylib = ["aot", "dep:libriscv-jit-rt"]

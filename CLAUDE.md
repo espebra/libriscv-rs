@@ -19,10 +19,12 @@ and the C++ to Rust file mapping.
 
 ```sh
 cargo test                                   # all tests, JIT included (tool-dependent tests skip if tools missing)
+cargo test --workspace --features libriscv/nightly-dispatch,rvlinux/nightly-dispatch  # the opt-in become/preserve_none dispatch
+cargo test --release -p libriscv --test dispatch  # stable dispatch: checks its tail calls are jumps (no stack growth)
 LIBRISCV_REQUIRE_TOOLCHAIN=1 cargo test      # same, but fail instead of skipping
 cargo test -- --ignored                      # include not-yet-enabled difftests
 cargo test -p rvlinux --test difftest rva23  # C++'s RVA23 suite; needs an RVA23 gcc ($RVCC, default ~/riscv/bin/riscv64-unknown-linux-gnu-gcc), else skips (LIBRISCV_REQUIRE_RVA23=1 fails)
-cargo clippy --all-targets -- -D warnings    # must be clean (also with --no-default-features)
+cargo clippy --all-targets -- -D warnings    # must be clean (also with --no-default-features, and with libriscv/nightly-dispatch)
 cargo test --workspace --no-default-features # interpreter only: no Cranelift, no unsafe in the build
 cargo test --workspace --features libriscv/aot-dylib,rvlinux/aot-dylib  # + AOT (needs rustc)
 rvlinux --jit-save-shared x.so prog.elf; rvlinux --jit-load x.so prog.elf   # JIT code cache (also --jit-save-object, RVLINUX_JIT_EMBED)
@@ -50,8 +52,11 @@ cargo bench -p rvlinux --bench coremark   # CoreMark: Rust interpreter/JIT vs C+
 fuzz/do_fuzz.sh vmfuzzer -- -max_total_time=300   # libFuzzer (vmfuzzer/elffuzzer/syshelperfuzzer); needs cargo-fuzz
 ```
 
-Toolchain: pinned nightly (`rust-toolchain.toml`) for `become`. Do not bump it
-as part of unrelated work; see "Toolchain" in `PORTING.md`.
+Toolchain: the crates build on stable Rust; the pinned nightly
+(`rust-toolchain.toml`) is for the opt-in `nightly-dispatch` feature (`become`,
+`preserve_none`) and AOT. Do not bump it as part of unrelated work; see
+"Toolchain" in `PORTING.md`. `.cargo/config.toml` aligns all functions on
+x86-64 for the stable dispatch.
 
 Guests compile with `riscv64-linux-gnu-gcc-14` (`$RCC`); outputs are cached in
 `target/riscv-guests/`. Rust guests (`testutil::build_rust`, `tests/native_rust.rs`)
@@ -74,10 +79,13 @@ need `rustup target add riscv64gc-unknown-linux-gnu` for the pinned toolchain.
   source and reference emulator. Record upstream bugs in the PR and preserve
   compatibility unless instructed otherwise.
 - Port corresponding `../libriscv/tests/unit/*.cpp` cases with each implementation.
-- Use `become` for every dispatch tail call. Handler chains are unbounded;
-  ordinary calls can overflow the stack. Use the shared signature described
-  in `PORTING.md` and the structure in
-  `../libriscv/lib/libriscv/tailcall_dispatch.cpp`.
+- Write handlers once, with `handler!`/`cold_handler!` and the `Frame`
+  methods, and transfer only through the `dispatch::abi` macros. Only
+  `dispatch/abi.rs` differs between the stable dispatch and
+  `nightly-dispatch` (`become`); handler chains are unbounded, and ordinary
+  calls can overflow the stack. Run fallible host code from handlers
+  through `abi::host` (see "Dispatch" in `PORTING.md`). Follow the structure
+  in `../libriscv/lib/libriscv/tailcall_dispatch.cpp`.
 - Start new modules with `//! Port of <C++ files>.`.
 - Preserve byte-compatible `rvlinux` summaries for `testutil::parse_run_output`:
   `>>> Program exited, exit code = N (0xN)` and `Instructions executed: N ...`.

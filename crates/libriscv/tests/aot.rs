@@ -453,7 +453,7 @@ fn fp_special_values_match_up_to_nan() {
     let at = |k: usize| V + 0x1000 * k as u64;
     let make = |k: usize, w: u32, options: MachineOptions| {
         let mut m = Machine::new(
-            &[],
+            [].into(),
             MachineOptions {
                 memory_max: 1 << 24,
                 ..options
@@ -627,7 +627,7 @@ fn merged_bounds_checks_match_the_interpreter() {
     let no_program = |code: &[u8], options: MachineOptions| machine_sized(code, 1 << 20, options);
     let program = |elf: &[u8], options: MachineOptions| {
         let mut m = Machine::new(
-            elf,
+            elf.into(),
             MachineOptions {
                 memory_max: 1 << 20,
                 ..options

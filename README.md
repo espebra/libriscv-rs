@@ -29,8 +29,10 @@ memory. JIT execution reaches approximately 2/3 of native performance. See
 
 ## Building and testing
 
-Requires the nightly toolchain pinned in `rust-toolchain.toml`. Instruction
-dispatch uses guaranteed tail calls (`become`), which are not yet stable.
+Builds on stable Rust. The fastest interpreter is the opt-in
+`nightly-dispatch` feature, which uses guaranteed tail calls (`become`) and
+needs the nightly toolchain pinned in `rust-toolchain.toml` (which this
+repository uses by default).
 
 ```sh
 cargo build

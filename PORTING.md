@@ -58,7 +58,9 @@ planned features.
   Dispatch returns `Result`; release builds use `panic = "abort"`.
 - **Instructions.** `Instr(u32)` replaces `union rv32i_instruction`, with
   format accessors such as `instr.itype().signed_imm()`.
-- **Dispatch.** Guaranteed tail calls with `become`; see "Dispatch".
+- **Dispatch.** Handlers tail-call each other. On stable Rust these are
+  ordinary calls that LLVM turns into jumps; the opt-in `nightly-dispatch`
+  feature uses guaranteed tail calls with `become`. See "Dispatch".
 - **Features.** Behavioral CMake options map to Cargo features, including
   `ext-a`, `ext-c`, `ext-f`, `ext-v`, `fcsr`, and `debug-checks`.
   `ext-c` selects one decoder entry per 2 bytes instead of 4, affecting
@@ -93,27 +95,95 @@ planned features.
 
 ## Toolchain
 
-`rust-toolchain.toml` pins `nightly-2026-09-28` (rustc `d080e7dff`). Dispatch
-requires `explicit_tail_calls`, `rust_preserve_none_cc`, and `fn_align`.
-Explicit tail calls remain an incomplete compiler feature; differential
-tests and instruction-count checks detect regressions.
+The library and `rvlinux` build on stable Rust (tested with 1.98). The
+opt-in `nightly-dispatch` feature, and `aot`, which enables it, need the
+nightly that `rust-toolchain.toml` pins: `nightly-2026-09-28` (rustc
+`d080e7dff`). That dispatch requires `explicit_tail_calls`,
+`rust_preserve_none_cc`, and `fn_align`. Explicit tail calls remain an
+incomplete compiler feature; differential tests and instruction-count checks
+detect regressions. AOT-generated code uses `become` too. The pin still
+applies to all builds in this repository; moving it to stable is separate
+work.
 
 The pin includes `riscv64gc-unknown-linux-gnu` for Rust test and example
 guests built by `testutil::build_rust` and linked with RISC-V GCC.
 
 Update the toolchain separately from unrelated changes. Run the full suite,
-including `--ignored`, repeat benchmarks, and record baseline changes.
-When `become` stabilizes, migrate to stable and remove the feature gate.
-`tail_call_tests.rs` verifies that indirect `become` calls do not grow the
-stack in unoptimized builds.
+including `--ignored`, in both dispatch modes, repeat benchmarks, and record
+baseline changes. `tail_call_tests.rs` verifies that indirect `become` calls
+do not grow the stack in unoptimized builds; `tests/dispatch.rs`
+(`handler_chains_do_not_grow_the_stack`) checks both modes, and with
+`--release` that the stable dispatch's calls are jumps.
+
+`.cargo/config.toml` aligns every function to 64 bytes on x86-64
+(`-C llvm-args=-align-all-functions=6`) for the stable dispatch, which
+cannot align just its handlers (see "Dispatch"). It applies to builds in this
+workspace only, and not when `RUSTFLAGS` is set.
 
 ## Dispatch
 
-Dispatch uses **tail-call threading with `become`**, following C++
-`tailcall_dispatch.cpp` (Clang `musttail` and `preserve_none`). Each handler
-tail-calls the next through a function pointer, giving each instruction its
-own indirect branch. A `match` dispatcher shares one branch; the C++ switch
-dispatcher measured approximately 28% slower than computed goto on CoreMark.
+Dispatch uses **tail-call threading**, following C++ `tailcall_dispatch.cpp`
+(Clang `musttail` and `preserve_none`). Each handler tail-calls the next
+through a function pointer, giving each instruction its own indirect branch.
+A `match` dispatcher shares one branch; the C++ switch dispatcher measured
+approximately 28% slower than computed goto on CoreMark.
+
+There are two modes with one set of handlers. `dispatch/abi.rs` is the only
+code that differs between them: the handler signature and ABI, the
+`Frame` a handler body sees, and the transfer macros (`execute!`,
+`begin_block!`, `next_block!`, `unchecked_jump!`, `overflow_checked_jump!`,
+`tail!`, `resume!`). Handlers in `dispatch.rs` and `bytecode.rs` are
+written once with `handler!`/`cold_handler!`, read their arguments through
+`Frame` methods, and transfer only through those macros.
+`tests/dispatch.rs` (`nightly_dispatch_syntax_stays_in_abi`) rejects
+`become`, `rust-preserve-none`, and `rustc_align` elsewhere.
+
+- **`nightly-dispatch`** (opt-in, pinned nightly): `become`,
+  `extern "rust-preserve-none"`, 64-byte aligned hot handlers, and every
+  value in registers. The C++ mapping below describes this mode.
+- **Default (stable)**: `return handler(...)` in tail position, with the
+  Rust ABI. LLVM turns these into jumps (sibling calls) only when every
+  argument is in a register, at most six on x86-64. So the signature is
+  `fn(exec, i, m, ins, counter) -> Exit`: the limit lives in
+  `DispatchState::limit` (read at limit checks, written after host calls),
+  handlers load the decoder cache's address and length from `exec`, and
+  block-ending handlers compute their own PC from `i` instead of receiving
+  the block-end PC. `ins` is fourth, in rcx for variable shifts.
+
+Stable-mode findings (2026-11-16, Ryzen 9 7950X, fixed-iteration CoreMark,
+`perf stat`):
+
+- Packing the index and instruction bits into one register, to also pass
+  the cache in registers, put a load on the dependency chain from one index
+  to the next: 1.9x the cycles of `nightly-dispatch`. Passing the cache
+  and loading each handler's own bits instead ran 20% more host
+  instructions for the same cycles as the chosen signature.
+- A handler that passes a stack value's address to a call (any large
+  `Result` returned through memory: system calls, vector, atomic and custom
+  instructions through `O::exec`, `jit.run`) gets no jumps at all: LLVM
+  leaves every later call a real call. Such host code runs in
+  `abi::host` (a `move` closure; not inlined in this mode), and native code
+  in `dispatch::native_step`. A disassembly scan of all handlers found no
+  remaining indirect calls in tail position.
+- Without per-function alignment (`fn_align` is nightly-only) the stable
+  dispatch took 15-20% more cycles; aligning all functions
+  (`.cargo/config.toml`) closed the gap. Five interleaved runs, median
+  cycles for 4000 CoreMark iterations (rv64imafdc): HEAD before the split
+  8.24G, `nightly-dispatch` 8.39G, stable 8.48G (+1-3%, within this
+  machine's noise). Host instructions: 27.81G nightly, 29.05G stable
+  (+4.5%); rv64imafdc_zba_zbb_zbs 27.84G / 30.77G.
+
+Sibling calls are an optimization, not a guarantee: unoptimized builds make
+real calls (~500 bytes of stack each). The dispatcher therefore runs in
+slices (`MachineOptions::dispatch_slice`, default `DISPATCH_SLICE`: 65536
+instructions, 256 unoptimized, unbounded with `nightly-dispatch`). A slice
+ends at the first limit check past its length and returns to
+`dispatch_sliced`, which continues where it stopped; this is the background
+JIT's slicing, which already had to be unobservable. A host call that ends a
+slice (a new limit) begins another. Every loop passes a limit check, so a
+chain is bounded by the slice plus the longest run of forward branches and
+fall-throughs. `rvlinux --dispatch-slice 7` runs every difftest scenario a
+second way (`<name>::interp_sliced`); results and counts must match.
 
 C++ dispatch mapping:
 
@@ -149,8 +219,9 @@ follows `cpu_dispatch.cpp`:
 - the entry check is `begin <= pc < end` (tailcall: `pc + 2 <= end`).
 
 Handler chains have no fixed length. They end on counter overflow, `stop()`,
-a system call requiring a dispatcher exit, or a fault. Always use `become`
-for dispatch tail calls to prevent stack growth. Phase 1 introduced this
+a system call requiring a dispatcher exit, or a fault (or a slice end).
+Transfer between handlers only through the `abi` macros, which use `become`
+with `nightly-dispatch`, to prevent stack growth. Phase 1 introduced this
 dispatcher and its decoder cache; Phase 4 added specialized bytecodes.
 
 ### Bytecodes
@@ -955,7 +1026,7 @@ variants into `target/cpp-ref/<mode>/rvlinux` for benchmarking
 - [x] `testutil`: cross-compile guests (cached), run C++ reference, parse output
 - [x] `rvlinux` CLI skeleton with output format contract
 - [x] Difftest scaffolding (ignored until Phase 2)
-- [x] Dispatch decision: pinned nightly + `become`; C++ dispatch variants built and baselined
+- [x] Dispatch decision: pinned nightly + `become`; C++ dispatch variants built and baselined (since 2026-11-16 the opt-in `nightly-dispatch`; stable by default)
 
 ### Phase 1 — Minimal machine (RV64I + M, freestanding guests; complete)
 
@@ -1527,7 +1598,9 @@ and JIT. `rustguestfuzzer` exercises collection operations on supplied bytes.
 - [x] Benchmark harness: CoreMark (`crates/rvlinux/benches/coremark.rs`) vs the C++ reference, `target/cpp-ref/{threaded,tailcall,asmjit}`; VM calls (`crates/libriscv/benches/vmcall.rs`)
 - [ ] Benchmark harness: dhrystone, STREAM
 - [x] Specialised bytecodes (`decode_bytecodes.cpp`, `threaded_rewriter.cpp`, `bytecode_impl.cpp`, `threaded_bytecodes.hpp`); see "Bytecodes"
-- [x] `extern "rust-preserve-none"` handlers
+- [x] `extern "rust-preserve-none"` handlers (`nightly-dispatch`)
+- [x] Stable-Rust dispatch by default, `nightly-dispatch` opt-in, one set of handlers (`dispatch/abi.rs`; `dispatch_slice`, `rvlinux --dispatch-slice`); see "Dispatch"
+- [ ] Stable toolchain pin, and CI for both dispatch modes
 - [x] Instruction fusion (`rvi_fuse.cpp`): nothing to port, C++ never calls `try_fuse`
 - [x] Shared execute segments across machines and forks, background JIT results reaching every holder (`decoder_cache.cpp` `SharedExecuteSegments`, `util/crc32.hpp`); see "Shared execute segments"
 - [x] Shared read-only data (`shared_rodata.cpp`), copy-on-write, with the `jit` feature; see "Shared read-only data"
@@ -1588,7 +1661,7 @@ phase starts; names below are the intended targets.
 | `cached_address.hpp` (`CachedAddress`) | — | 3 | not yet (a cached `address_of`) |
 | `registers.hpp`, `rvv_registers.hpp` | `registers.rs`, `rvv_registers.rs` | 1–2, 5 | ✅ integer, FP (raw bits) + FCSR (the `fp64reg` views are in `isa/rvfd.rs`), vector |
 | `cpu.hpp`, `cpu.cpp`, `cpu_inline.hpp` | `cpu.rs` | 1 | ✅ (`create_block_ending_entry_at`, `install_ebreak_for`: `decoder_cache.rs`; other debugger helpers: Phase 5) |
-| `tailcall_dispatch.cpp` | `dispatch.rs` | 1, 4 | ✅ |
+| `tailcall_dispatch.cpp` | `dispatch.rs`, `dispatch/abi.rs` | 1, 4 | ✅ |
 | `cpu_dispatch.cpp`, `threaded_dispatch.cpp`, `cpu_inaccurate_dispatch.cpp`, `threaded_inaccurate_dispatch.cpp` | — | — | superseded by tail-call dispatch; `cpu_dispatch.cpp` defines the observable semantics (see "Dispatch") |
 | `machine.hpp`, `machine.cpp`, `machine_inline.hpp` | `machine.rs`, `sysargs.rs` | 1–3 | Phase 1 part ✅ (`system()`, syscalls, simulate), fork ✅, typed `sysargs`/`set_result` ✅ |
 | `machine_vmcall.hpp`, `prepared_call.hpp` | `vmcall.rs` | 3 | ✅ `vmcall`/`preempt` (`PreparedCall`: not yet) |

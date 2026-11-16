@@ -13,6 +13,8 @@ default = ["jit"]
 # unless given `--no-translate`. Without it (`--no-default-features`),
 # `rvlinux` only interprets, and no crate in the build has unsafe code.
 jit = ["libriscv/jit"]
+# The fastest interpreter (`libriscv/nightly-dispatch`); needs the pinned nightly.
+nightly-dispatch = ["libriscv/nightly-dispatch"]
 # Adds `--aot-save`/`--aot-save-shared`: translate the program to Rust ahead
 # of time, and runs translations compiled into `rvlinux`
 # (`RVLINUX_AOT_EMBED`). No unsafe code.
