@@ -1237,7 +1237,7 @@ impl RustGuest {
     }
 
     fn with_options(options: MachineOptions) -> Self {
-        let mut machine = Machine::new(rust_guest_binary(), options).unwrap();
+        let mut machine = Machine::new(rust_guest_binary().into(), options).unwrap();
         machine.set_userdata(GuestState::default());
         machine.set_printer(|_, _| {});
         let heap = machine.memory.mmap_allocate(HEAP_SIZE);

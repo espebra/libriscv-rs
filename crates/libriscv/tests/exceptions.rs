@@ -169,7 +169,7 @@ fn build(code: &str) -> Option<Vec<u8>> {
 }
 
 fn linux_machine(binary: &[u8], native_heap: bool) -> Machine {
-    let mut machine = Machine::new(binary, MachineOptions::default()).unwrap();
+    let mut machine = Machine::new(binary.into(), MachineOptions::default()).unwrap();
     if native_heap {
         setup_native_system_calls(&mut machine, 16 << 20);
     }

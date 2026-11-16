@@ -53,7 +53,7 @@ fn run(set_altstack: bool, instructions: u64) -> Machine {
         ECALL,                    // 40
         0x6f,                     // 44: (not reached)
     ];
-    let mut m = Machine::new(&[], MachineOptions::default()).unwrap();
+    let mut m = Machine::new([].into(), MachineOptions::default()).unwrap();
     m.setup_linux_syscalls(false, false);
     m.setup_posix_threads();
     let mut stack_t = [0u8; 24];

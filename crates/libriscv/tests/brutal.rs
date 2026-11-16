@@ -38,7 +38,7 @@ fn no_arena() -> MachineOptions {
 
 /// A Linux machine without an arena, run to the end of `main`.
 fn booted(binary: &[u8], args: &[&str]) -> Machine {
-    let mut machine = Machine::new(binary, no_arena()).unwrap();
+    let mut machine = Machine::new(binary.into(), no_arena()).unwrap();
     machine.setup_linux_syscalls(false, false);
     machine.setup_linux(args, &ENV).unwrap();
     machine
@@ -56,7 +56,7 @@ fn call(m: &mut Machine, f: &str, arg: i64) -> i64 {
 #[test]
 fn forked_machines_require_an_empty_flat_memory_arena() {
     let master = Machine::new(
-        &[],
+        [].into(),
         MachineOptions {
             memory_max: 8 << 20,
             use_memory_arena: true,
@@ -116,7 +116,7 @@ fn calculate_fib_50_slowly() {
     ) else {
         return;
     };
-    let mut machine = Machine::new(&binary, no_arena()).unwrap();
+    let mut machine = Machine::new(binary.as_slice().into(), no_arena()).unwrap();
 
     let addr = machine.address_of("my_start").unwrap();
     assert_ne!(addr, 0);

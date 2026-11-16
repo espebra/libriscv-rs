@@ -54,7 +54,7 @@ fn report(name: &str, start: Instant, n: u64) {
 }
 
 fn create(binary: &[u8], options: &MachineOptions) -> Machine {
-    let mut m = Machine::new(binary, options.clone()).unwrap();
+    let mut m = Machine::new(binary.into(), options.clone()).unwrap();
     m.setup_linux_syscalls(false, false);
     m.setup_linux(&["vmcall"], &["LC_ALL=C"]).unwrap();
     m.install_syscall_handler(500, |m| {

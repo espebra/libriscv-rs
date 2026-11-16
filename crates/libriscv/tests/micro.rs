@@ -36,7 +36,7 @@ fn code_bytes(program: &[u32]) -> Vec<u8> {
 }
 
 fn empty_machine(options: MachineOptions) -> Machine {
-    Machine::new(&[], options).unwrap()
+    Machine::new([].into(), options).unwrap()
 }
 
 /// Run `program` at `V` from fresh registers, once with the tail-call
@@ -195,7 +195,7 @@ fn run_elf_payload(elf: &[u8], use_memory_arena: bool) -> libriscv::Result<()> {
         use_memory_arena,
         ..Default::default()
     };
-    let mut machine = Machine::new(elf, options)?;
+    let mut machine = Machine::new(elf.into(), options)?;
     machine.set_on_unhandled_syscall(ignore_syscall);
     machine.simulate(MAX_CYCLES)
 }

@@ -82,7 +82,7 @@ fn activate_native_helper_syscalls() {
     ) else {
         return;
     };
-    let mut machine = Machine::new(&binary, MachineOptions::default()).unwrap();
+    let mut machine = Machine::new(binary.as_slice().into(), MachineOptions::default()).unwrap();
     machine.setup_linux_syscalls(false, false);
     setup_native_system_calls(&mut machine, 65536);
 
@@ -127,7 +127,7 @@ fn use_native_helper_syscalls() {
     ) else {
         return;
     };
-    let mut machine = Machine::new(&binary, MachineOptions::default()).unwrap();
+    let mut machine = Machine::new(binary.as_slice().into(), MachineOptions::default()).unwrap();
     setup_native_system_calls(&mut machine, 65536);
     machine.setup_linux_syscalls(false, false);
     machine.setup_linux(&["native"], &ENV).unwrap();
@@ -159,7 +159,7 @@ fn free_unknown_causes_exception() {
     ) else {
         return;
     };
-    let mut machine = Machine::new(&binary, MachineOptions::default()).unwrap();
+    let mut machine = Machine::new(binary.as_slice().into(), MachineOptions::default()).unwrap();
     setup_native_system_calls(&mut machine, 65536);
     machine.setup_linux_syscalls(false, false);
     machine.setup_linux(&["native"], &ENV).unwrap();
@@ -188,7 +188,7 @@ fn bare_machine() -> Machine {
         memory_max: 8 << 20,
         ..Default::default()
     };
-    let mut machine = Machine::new(&[], options).unwrap();
+    let mut machine = Machine::new([].into(), options).unwrap();
     machine
         .setup_native_heap(HEAP_SYSCALLS_BASE, 0x10_0000, 0x1_0000)
         .unwrap();
@@ -251,7 +251,7 @@ fn native_heap_system_calls() {
     let err = call(&mut m, heap + 3, &[c]).unwrap_err();
     assert_eq!(err.message, "Possible double-free for freed pointer");
     // Without a heap.
-    let mut plain = Machine::new(&[], MachineOptions::default()).unwrap();
+    let mut plain = Machine::new([].into(), MachineOptions::default()).unwrap();
     assert!(!plain.has_arena());
     let err = plain.arena().unwrap_err();
     assert_eq!(err.kind, ExceptionKind::SystemCallFailed);
@@ -341,7 +341,7 @@ fn backtrace_with_symbols() {
     ) else {
         return;
     };
-    let mut machine = Machine::new(&binary, MachineOptions::default()).unwrap();
+    let mut machine = Machine::new(binary.as_slice().into(), MachineOptions::default()).unwrap();
     setup_native_system_calls(&mut machine, 65536);
     machine.setup_linux_syscalls(false, false);
     machine.setup_linux(&["native"], &ENV).unwrap();
@@ -440,7 +440,7 @@ fn build_cxx(code: &str, extra: &str) -> Vec<u8> {
 
 /// A machine running `binary` to completion, with the native heap.
 fn container_machine(binary: &[u8], heap_size: u64) -> Machine {
-    let mut machine = Machine::new(binary, MachineOptions::default()).unwrap();
+    let mut machine = Machine::new(binary.into(), MachineOptions::default()).unwrap();
     setup_native_system_calls(&mut machine, heap_size);
     machine.setup_linux_syscalls(false, false);
     machine.setup_linux(&["vmcall"], &ENV).unwrap();

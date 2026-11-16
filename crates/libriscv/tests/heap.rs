@@ -676,7 +676,7 @@ fn syscall_layer_rejects_hostile_guest_inputs() {
         memory_max: 64 << 20,
         ..Default::default()
     };
-    let mut machine = Machine::new(&[], options).unwrap();
+    let mut machine = Machine::new([].into(), options).unwrap();
     let heap: u64 = 0x10_0000;
     machine.setup_native_heap(500, heap, 8 << 20).unwrap();
     let syscall = |m: &mut Machine, number: u64, a0: u64, a1: u64| {

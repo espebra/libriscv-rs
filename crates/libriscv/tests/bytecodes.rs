@@ -183,7 +183,7 @@ struct Outcome {
 }
 
 fn run(code: &[u8], seed: u64, precise: bool) -> Outcome {
-    let mut m = Machine::new(&[], MachineOptions::default()).unwrap();
+    let mut m = Machine::new([].into(), MachineOptions::default()).unwrap();
     // The program ends in `j .`, so the dispatcher runs until its limit.
     let mut code = code.to_vec();
     code.extend(0x0000_006Fu32.to_le_bytes());

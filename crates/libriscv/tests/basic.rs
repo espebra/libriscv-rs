@@ -7,6 +7,8 @@
     clippy::indexing_slicing
 )]
 
+use std::sync::Arc;
+
 use libriscv::{ExceptionKind, Machine, MachineOptions};
 
 const MAX_MEMORY: u64 = 8 << 20;
@@ -36,11 +38,11 @@ fn instantiate_machine() {
     let binary = build("int main() { return 666; }", "-O2 -static");
     if !libriscv::COMPRESSED_ENABLED {
         // An RVC executable needs the C extension.
-        let err = Machine::new(&binary, options()).unwrap_err();
+        let err = Machine::new(binary.as_slice().into(), options()).unwrap_err();
         assert_eq!(err.kind, ExceptionKind::InvalidProgram, "{err}");
         return;
     }
-    let machine = Machine::new(&binary, options()).unwrap();
+    let machine = Machine::new(binary.as_slice().into(), options()).unwrap();
 
     // The stack is mmap allocated
     assert!(machine.memory.stack_initial() > machine.memory.mmap_start());
@@ -70,7 +72,7 @@ fn execute_minimal_machine() {
         "#,
         &format!("-static -ffreestanding -nostartfiles {RV64IM}"),
     );
-    let mut machine = Machine::new(&binary, options()).unwrap();
+    let mut machine = Machine::new(binary.as_slice().into(), options()).unwrap();
     machine.install_syscall_handler(1, |m| {
         m.stop();
         Ok(())
@@ -80,6 +82,53 @@ fn execute_minimal_machine() {
     // li, li, ecall: the block ends with the ECALL, and the machine stopped
     // there.
     assert_eq!(machine.instruction_counter(), 3);
+}
+
+/// Machines hold the caller's ELF instead of a copy of it, hand it back
+/// for creating more machines, and outlive the caller's handle.
+#[test]
+fn machines_share_one_binary() {
+    if !testutil::need_compiler() {
+        return;
+    }
+    let binary: Arc<[u8]> = build(
+        r#"
+        __asm__(".global _start\n"
+        ".section .text\n"
+        "_start:\n"
+        "	li a0, 666\n"
+        "	li a7, 1\n"
+        "	ecall\n");
+        "#,
+        &format!("-static -ffreestanding -nostartfiles {RV64IM}"),
+    )
+    .into();
+    // Forking requires a machine without a memory arena.
+    let options = MachineOptions {
+        use_memory_arena: false,
+        ..options()
+    };
+    let first = Machine::new(Arc::clone(&binary), options.clone()).unwrap();
+    // A second machine from the first one's ELF.
+    let second = Machine::new(Arc::clone(first.memory.binary()), options).unwrap();
+    let fork = first.fork().unwrap();
+    let machines = [first, second, fork];
+    for m in &machines {
+        assert!(Arc::ptr_eq(m.memory.binary(), &binary));
+    }
+    // The caller's handle, the two machines, and the fork's own reference.
+    assert_eq!(Arc::strong_count(&binary), 4);
+    let weak = Arc::downgrade(&binary);
+    drop(binary);
+    for mut m in machines {
+        m.install_syscall_handler(1, |m| {
+            m.stop();
+            Ok(())
+        });
+        m.simulate(10).unwrap();
+        assert_eq!(m.return_value() as i32, 666);
+    }
+    assert_eq!(weak.strong_count(), 0);
 }
 
 #[test]
@@ -97,7 +146,7 @@ fn execution_timeout() {
         "#,
         &format!("-static -ffreestanding -nostartfiles {RV64IM}"),
     );
-    let mut machine = Machine::new(&binary, options()).unwrap();
+    let mut machine = Machine::new(binary.as_slice().into(), options()).unwrap();
     // Simulate 250k instructions before giving up
     let err = machine.simulate(250_000).unwrap_err();
     assert_eq!(err.kind, ExceptionKind::MaxInstructionsReached);
@@ -112,7 +161,7 @@ fn jit_option_requires_the_feature() {
         jit: true,
         ..options()
     };
-    let result = Machine::new(&[], options);
+    let result = Machine::new([].into(), options);
     if cfg!(feature = "jit") {
         assert!(result.is_ok());
     } else {
@@ -154,7 +203,7 @@ fn verify_program_arguments_and_environment() {
         }"#,
         "-O2 -static",
     );
-    let mut machine = Machine::new(&binary, linux_options()).unwrap();
+    let mut machine = Machine::new(binary.as_slice().into(), linux_options()).unwrap();
     machine.setup_linux_syscalls(true, true);
     machine
         .setup_linux(
@@ -186,7 +235,7 @@ fn catch_output_from_write_system_call() {
         }"#,
         "-O2 -static",
     );
-    let mut machine = Machine::new(&binary, linux_options()).unwrap();
+    let mut machine = Machine::new(binary.as_slice().into(), linux_options()).unwrap();
     machine.setup_linux_syscalls(false, false);
     machine.setup_linux(&["basic"], &ENV).unwrap();
     machine.set_printer(|_, data| HELLO.store(data == b"Hello World!", Ordering::Relaxed));
@@ -221,7 +270,7 @@ fn calculate_fib_50() {
         return;
     }
     let binary = build(&FIB.replace("EBREAK;", ""), "-O2 -static");
-    let mut machine = Machine::new(&binary, linux_options()).unwrap();
+    let mut machine = Machine::new(binary.as_slice().into(), linux_options()).unwrap();
     machine.setup_linux_syscalls(false, false);
     machine.setup_linux(&["basic", "50"], &ENV).unwrap();
     machine.simulate(MAX_INSTRUCTIONS).unwrap();
@@ -243,7 +292,7 @@ fn count_using_ebreak() {
         &FIB.replace("EBREAK;", "__asm__(\"ebreak\");"),
         "-O2 -static",
     );
-    let mut machine = Machine::new(&binary, MachineOptions::default()).unwrap();
+    let mut machine = Machine::new(binary.as_slice().into(), MachineOptions::default()).unwrap();
     machine.setup_linux_syscalls(false, false);
     machine.setup_linux(&["basic", "50"], &ENV).unwrap();
     // Count the EBREAKs, and stop at the 25th.

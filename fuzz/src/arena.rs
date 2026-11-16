@@ -70,7 +70,7 @@ pub fn fuzz_arena_discard(data: &[u8]) {
         memory_max: ARENA,
         ..MachineOptions::default()
     };
-    let Ok(mut m) = Machine::new(&[], options) else {
+    let Ok(mut m) = Machine::new([].into(), options) else {
         return;
     };
     if m.memory.memory_arena_size() != ARENA {
@@ -190,7 +190,7 @@ mod tests {
             memory_max: ARENA,
             ..MachineOptions::default()
         };
-        let mut m = Machine::new(&[], options).unwrap();
+        let mut m = Machine::new([].into(), options).unwrap();
         m.memory.memset(0x40_0000, 1, 0x40_0000).unwrap();
         m.memory.memdiscard(0x40_1000, 0x30_0000, true).unwrap();
         let view = m.memory.memview(0x40_0000, 0x40_0000).unwrap();

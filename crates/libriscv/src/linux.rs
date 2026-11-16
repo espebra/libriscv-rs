@@ -118,7 +118,7 @@ impl Machine {
         let platform_addr = push_down(self, &mut dst, b"RISC-V 64-bit\0")?;
 
         // Program headers
-        let binary = std::sync::Arc::clone(self.memory.binary_arc());
+        let binary = std::sync::Arc::clone(self.memory.binary());
         let ehdr = elf::header(&binary)?;
         let phnum = u64::from(ehdr.e_phnum);
         let phdrs_len = phnum * PHDR_SIZE;

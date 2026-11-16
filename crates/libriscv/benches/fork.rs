@@ -78,7 +78,7 @@ fn main() {
         use_memory_arena: false,
         ..Default::default()
     };
-    let mut master = Machine::new(&binary, options).unwrap();
+    let mut master = Machine::new(binary.as_slice().into(), options).unwrap();
     master.setup_linux_syscalls(false, false);
     master.setup_linux(&["fork"], &["LC_ALL=C"]).unwrap();
     master.simulate(u64::MAX).unwrap();

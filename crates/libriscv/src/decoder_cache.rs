@@ -1135,7 +1135,7 @@ exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.";
 
     fn machine(code: &[u8]) -> crate::Machine {
         let mut m = crate::Machine::new(
-            &[],
+            [].into(),
             crate::MachineOptions {
                 memory_max: 1 << 20,
                 ..Default::default()

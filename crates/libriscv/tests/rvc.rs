@@ -18,7 +18,7 @@ use libriscv::{ExceptionKind, Machine, MachineOptions};
 const MEMBASE: u64 = 0x1000;
 
 fn empty_machine() -> Machine {
-    Machine::new(&[], MachineOptions::default()).unwrap()
+    Machine::new([].into(), MachineOptions::default()).unwrap()
 }
 
 /// Code bytes for `halves`, plus 4 bytes of padding: C++ only decodes
@@ -157,7 +157,7 @@ fn dispatch_and_precise_agree() {
     ];
     let mut regs = Vec::new();
     for precise in [false, true] {
-        let mut m = Machine::new(&[], MachineOptions::default()).unwrap();
+        let mut m = Machine::new([].into(), MachineOptions::default()).unwrap();
         m.init_execute_area(&code(program), MEMBASE).unwrap();
         m.cpu.jump(MEMBASE).unwrap();
         m.cpu.set_reg(REG_SP, 0x10_0000);

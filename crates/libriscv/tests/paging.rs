@@ -28,7 +28,7 @@ const VLEN: u64 = 16 * PAGE_SIZE;
 const RO: PageAttributes = PageAttributes::rwx(true, false, false);
 
 fn empty(options: MachineOptions) -> Machine {
-    Machine::new(&[], options).unwrap()
+    Machine::new([].into(), options).unwrap()
 }
 
 fn no_arena() -> MachineOptions {
@@ -56,7 +56,7 @@ fn build(code: &str, args: &str) -> Option<Vec<u8>> {
 /// A Linux machine with 8 MiB of memory: the stack (above the 16 MiB brk
 /// area) is outside the arena, in pages.
 fn linux_machine(binary: &[u8], name: &str) -> Machine {
-    let mut m = Machine::new(binary, small()).unwrap();
+    let mut m = Machine::new(binary.into(), small()).unwrap();
     m.setup_linux_syscalls(false, false);
     m.setup_linux(&[name], &ENV).unwrap();
     m
@@ -584,7 +584,7 @@ fn fib_on_high_memory_page() {
         return;
     };
     for precise in [false, true] {
-        let mut m = Machine::new(&binary, small()).unwrap();
+        let mut m = Machine::new(binary.as_slice().into(), small()).unwrap();
         m.setup_linux_syscalls(false, false);
         m.setup_linux(&["va_exec", "50"], &ENV).unwrap();
         if precise {
@@ -762,7 +762,7 @@ fn instantiate_pie_machine() {
     let Some(binary) = build("int main() { return 666; }", PIE_ARGS) else {
         return;
     };
-    let m = Machine::new(&binary, small()).unwrap();
+    let m = Machine::new(binary.as_slice().into(), small()).unwrap();
     assert!(m.memory.is_dynamic_executable());
     // The stack is mmap allocated
     assert!(m.memory.stack_initial() > m.memory.mmap_start());
@@ -784,7 +784,8 @@ fn shared_object_needs_a_dynamic_linker() {
     let Some(binary) = build("int main() { return 666; }", "-shared") else {
         return;
     };
-    let failed = Machine::new(&binary, small()).and_then(|mut m| m.simulate(MAX_INSTRUCTIONS));
+    let failed = Machine::new(binary.as_slice().into(), small())
+        .and_then(|mut m| m.simulate(MAX_INSTRUCTIONS));
     assert!(failed.is_err());
 }
 
@@ -814,7 +815,7 @@ fn fib_in_pie_executable() {
     ) else {
         return;
     };
-    let mut m = Machine::new(&binary, small()).unwrap();
+    let mut m = Machine::new(binary.as_slice().into(), small()).unwrap();
     m.setup_linux_syscalls(false, false);
     m.setup_linux(&["dynamic"], &["LC_TYPE=C", "LC_ALL=C"])
         .unwrap();
@@ -880,7 +881,7 @@ fn mmap_rwx(addr: u32, area: u64, flags: i32) -> [u32; 8] {
 fn run_decoding_guest(program: &[u32], free_decode_bytes: u64, limit: u64) -> (Machine, bool, u64) {
     let code: Vec<u8> = program.iter().flat_map(|w| w.to_le_bytes()).collect();
     let mut m = Machine::new(
-        &[],
+        [].into(),
         MachineOptions {
             memory_max: 64 << 20,
             free_decode_bytes,

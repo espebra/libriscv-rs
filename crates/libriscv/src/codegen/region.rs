@@ -403,7 +403,7 @@ mod tests {
     fn analysed(words: &[u32]) -> (Machine, Analysis) {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let mut m = Machine::new(
-            &[],
+            [].into(),
             MachineOptions {
                 memory_max: 1 << 20,
                 ..Default::default()

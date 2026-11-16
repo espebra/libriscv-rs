@@ -106,7 +106,7 @@ struct Outcome {
 
 fn machine(code: &[u8], jit: bool) -> Option<Machine> {
     let mut m = Machine::new(
-        &[],
+        [].into(),
         MachineOptions {
             memory_max: MEMORY_MAX,
             jit,

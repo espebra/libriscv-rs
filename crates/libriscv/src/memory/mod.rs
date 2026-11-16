@@ -600,11 +600,10 @@ impl Memory {
         &mut self.arena
     }
 
-    /// The ELF binary the machine was created from.
-    pub fn binary(&self) -> &[u8] {
-        &self.binary
-    }
-    pub(crate) const fn binary_arc(&self) -> &Arc<[u8]> {
+    /// The ELF binary the machine was created from, shared with every
+    /// machine created from the same `Arc` and with forks. Clone it to
+    /// create more machines from the same ELF without copying it.
+    pub const fn binary(&self) -> &Arc<[u8]> {
         &self.binary
     }
 

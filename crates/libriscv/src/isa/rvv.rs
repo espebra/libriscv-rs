@@ -2755,7 +2755,7 @@ mod tests {
         .collect();
         for precise in [false, true] {
             let mut m = Machine::new(
-                &[],
+                [].into(),
                 MachineOptions {
                     memory_max: 1 << 20,
                     jit: false,

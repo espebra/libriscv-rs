@@ -84,7 +84,7 @@ pub(crate) fn quiet(m: &mut Machine) {
 /// instructions.
 pub fn fuzz_instruction_set(data: &[u8]) {
     let run = || -> libriscv::Result<()> {
-        let mut machine = Machine::new(&[], small_options())?;
+        let mut machine = Machine::new([].into(), small_options())?;
         machine
             .memory
             .set_page_attr(S, 0x1000, PageAttributes::default())?;
@@ -115,7 +115,7 @@ pub fn fuzz_instruction_set(data: &[u8]) {
 /// always reproduces from the input alone.
 pub fn fuzz_elf_loader(data: &[u8]) {
     let run = || -> libriscv::Result<()> {
-        let mut machine = Machine::new(data, loader_options())?;
+        let mut machine = Machine::new(data.into(), loader_options())?;
         machine.set_on_unhandled_syscall(|_, _| Ok(()));
         if FUZZ_SYSTEM_CALLS {
             quiet(&mut machine);
@@ -176,7 +176,7 @@ fn syscall_helpers(m: &mut Machine) -> libriscv::Result<()> {
 /// the registers hold.
 pub fn fuzz_syscall_helpers(data: &[u8]) {
     const MAX_CYCLES: u64 = 10_000;
-    let Ok(mut machine) = Machine::new(&[], loader_options()) else {
+    let Ok(mut machine) = Machine::new([].into(), loader_options()) else {
         return;
     };
     quiet(&mut machine);
@@ -201,7 +201,7 @@ pub fn fuzz_native_syscalls(data: &[u8]) {
     let Some((&syscall_id, code)) = data.split_first() else {
         return;
     };
-    let Ok(mut machine) = Machine::new(&[], loader_options()) else {
+    let Ok(mut machine) = Machine::new([].into(), loader_options()) else {
         return;
     };
     quiet(&mut machine);

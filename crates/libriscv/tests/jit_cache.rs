@@ -87,7 +87,7 @@ fn small() -> MachineOptions {
 }
 
 fn machine(options: MachineOptions) -> Machine {
-    let mut m = Machine::new(&[], options).unwrap();
+    let mut m = Machine::new([].into(), options).unwrap();
     let (a, b) = segments();
     m.init_execute_area(&b, B).unwrap();
     m.init_execute_area(&a, A).unwrap();

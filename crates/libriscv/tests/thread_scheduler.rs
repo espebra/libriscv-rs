@@ -41,7 +41,7 @@ const fn jal_x0(off: i32) -> u32 {
 }
 
 fn machine(program: &[u32]) -> Machine {
-    let mut m = Machine::new(&[], MachineOptions::default()).unwrap();
+    let mut m = Machine::new([].into(), MachineOptions::default()).unwrap();
     m.setup_linux_syscalls(false, false);
     m.setup_posix_threads();
     m.copy_to_guest(FUTEX, &[0u8; 8]).unwrap();

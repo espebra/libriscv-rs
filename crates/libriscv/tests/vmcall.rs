@@ -28,7 +28,7 @@ fn build(code: &str) -> Vec<u8> {
 
 fn machine_with(binary: &[u8], options: MachineOptions) -> Machine {
     let mut machine = Machine::new(
-        binary,
+        binary.into(),
         MachineOptions {
             memory_max: MAX_MEMORY,
             ..options

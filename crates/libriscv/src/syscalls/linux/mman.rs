@@ -379,7 +379,7 @@ mod tests {
         std::fs::write(&lib, &contents).unwrap();
         let path = lib.to_str().unwrap().to_owned();
         let mut m = Machine::new(
-            &[],
+            [].into(),
             MachineOptions {
                 memory_max: 64 << 20,
                 ..Default::default()

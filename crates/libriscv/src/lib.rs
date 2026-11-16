@@ -12,7 +12,8 @@
 //!
 //! # fn main() -> libriscv::Result<()> {
 //! let binary = std::fs::read("program.elf").unwrap();
-//! let mut machine = Machine::new(&binary, MachineOptions::default())?;
+//! // An `Arc<[u8]>`: machines created from clones of it share one copy.
+//! let mut machine = Machine::new(binary.into(), MachineOptions::default())?;
 //! machine.setup_minimal_syscalls();
 //! machine.simulate(1_000_000)?;
 //! println!("exit code: {}", machine.return_value() as i32);
@@ -28,7 +29,7 @@
 //!
 //! # fn main() -> libriscv::Result<()> {
 //! let binary = std::fs::read("program.elf").unwrap();
-//! let mut machine = Machine::new(&binary, MachineOptions::default())?;
+//! let mut machine = Machine::new(binary.into(), MachineOptions::default())?;
 //! machine.setup_linux(&["program", "arg"], &["LC_ALL=C"])?;
 //! machine.setup_linux_syscalls(true, false);
 //! machine.setup_posix_threads();

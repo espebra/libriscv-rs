@@ -302,7 +302,7 @@ fn machine(binary: &[u8]) -> Machine {
         allow_write_exec_segment: true,
         ..Default::default()
     };
-    let mut m = Machine::new(binary, options).unwrap();
+    let mut m = Machine::new(binary.into(), options).unwrap();
     m.setup_minimal_syscalls();
     m
 }

@@ -36,7 +36,7 @@ fn empty() -> Machine {
         memory_max: MAX_MEMORY,
         ..Default::default()
     };
-    Machine::new(&[], options).unwrap()
+    Machine::new([].into(), options).unwrap()
 }
 
 fn linux_machine(code: &str, name: &str) -> Option<Machine> {
@@ -48,7 +48,7 @@ fn linux_machine(code: &str, name: &str) -> Option<Machine> {
         memory_max: MAX_MEMORY,
         ..Default::default()
     };
-    let mut machine = Machine::new(&binary, options).unwrap();
+    let mut machine = Machine::new(binary.as_slice().into(), options).unwrap();
     machine.setup_linux_syscalls(false, false);
     machine.setup_linux(&[name], &ENV).unwrap();
     Some(machine)

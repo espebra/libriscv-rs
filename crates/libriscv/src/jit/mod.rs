@@ -379,7 +379,7 @@ pub(crate) mod tests {
 
     fn run(code: &[u8], slice: Option<u64>, fuel: u64) -> (Result<bool, String>, Vec<u64>) {
         let mut m = Machine::new(
-            &[],
+            [].into(),
             MachineOptions {
                 memory_max: 1 << 20,
                 jit: slice.is_some(),
@@ -417,7 +417,7 @@ pub(crate) mod tests {
         let lp = V + 0x1000;
         let bytes: Vec<u8> = page.iter().flat_map(|w| w.to_le_bytes()).collect();
         let mut m = Machine::new(
-            &[],
+            [].into(),
             MachineOptions {
                 memory_max: 1 << 20,
                 jit,
@@ -534,7 +534,7 @@ pub(crate) mod tests {
             .collect();
         let run = |jit: bool| {
             let mut m = Machine::new(
-                &[],
+                [].into(),
                 MachineOptions {
                     memory_max: 1 << 20,
                     jit,
@@ -575,7 +575,7 @@ pub(crate) mod tests {
         }
         let run = |jit: bool| {
             let mut m = Machine::new(
-                &[],
+                [].into(),
                 MachineOptions {
                     memory_max: 1 << 20,
                     jit,
@@ -667,7 +667,7 @@ pub(crate) mod tests {
             for &w in words {
                 let code: Vec<u8> = [w, JSELF].iter().flat_map(|w| w.to_le_bytes()).collect();
                 let mut m = Machine::new(
-                    &[],
+                    [].into(),
                     MachineOptions {
                         memory_max: 1 << 20,
                         ..Default::default()
@@ -707,7 +707,7 @@ pub(crate) mod tests {
         let code: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
         let run = |jit: bool, a: f64, b: f32| {
             let mut m = Machine::new(
-                &[],
+                [].into(),
                 MachineOptions {
                     memory_max: 1 << 20,
                     jit,
@@ -783,7 +783,7 @@ pub(crate) mod tests {
         let code: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
         let run = |options: MachineOptions| {
             let mut m = Machine::new(
-                &[],
+                [].into(),
                 MachineOptions {
                     memory_max: 1 << 20,
                     ..options
@@ -857,7 +857,7 @@ pub(crate) mod tests {
         // `jit_spectre_guards`, or `None` without a JIT.
         let guards = |on: bool| {
             let mut m = Machine::new(
-                &[],
+                [].into(),
                 MachineOptions {
                     memory_max: 1 << 20,
                     jit_spectre_guards: on,
@@ -898,7 +898,7 @@ pub(crate) mod tests {
         words.push(JSELF);
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let mut m = Machine::new(
-            &[],
+            [].into(),
             MachineOptions {
                 memory_max: 1 << 20,
                 ..Default::default()
@@ -946,7 +946,7 @@ pub(crate) mod tests {
         };
         let machine = |jit: bool, background: bool| {
             let mut m = Machine::new(
-                &[],
+                [].into(),
                 MachineOptions {
                     memory_max: 1 << 20,
                     jit,

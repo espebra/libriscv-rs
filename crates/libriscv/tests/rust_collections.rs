@@ -35,7 +35,7 @@ const HEAP_SIZE: u64 = 0x100_0000;
 
 fn machine() -> Machine {
     let mut m = Machine::new(
-        &[],
+        [].into(),
         MachineOptions {
             memory_max: 64 << 20,
             ..Default::default()

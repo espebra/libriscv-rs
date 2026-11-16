@@ -146,7 +146,7 @@ fn run(binary: &[u8], scenario: u32, translated: bool) -> (Machine, Outcome) {
         jit: translated,
         ..Default::default()
     };
-    let mut machine = Machine::new(binary, options).unwrap();
+    let mut machine = Machine::new(binary.into(), options).unwrap();
     if translated {
         assert!(machine.cpu.current_execute_segment().jit_entry_count() > 0);
     }
@@ -267,7 +267,7 @@ fn unknown_dyncall_index_and_other_custom_instructions() {
     .unwrap();
     for jit in [false, cfg!(feature = "jit")] {
         let mut machine = Machine::new(
-            &binary,
+            binary.as_slice().into(),
             MachineOptions {
                 memory_max: 8 << 20,
                 jit,

@@ -65,7 +65,7 @@ fn point_into_data(m: &mut Machine) {
 /// A Linux machine running `code`, set up like `rvlinux --sandbox`.
 fn linux_machine(code: &[u8], options: MachineOptions) -> Option<Machine> {
     let binary = elf::executable(code, &[]);
-    let mut m = Machine::new(&binary, options).ok()?;
+    let mut m = Machine::new(binary.as_slice().into(), options).ok()?;
     deterministic(&mut m);
     sandboxed_linux(&mut m);
     m.setup_linux(&["program"], &["LC_ALL=C"]).ok()?;
@@ -184,7 +184,7 @@ fn libc_machine(data: &[u8]) -> Option<Machine> {
         libc_fastpath: true,
         ..options()
     };
-    let mut m = Machine::new(&binary, options).ok()?;
+    let mut m = Machine::new(binary.as_slice().into(), options).ok()?;
     deterministic(&mut m);
     m.setup_linux_syscalls(false, false);
     m.setup_linux(&["program"], &["LC_ALL=C"]).ok()?;
@@ -266,7 +266,7 @@ fn fork_and_compare(data: &[u8]) -> Option<()> {
         use_memory_arena: false,
         ..options()
     };
-    let mut parent = Machine::new(&binary, options).ok()?;
+    let mut parent = Machine::new(binary.as_slice().into(), options).ok()?;
     deterministic(&mut parent);
     parent.setup_minimal_syscalls();
     parent.setup_native_memory(100);

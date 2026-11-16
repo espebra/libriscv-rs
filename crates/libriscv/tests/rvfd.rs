@@ -40,7 +40,7 @@ fn code_bytes(program: &[u32]) -> Vec<u8> {
 /// dispatcher and once with the precise interpreter, checking both.
 fn run_both(program: &[u32], setup: impl Fn(&mut Machine), verify: impl Fn(&Machine)) {
     const V: u64 = 0x2000;
-    let mut machine = Machine::new(&[], MachineOptions::default()).unwrap();
+    let mut machine = Machine::new([].into(), MachineOptions::default()).unwrap();
     machine.init_execute_area(&code_bytes(program), V).unwrap();
 
     let reset = |machine: &mut Machine| {
@@ -252,7 +252,7 @@ fn single_precision_writes_keep_the_upper_half() {
 fn illegal_formats_raise_illegal_operation() {
     // FSQRT.H: no half-precision arithmetic.
     let program = [enc_rtype(ENC_OP_FP, 0, 0x2E, 1, 0, 0), ENC_JSELF];
-    let mut machine = Machine::new(&[], MachineOptions::default()).unwrap();
+    let mut machine = Machine::new([].into(), MachineOptions::default()).unwrap();
     machine
         .init_execute_area(&code_bytes(&program), 0x2000)
         .unwrap();

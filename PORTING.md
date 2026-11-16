@@ -1998,6 +1998,7 @@ itself, so:
 - [ ] Call-depth handling
 - [ ] `PreparedCall` (`prepared_call.hpp`)
 - [x] Guest memory views, `copy_to/from_guest`, `memstring`, `stack_push` (`memory/helpers.rs`: `Buffer`/`membuffer`, `strlen`, `memstring_view`, `memview`/`memview_mut` with `maxlen`, typed `memarray`/`memspan`/`try_memarray` as `GuestSlice`/`GuestSliceMut` over `GuestPod`, `try_memmove`, both `memcmp`s, machine-to-machine `memcpy_from`, `read_value`/`write_value`; `stack_push_value`)
+- [x] Shared ELF: `Machine::new(Arc<[u8]>, options)` and `Memory::binary() -> &Arc<[u8]>`, so many machines run one ELF without copying it. C++'s `Machine(std::string_view)` borrows the caller's bytes, which must outlive the machine; here they're shared by reference count instead (forks share the machine's)
 - [x] Printer / stdin / rdtime hooks
 - [x] Userdata (`set_userdata`/`get_userdata`; `with_userdata`, not in C++), custom instructions (`on_unimplemented_instruction`); see "Architecture decisions"
 - [x] Fork with CoW (`machine.cpp`, `cpu.cpp`, `memory.cpp` `machine_loader`), page caches; see "Fork". (C++ `Memory::reset()` is empty: nothing to port)

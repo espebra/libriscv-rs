@@ -36,7 +36,7 @@ fn linux_machine(binary: &[u8], filesystem: bool) -> Machine {
         memory_max: 8 << 20,
         ..Default::default()
     };
-    let mut machine = Machine::new(binary, options).unwrap();
+    let mut machine = Machine::new(binary.into(), options).unwrap();
     machine.setup_linux_syscalls(filesystem, false);
     machine.setup_linux(&["linux_test"], &ENV).unwrap();
     machine
@@ -283,7 +283,7 @@ fn malloc_free_and_brk() {
     }"#;
     // 8 MiB live in mmap: more than the 4 MiB of pages an 8 MiB machine has
     // outside its arena (C++ runs out of memory too), so use the default.
-    let mut machine = Machine::new(&build(code), MachineOptions::default()).unwrap();
+    let mut machine = Machine::new(build(code).into(), MachineOptions::default()).unwrap();
     machine.setup_linux_syscalls(false, false);
     machine.setup_linux(&["linux_test"], &ENV).unwrap();
     assert_eq!(run_in(machine), 666);
@@ -394,7 +394,7 @@ fn pinned_file_mappings() {
             memory_max,
             ..Default::default()
         };
-        let mut machine = Machine::new(&binary, options).unwrap();
+        let mut machine = Machine::new(binary.as_slice().into(), options).unwrap();
         machine.setup_linux_syscalls(true, false);
         machine.setup_linux(&["linux_test"], &ENV).unwrap();
         let fds = machine.fds_mut().unwrap();

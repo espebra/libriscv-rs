@@ -21,7 +21,7 @@ const MASK_NANOS: i64 = !0x3FFF;
 
 /// A machine with a second thread, so that sleeps are short.
 fn machine() -> Machine {
-    let mut m = Machine::new(&[], MachineOptions::default()).unwrap();
+    let mut m = Machine::new([].into(), MachineOptions::default()).unwrap();
     m.setup_linux_syscalls(false, false);
     m.setup_posix_threads();
     // clone: the main thread is suspended and the child runs.
@@ -96,7 +96,7 @@ fn normal_requests_charge_one_instruction_per_microsecond() {
 fn nanosleep_writes_the_clamped_request_back() {
     // Alone, the thread really sleeps: the whole duration is clamped to a
     // second, but the request written back is C++'s, seconds clamped.
-    let mut m = Machine::new(&[], MachineOptions::default()).unwrap();
+    let mut m = Machine::new([].into(), MachineOptions::default()).unwrap();
     m.setup_linux_syscalls(false, false);
     let nsec = 500_000_000i64;
     let mut ts = [0u8; 16];

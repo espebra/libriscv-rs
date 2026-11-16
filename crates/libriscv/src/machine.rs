@@ -132,7 +132,14 @@ fn default_rdtime(m: &Machine) -> u64 {
 impl Machine {
     /// Create a machine and load `binary` (a 64-bit RISC-V ELF) into it.
     /// An empty `binary` creates a machine with empty memory and no code.
-    pub fn new(binary: &[u8], options: MachineOptions) -> Result<Self> {
+    ///
+    /// The machine holds `binary` by reference count instead of copying
+    /// it: every machine created from the same `Arc` (and every fork of
+    /// them) shares one copy of the ELF, which stays alive while any of
+    /// them does. The bytes are never written to. A `Vec<u8>` or `&[u8]`
+    /// converts with `.into()` (one copy); [`Memory::binary`] hands the
+    /// `Arc` back for creating more machines.
+    pub fn new(binary: Arc<[u8]>, options: MachineOptions) -> Result<Self> {
         if options.jit && !cfg!(feature = "jit") {
             return Err(MachineError::new(
                 ExceptionKind::FeatureDisabled,
@@ -140,7 +147,7 @@ impl Machine {
                 0,
             ));
         }
-        let (memory, first_segment) = Memory::new(Arc::from(binary), &options)?;
+        let (memory, first_segment) = Memory::new(binary, &options)?;
         let mut machine = Self {
             cpu: Cpu::new(options.free_decode_bytes),
             memory,

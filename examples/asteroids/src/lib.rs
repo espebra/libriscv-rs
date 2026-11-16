@@ -313,7 +313,7 @@ impl Game {
     /// is ready, and call its `game_init`.
     pub fn new(elf: &[u8], options: &GameOptions) -> Result<Self> {
         let mut m = Machine::new(
-            elf,
+            elf.into(),
             MachineOptions {
                 jit: options.jit,
                 jit_background: options.jit_background,

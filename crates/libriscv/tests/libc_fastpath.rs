@@ -57,7 +57,7 @@ fn run_exerciser(binary: &[u8], fastpath: bool) -> String {
         libc_fastpath: fastpath,
         ..Default::default()
     };
-    let mut machine = Machine::new(binary, options).unwrap();
+    let mut machine = Machine::new(binary.into(), options).unwrap();
     machine.set_userdata(State::default());
     machine.set_printer(collect_output);
     machine.setup_linux_syscalls(false, false);
@@ -91,9 +91,9 @@ fn hot_patching_leaves_guest_memory_untouched() {
         memory_max: MAX_MEMORY,
         ..Default::default()
     };
-    let plain = Machine::new(&binary, options.clone()).unwrap();
+    let plain = Machine::new(binary.as_slice().into(), options.clone()).unwrap();
     let patched = Machine::new(
-        &binary,
+        binary.as_slice().into(),
         MachineOptions {
             libc_fastpath: true,
             ..options
@@ -122,7 +122,7 @@ fn hot_patching_does_not_break_real_breakpoints() {
         libc_fastpath: true,
         ..Default::default()
     };
-    let mut machine = Machine::new(&binary, options).unwrap();
+    let mut machine = Machine::new(binary.as_slice().into(), options).unwrap();
     machine.set_userdata(State::default());
     machine.set_printer(collect_output);
     machine.setup_linux_syscalls(false, false);
@@ -164,7 +164,7 @@ fn breakpoints_without_the_fast_path() {
         ebreak_locations: vec![EbreakLocation::Symbol("main".into())],
         ..Default::default()
     };
-    let mut machine = Machine::new(&binary, options).unwrap();
+    let mut machine = Machine::new(binary.as_slice().into(), options).unwrap();
     machine.set_userdata(State::default());
     machine.set_printer(collect_output);
     machine.setup_linux_syscalls(false, false);

@@ -23,7 +23,7 @@ pub type Regs = [u64; 64];
 
 pub fn machine_sized(code: &[u8], memory_max: u64, options: MachineOptions) -> Machine {
     let mut m = Machine::new(
-        &[],
+        [].into(),
         MachineOptions {
             memory_max,
             ..options

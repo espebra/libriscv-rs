@@ -664,7 +664,7 @@ fn machine(binary: &[u8], jit: bool) -> Machine {
         jit_cache: false,
         ..Default::default()
     };
-    let mut m = Machine::new(binary, options).unwrap();
+    let mut m = Machine::new(binary.into(), options).unwrap();
     m.setup_minimal_syscalls();
     m
 }

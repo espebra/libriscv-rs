@@ -219,7 +219,7 @@ fn accesses_outside_the_arena_use_the_page_table() {
 
 fn elf_machine(elf: &[u8], jit: bool) -> Machine {
     let mut m = Machine::new(
-        elf,
+        elf.into(),
         MachineOptions {
             memory_max: 1 << 20,
             jit,
@@ -1026,16 +1026,16 @@ fn nbit_round_up_limit() {
         jit_automatic_nbit_address_space: true,
         ..Default::default()
     };
-    let m = Machine::new(&[], options(4000 << 20)).unwrap();
+    let m = Machine::new([].into(), options(4000 << 20)).unwrap();
     assert_eq!(m.memory.memory_arena_size(), 4 << 30);
     // 768 MiB -> 1 GiB adds exactly 256 MiB: allowed.
-    let m = Machine::new(&[], options(768 << 20)).unwrap();
+    let m = Machine::new([].into(), options(768 << 20)).unwrap();
     assert_eq!(m.memory.memory_arena_size(), 1 << 30);
-    let err = Machine::new(&[], options((768 << 20) - 4096)).unwrap_err();
+    let err = Machine::new([].into(), options((768 << 20) - 4096)).unwrap_err();
     assert_eq!(err.kind, ExceptionKind::OutOfMemory);
     // Not a problem without the option.
     let m = Machine::new(
-        &[],
+        [].into(),
         MachineOptions {
             jit_automatic_nbit_address_space: false,
             ..options(600 << 20)

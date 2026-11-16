@@ -373,7 +373,7 @@ fn rust_machine(memory: &[u8]) -> Option<Machine> {
         memory_max: 16 << 20,
         ..crate::options()
     };
-    let mut m = Machine::new(&[], options).ok()?;
+    let mut m = Machine::new([].into(), options).ok()?;
     crate::quiet(&mut m);
     m.setup_native_heap(HEAP_SYSCALLS, crate::HEAP, crate::HEAP_SIZE)
         .ok()?;

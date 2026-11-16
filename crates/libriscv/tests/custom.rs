@@ -76,7 +76,7 @@ fn syscall_500(m: &mut Machine) -> libriscv::Result<()> {
 
 fn custom_machine(binary: &[u8]) -> Machine {
     let mut machine = Machine::new(
-        binary,
+        binary.into(),
         MachineOptions {
             memory_max: MAX_MEMORY,
             ..Default::default()
@@ -156,7 +156,7 @@ fn userdata() {
         use_memory_arena: false,
         ..Default::default()
     };
-    let mut machine = Machine::new(&[], options).unwrap();
+    let mut machine = Machine::new([].into(), options).unwrap();
     assert!(!machine.has_userdata());
     assert!(machine.userdata::<u32>().is_none());
 
@@ -189,7 +189,7 @@ fn userdata() {
 #[test]
 fn with_userdata() {
     const LOG: usize = 400;
-    let mut machine = Machine::new(&[], MachineOptions::default()).unwrap();
+    let mut machine = Machine::new([].into(), MachineOptions::default()).unwrap();
     // No userdata, or of another type: f isn't called.
     assert_eq!(machine.with_userdata(|_: &mut Vec<String>, _| 1), None);
     machine.set_userdata(5u32);

@@ -29,7 +29,7 @@ const NOP: u32 = 0x0000_0013;
 const JSELF: u32 = 0x0000_006F;
 
 fn machine_with(program: &[u32]) -> Machine {
-    let mut m = Machine::new(&[], MachineOptions::default()).unwrap();
+    let mut m = Machine::new([].into(), MachineOptions::default()).unwrap();
     let code: Vec<u8> = program.iter().flat_map(|w| w.to_le_bytes()).collect();
     m.init_execute_area(&code, V).unwrap();
     m.cpu.jump(V).unwrap();
@@ -174,11 +174,11 @@ fn dispatcher_and_precise_interpreter_agree() {
     )
     .unwrap_or_else(|e| panic!("{e}"));
 
-    let mut fast = Machine::new(&binary, MachineOptions::default()).unwrap();
+    let mut fast = Machine::new(binary.as_slice().into(), MachineOptions::default()).unwrap();
     fast.setup_minimal_syscalls();
     fast.simulate(100_000_000).unwrap();
 
-    let mut precise = Machine::new(&binary, MachineOptions::default()).unwrap();
+    let mut precise = Machine::new(binary.as_slice().into(), MachineOptions::default()).unwrap();
     precise.setup_minimal_syscalls();
     precise.set_max_instructions(100_000_000);
     precise.simulate_precise().unwrap();
@@ -211,7 +211,7 @@ fn random_code_never_panics() {
         }
         let align = if libriscv::COMPRESSED_ENABLED { 2 } else { 4 };
         let base = 0x2000 + u64::from(next() % 64) * align;
-        let mut m = Machine::new(&[], MachineOptions::default()).unwrap();
+        let mut m = Machine::new([].into(), MachineOptions::default()).unwrap();
         m.set_on_unhandled_syscall(|_, _| Ok(()));
         if m.init_execute_area(&code, base).is_err() {
             continue;
@@ -246,7 +246,7 @@ fn instructions_before_a_breakpoint_are_counted() {
         ebreak_locations: vec![libriscv::EbreakLocation::Address(V + 4)],
         ..Default::default()
     };
-    let mut m = Machine::new(&[], options).unwrap();
+    let mut m = Machine::new([].into(), options).unwrap();
     m.init_execute_area(&code, V).unwrap();
     // The breakpoint loops back to V, as a fast-path function returning to
     // its caller does.
@@ -287,7 +287,7 @@ fn a_breakpoint_after_a_4_byte_instruction_ends_its_block() {
         ebreak_locations: vec![libriscv::EbreakLocation::Address(V + 6)],
         ..Default::default()
     };
-    let mut m = Machine::new(&[], options).unwrap();
+    let mut m = Machine::new([].into(), options).unwrap();
     m.init_execute_area(&code, V).unwrap();
     m.set_userdata(std::sync::atomic::AtomicU64::new(0));
     m.install_syscall_handler(SYSCALL_EBREAK_NR, |m| {

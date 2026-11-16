@@ -146,7 +146,7 @@ fn vmcall_machine(code: &[u8]) -> Option<Machine> {
         memory_max: 16 << 20,
         ..crate::options()
     };
-    let mut m = Machine::new(&binary, options).ok()?;
+    let mut m = Machine::new(binary.as_slice().into(), options).ok()?;
     quiet(&mut m);
     m.set_userdata(State::default());
     m.setup_minimal_syscalls();

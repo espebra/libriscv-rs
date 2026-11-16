@@ -286,7 +286,7 @@ const EXPECTED: [u64; OPS * PAIRS] = [
 ];
 
 fn machine(binary: &[u8]) -> Machine {
-    let mut m = Machine::new(binary, MachineOptions::default()).unwrap();
+    let mut m = Machine::new(binary.into(), MachineOptions::default()).unwrap();
     m.setup_minimal_syscalls();
     m
 }

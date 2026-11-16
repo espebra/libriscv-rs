@@ -78,7 +78,7 @@ fn options() -> MachineOptions {
 }
 
 fn machine(code: &[u8], options: MachineOptions) -> Machine {
-    let mut m = Machine::new(&[], options).unwrap();
+    let mut m = Machine::new([].into(), options).unwrap();
     m.init_execute_area(code, A).unwrap();
     m.cpu.jump(A).unwrap();
     m

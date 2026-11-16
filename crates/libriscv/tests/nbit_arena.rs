@@ -43,7 +43,7 @@ void _start(void) {
 
 fn run(binary: &[u8], jit: bool, nbit: bool) -> Result<i64, ExceptionKind> {
     let mut machine = Machine::new(
-        binary,
+        binary.into(),
         MachineOptions {
             memory_max: MAX_MEMORY,
             jit,

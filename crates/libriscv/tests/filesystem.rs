@@ -55,7 +55,7 @@ fn machine(setup: impl FnOnce(&mut FileDescriptors)) -> Machine {
         memory_max: 8 << 20,
         ..Default::default()
     };
-    let mut m = Machine::new(&[], options).unwrap();
+    let mut m = Machine::new([].into(), options).unwrap();
     m.setup_linux_syscalls(true, false);
     let fds = m.fds_mut().unwrap();
     fds.permit_filesystem = true;

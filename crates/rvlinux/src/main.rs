@@ -353,7 +353,7 @@ fn main() -> ExitCode {
         use_shared_rodata: false,
         ..Default::default()
     };
-    let mut machine = match libriscv::Machine::new(&binary, options) {
+    let mut machine = match libriscv::Machine::new(binary.as_slice().into(), options) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("Exception: {e}");
