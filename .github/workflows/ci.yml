@@ -30,6 +30,7 @@ jobs:
         if: matrix.os == 'ubuntu-24.04'
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - run: cargo clippy --all-targets --features libriscv/nightly-dispatch -- -D warnings
 
   test:
     strategy:
@@ -102,6 +103,19 @@ jobs:
 
       - name: Test the JIT without the C extension
         run: cargo test -p libriscv --no-default-features --features jit
+
+      # The default dispatch relies on LLVM turning handler calls into
+      # jumps; optimized, they must not grow the stack.
+      - name: Check the stable dispatch's tail calls (release)
+        run: cargo test --release -p libriscv --test dispatch
+
+      - name: Test the opt-in nightly dispatch (become, preserve_none)
+        env:
+          LIBRISCV_CPP: ${{ github.workspace }}/libriscv-cpp
+          LIBRISCV_CPP_EMULATOR: ${{ github.workspace }}/libriscv-cpp/emulator/.build/rvlinux
+          COREMARK_DIR: ${{ github.workspace }}/coremark
+          LIBRISCV_REQUIRE_TOOLCHAIN: "1"
+        run: cargo test --workspace --features libriscv/nightly-dispatch,rvlinux/nightly-dispatch
 
   # Run the dynamically linked STREAM benchmark through ld.so and the
   # riscv64 glibc, and check that it completes with validated results:
