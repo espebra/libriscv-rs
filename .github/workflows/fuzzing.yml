@@ -30,7 +30,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install pinned toolchain (rust-toolchain.toml)
+      - name: Install pinned nightly (fuzz/rust-toolchain.toml)
+        working-directory: fuzz
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:

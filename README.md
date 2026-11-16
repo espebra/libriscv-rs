@@ -29,10 +29,14 @@ memory. JIT execution reaches approximately 2/3 of native performance. See
 
 ## Building and testing
 
-Builds on stable Rust. The fastest interpreter is the opt-in
-`nightly-dispatch` feature, which uses guaranteed tail calls (`become`) and
-needs the nightly toolchain pinned in `rust-toolchain.toml` (which this
-repository uses by default).
+Builds on stable Rust (the version pinned in `rust-toolchain.toml`),
+including the interpreter and the JIT. The opt-in `nightly-dispatch` feature
+is the fastest interpreter: it uses guaranteed tail calls (`become`) and
+needs the pinned nightly, as does AOT translation:
+
+```sh
+cargo +nightly-2026-09-28 build --features libriscv/nightly-dispatch,rvlinux/nightly-dispatch
+```
 
 ```sh
 cargo build
@@ -64,14 +68,15 @@ into the host program or a shared object:
 
 ```sh
 rvlinux -Q --aot-save prog.rs prog.elf          # translate to Rust source
-RVLINUX_AOT_EMBED=prog.rs cargo build -p rvlinux --no-default-features --features aot   # embed the translation
+RVLINUX_AOT_EMBED=prog.rs cargo +nightly-2026-09-28 build -p rvlinux --no-default-features --features aot   # embed the translation
 rvlinux -Q --aot-save-shared prog.so prog.elf   # compile a shared object with rustc
 rvlinux --aot-load prog.so prog.elf             # requires aot-dylib
 ```
 
 Translations preserve interpreter results and instruction counts and require
-matching segments and memory layouts. Compilation requires the pinned nightly
-`rustc` for `become`. See `libriscv::aot` and `MachineOptions::aot_output`.
+matching segments and memory layouts. AOT requires the pinned nightly
+(`cargo +nightly-2026-09-28`, also for building `rvlinux` with `aot`) for
+`become`. See `libriscv::aot` and `MachineOptions::aot_output`.
 
 ## License
 

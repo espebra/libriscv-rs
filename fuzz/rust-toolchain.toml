@@ -1,0 +1,7 @@
+# The pinned nightly: cargo-fuzz needs nightly sanitizer flags. It is also
+# the toolchain for the main workspace's opt-in `nightly-dispatch` and `aot`
+# features (`cargo +nightly-2026-09-28 ...`); keep the two in sync with
+# NIGHTLY in .github/workflows/ci.yml. See "Toolchain" in PORTING.md.
+[toolchain]
+channel = "nightly-2026-09-28"
+components = ["rustfmt", "clippy"]

@@ -19,14 +19,14 @@ and the C++ to Rust file mapping.
 
 ```sh
 cargo test                                   # all tests, JIT included (tool-dependent tests skip if tools missing)
-cargo test --workspace --features libriscv/nightly-dispatch,rvlinux/nightly-dispatch  # the opt-in become/preserve_none dispatch
+cargo +nightly-2026-09-28 test --workspace --features libriscv/nightly-dispatch,rvlinux/nightly-dispatch  # the opt-in become/preserve_none dispatch
 cargo test --release -p libriscv --test dispatch  # stable dispatch: checks its tail calls are jumps (no stack growth)
 LIBRISCV_REQUIRE_TOOLCHAIN=1 cargo test      # same, but fail instead of skipping
 cargo test -- --ignored                      # include not-yet-enabled difftests
 cargo test -p rvlinux --test difftest rva23  # C++'s RVA23 suite; needs an RVA23 gcc ($RVCC, default ~/riscv/bin/riscv64-unknown-linux-gnu-gcc), else skips (LIBRISCV_REQUIRE_RVA23=1 fails)
-cargo clippy --all-targets -- -D warnings    # must be clean (also with --no-default-features, and with libriscv/nightly-dispatch)
+cargo clippy --all-targets -- -D warnings    # must be clean (also with --no-default-features, and +nightly with libriscv/nightly-dispatch)
 cargo test --workspace --no-default-features # interpreter only: no Cranelift, no unsafe in the build
-cargo test --workspace --features libriscv/aot-dylib,rvlinux/aot-dylib  # + AOT (needs rustc)
+cargo +nightly-2026-09-28 test --workspace --features libriscv/aot-dylib,rvlinux/aot-dylib  # + AOT (needs the nightly)
 rvlinux --jit-save-shared x.so prog.elf; rvlinux --jit-load x.so prog.elf   # JIT code cache (also --jit-save-object, RVLINUX_JIT_EMBED)
 rvlinux --aot-save-shared x.so prog.elf; rvlinux --aot-load x.so prog.elf   # AOT: translate to safe Rust (also --aot-save x.rs, RVLINUX_AOT_EMBED)
 cargo run --release -p asteroids             # example game: Rust engine + Rust RV64GCB script (examples/asteroids)
@@ -52,15 +52,18 @@ cargo bench -p rvlinux --bench coremark   # CoreMark: Rust interpreter/JIT vs C+
 fuzz/do_fuzz.sh vmfuzzer -- -max_total_time=300   # libFuzzer (vmfuzzer/elffuzzer/syshelperfuzzer); needs cargo-fuzz
 ```
 
-Toolchain: the crates build on stable Rust; the pinned nightly
-(`rust-toolchain.toml`) is for the opt-in `nightly-dispatch` feature (`become`,
-`preserve_none`) and AOT. Do not bump it as part of unrelated work; see
-"Toolchain" in `PORTING.md`. `.cargo/config.toml` aligns all functions on
+Toolchain: the crates, interpreter and JIT build on the stable Rust pinned in
+`rust-toolchain.toml`. The opt-in `nightly-dispatch` feature (`become`,
+`preserve_none`), AOT and the fuzzers need the nightly pinned in
+`fuzz/rust-toolchain.toml` (`cargo +nightly-2026-09-28`; also `NIGHTLY` in
+CI). Do not bump either as part of unrelated work; see "Toolchain" in
+`PORTING.md`. `.cargo/config.toml` aligns all functions on
 x86-64 for the stable dispatch.
 
 Guests compile with `riscv64-linux-gnu-gcc-14` (`$RCC`); outputs are cached in
 `target/riscv-guests/`. Rust guests (`testutil::build_rust`, `tests/native_rust.rs`)
-need `rustup target add riscv64gc-unknown-linux-gnu` for the pinned toolchain.
+need `rustup target add riscv64gc-unknown-linux-gnu` for the toolchain that runs them
+(`rust-toolchain.toml` installs it for stable).
 
 ## Rules
 

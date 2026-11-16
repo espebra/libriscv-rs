@@ -35,8 +35,9 @@ and ignored, matching exception handling in the C++ harness.
 cargo install cargo-fuzz
 ```
 
-The fuzz crate uses the repository's pinned nightly and a separate workspace
-to exclude libFuzzer from the main test build.
+The fuzz crate uses the nightly pinned in `fuzz/rust-toolchain.toml` (the
+main workspace builds on stable) and a separate workspace to exclude
+libFuzzer from the main test build.
 
 ## Running
 

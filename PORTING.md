@@ -95,20 +95,27 @@ planned features.
 
 ## Toolchain
 
-The library and `rvlinux` build on stable Rust (tested with 1.98). The
-opt-in `nightly-dispatch` feature, and `aot`, which enables it, need the
-nightly that `rust-toolchain.toml` pins: `nightly-2026-09-28` (rustc
-`d080e7dff`). That dispatch requires `explicit_tail_calls`,
+The library, the interpreter, the JIT and `rvlinux` build on stable Rust.
+`rust-toolchain.toml` pins the stable release the repository is tested with
+(1.98), so new compiler or clippy releases do not break builds or
+`-D warnings` unannounced.
+
+Two pins exist, for the opt-in parts that need a nightly:
+`nightly-2026-09-28` (rustc `d080e7dff`), named in `fuzz/rust-toolchain.toml`
+(cargo-fuzz needs nightly) and `NIGHTLY` in `.github/workflows/ci.yml`. Use
+it with `cargo +nightly-2026-09-28` for the `nightly-dispatch` feature and
+`aot`, which enables it. That dispatch requires `explicit_tail_calls`,
 `rust_preserve_none_cc`, and `fn_align`. Explicit tail calls remain an
 incomplete compiler feature; differential tests and instruction-count checks
-detect regressions. AOT-generated code uses `become` too. The pin still
-applies to all builds in this repository; moving it to stable is separate
-work.
+detect regressions. AOT-generated code uses `become` too, and
+`AotOutput::write_shared_object` compiles it with the toolchain libriscv was
+built with.
 
-The pin includes `riscv64gc-unknown-linux-gnu` for Rust test and example
-guests built by `testutil::build_rust` and linked with RISC-V GCC.
+The stable pin includes `riscv64gc-unknown-linux-gnu` for Rust test and
+example guests built by `testutil::build_rust` and linked with RISC-V GCC;
+running the tests with the nightly needs that target installed for it too.
 
-Update the toolchain separately from unrelated changes. Run the full suite,
+Update either toolchain separately from unrelated changes. Run the full suite,
 including `--ignored`, in both dispatch modes, repeat benchmarks, and record
 baseline changes. `tail_call_tests.rs` verifies that indirect `become` calls
 do not grow the stack in unoptimized builds; `tests/dispatch.rs`
@@ -1600,7 +1607,7 @@ and JIT. `rustguestfuzzer` exercises collection operations on supplied bytes.
 - [x] Specialised bytecodes (`decode_bytecodes.cpp`, `threaded_rewriter.cpp`, `bytecode_impl.cpp`, `threaded_bytecodes.hpp`); see "Bytecodes"
 - [x] `extern "rust-preserve-none"` handlers (`nightly-dispatch`)
 - [x] Stable-Rust dispatch by default, `nightly-dispatch` opt-in, one set of handlers (`dispatch/abi.rs`; `dispatch_slice`, `rvlinux --dispatch-slice`); see "Dispatch"
-- [ ] Stable toolchain pin, and CI for both dispatch modes
+- [x] Stable toolchain pin (`rust-toolchain.toml`: 1.98), and CI for both dispatch modes; the pinned nightly only for `nightly-dispatch`, AOT and fuzzing (`fuzz/rust-toolchain.toml`, CI `NIGHTLY`)
 - [x] Instruction fusion (`rvi_fuse.cpp`): nothing to port, C++ never calls `try_fuse`
 - [x] Shared execute segments across machines and forks, background JIT results reaching every holder (`decoder_cache.cpp` `SharedExecuteSegments`, `util/crc32.hpp`); see "Shared execute segments"
 - [x] Shared read-only data (`shared_rodata.cpp`), copy-on-write, with the `jit` feature; see "Shared read-only data"

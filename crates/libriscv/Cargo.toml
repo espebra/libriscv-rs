@@ -18,7 +18,7 @@ ext-f = []
 ext-v = ["ext-f"]
 # The fastest interpreter dispatch: guaranteed tail calls (`become`), the
 # `preserve_none` calling convention and aligned handlers. Needs the nightly
-# pinned in `rust-toolchain.toml`. Without it the crate builds on stable Rust,
+# pinned in `fuzz/rust-toolchain.toml` (`cargo +nightly-2026-09-28`). Without it the crate builds on stable Rust,
 # with the same handlers chained by ordinary tail calls. See "Dispatch" in
 # PORTING.md.
 nightly-dispatch = []

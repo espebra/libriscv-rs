@@ -12,6 +12,10 @@ env:
   LIBRISCV_CPP_REF: 9adb3f6618308111a3b1c5e3c407fdc246ce1916
   # eembc/coremark commit for the CoreMark difftest and benchmark.
   COREMARK_REF: eefc986ebd3452d6adde22eafaff3e5c859f29e4
+  # The pinned nightly for the opt-in `nightly-dispatch` and `aot` features;
+  # everything else builds on the stable pinned in rust-toolchain.toml.
+  # Keep in sync with fuzz/rust-toolchain.toml.
+  NIGHTLY: nightly-2026-09-28
 
 jobs:
   lint:
@@ -24,13 +28,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install pinned toolchain (rust-toolchain.toml)
-        run: rustup toolchain install
+      - name: Install pinned toolchains (rust-toolchain.toml, and the nightly)
+        run: |
+          rustup toolchain install
+          rustup toolchain install "$NIGHTLY" --profile minimal -c clippy
       - run: cargo fmt --all --check
         if: matrix.os == 'ubuntu-24.04'
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --no-default-features -- -D warnings
-      - run: cargo clippy --all-targets --features libriscv/nightly-dispatch -- -D warnings
+      - run: cargo +$NIGHTLY clippy --all-targets --features libriscv/nightly-dispatch -- -D warnings
 
   test:
     strategy:
@@ -42,8 +48,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install pinned toolchain (rust-toolchain.toml)
-        run: rustup toolchain install
+      - name: Install pinned toolchains (rust-toolchain.toml, and the nightly)
+        run: |
+          rustup toolchain install
+          rustup toolchain install "$NIGHTLY" --profile minimal -t riscv64gc-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
 
       - name: Install RISC-V cross compiler
@@ -115,7 +123,7 @@ jobs:
           LIBRISCV_CPP_EMULATOR: ${{ github.workspace }}/libriscv-cpp/emulator/.build/rvlinux
           COREMARK_DIR: ${{ github.workspace }}/coremark
           LIBRISCV_REQUIRE_TOOLCHAIN: "1"
-        run: cargo test --workspace --features libriscv/nightly-dispatch,rvlinux/nightly-dispatch
+        run: cargo +$NIGHTLY test --workspace --features libriscv/nightly-dispatch,rvlinux/nightly-dispatch
 
   # Run the dynamically linked STREAM benchmark through ld.so and the
   # riscv64 glibc, and check that it completes with validated results:
@@ -210,8 +218,8 @@ jobs:
             set -eu
             cp -R riscv64-glibc/usr/riscv64-linux-gnu /usr/
 
-            # The pinned nightly, without the rustfmt/clippy components of
-            # rust-toolchain.toml (not needed here).
+            # The pinned stable toolchain, without the rustfmt/clippy
+            # components of rust-toolchain.toml (not needed here).
             channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
             curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$channel"
             export PATH="$HOME/.cargo/bin:$PATH" RUSTUP_TOOLCHAIN="$channel"
@@ -243,3 +251,6 @@ jobs:
       # Everything except `fcsr`, which is a deliberate compile error until
       # it is ported.
       - run: cargo build -p libriscv --features ext-a,ext-c,ext-f,ext-v,debug-checks,jit
+      # The opt-in nightly features: AOT (which enables `nightly-dispatch`).
+      - run: rustup toolchain install "$NIGHTLY" --profile minimal
+      - run: cargo +$NIGHTLY build -p libriscv --features ext-a,ext-c,ext-f,ext-v,jit,aot-dylib

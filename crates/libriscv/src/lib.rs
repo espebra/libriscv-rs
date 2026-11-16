@@ -53,7 +53,7 @@
 //! `tailcall_dispatch.cpp`: each handler tail-calls the next. On stable these
 //! are ordinary calls that the optimizer turns into jumps, with the
 //! dispatcher bounding how many it chains. The opt-in `nightly-dispatch`
-//! feature, which needs the nightly pinned in `rust-toolchain.toml`, uses
+//! feature, which needs a nightly (`cargo +nightly-2026-09-28`), uses
 //! guaranteed tail calls (`become`) and the `preserve_none` calling
 //! convention instead, for the fastest interpreter.
 
