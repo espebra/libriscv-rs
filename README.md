@@ -6,7 +6,9 @@ the C++ implementation, with Cranelift replacing its JIT backend. The library
 uses `#![forbid(unsafe_code)]`. Executable memory and native library loading
 are isolated in `libriscv-jit-rt`.
 
-Supports RV64 only. See [PORTING.md](PORTING.md) for extension coverage and
+[![CI](https://github.com/libriscv/libriscv-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/libriscv/libriscv-rs/actions/workflows/ci.yml) [![Fuzzing](https://github.com/libriscv/libriscv-rs/actions/workflows/fuzzing.yml/badge.svg)](https://github.com/libriscv/libriscv-rs/actions/workflows/fuzzing.yml)
+
+Supports full [RVA23U64](https://docs.riscv.org/reference/rva23/v1.0/rva23-profiles.html#3-1-1-rva23u64-profile). See [PORTING.md](PORTING.md) for extension coverage and
 implementation status.
 
 ## Benchmarks
