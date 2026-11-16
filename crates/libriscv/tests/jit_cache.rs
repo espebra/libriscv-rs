@@ -153,7 +153,7 @@ fn saved_segments_run_like_the_interpreter() {
         ..small()
     });
     assert_eq!(cached(&m), [false, false]);
-    // Another memory layout: the code isn't used.
+    // Another memory layout: the code is not used.
     let mut m = machine(MachineOptions {
         memory_max: 2 << 20,
         ..small()

@@ -1,12 +1,9 @@
-//! Port of `tests/unit/rva23.cpp`: the four RVA23U64 mandatory
-//! extensions that no plain rv64gc toolchain can name -- Zfhmin, Zimop,
-//! Zcmop and Zawrs -- written as raw `.insn` encodings, so the CI toolchain
-//! can build them. The wider RVA23 coverage, which needs a full RVA23
-//! compiler, is in `rva23_suite.rs`; the vector extension's own unit test is
-//! `rvv.rs`.
+//! Port of `tests/unit/rva23.cpp`: Zfhmin, Zimop, Zcmop, and Zawrs tests.
+//! Raw `.insn` encodings allow compilation without an RVA23-aware assembler.
+//! Broader RVA23 coverage is in `crates/rvlinux/tests/difftest.rs`; RVV tests
+//! are in `rvv.rs`.
 //!
-//! The guest is freestanding, so instead of `setup_linux` it runs with the
-//! minimal system calls; it exits with the address of its results.
+//! The freestanding guest uses minimal system calls and returns its result address.
 
 #![cfg(all(feature = "ext-f", feature = "ext-c", feature = "ext-a"))]
 #![allow(

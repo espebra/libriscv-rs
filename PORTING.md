@@ -1,183 +1,134 @@
 # Porting libriscv to safe Rust
 
-This is the plan and progress tracker for the port. Update the status column
-in the same commit that changes it.
+Architecture, implementation status, and validation requirements for the port.
+Update status entries in the same commit as implementation changes.
 
 **Reference:** C++ libriscv at `../libriscv` (override with `$LIBRISCV_CPP`),
 tracking upstream commit `9adb3f6618308111a3b1c5e3c407fdc246ce1916` (v1.11+).
-When the C++ side moves, bump this hash and the ones in
-`.github/workflows/ci.yml` and `fuzzing.yml` together.
+Update this hash together with the reference hashes in
+`.github/workflows/ci.yml` and `fuzzing.yml`.
 
 ## Goals
 
-1. **Safe:** `#![forbid(unsafe_code)]` in every crate, with one exception:
-   `libriscv-jit-rt`, the executable-memory runtime of the optional JIT (see
-   "JIT"), which also loads AOT translations from shared objects (see
-   "AOT"; embedded translations need no unsafe code at all) and owns the
-   guest arena mapping for shared read-only data (see "Shared read-only
-   data"). `libriscv` itself forbids unsafe code with or without the JIT.
-   Prefer zero runtime dependencies for `libriscv` (the `jit` feature adds
-   Cranelift). Nightly *language features* are fine (see Toolchain); unsafe
-   is not.
-2. **Host never panics on guest input.** Every guest fault is a `MachineError`.
+1. **Memory safety.** `libriscv` enforces `#![forbid(unsafe_code)]` with all
+   features. Unsafe operations are isolated in `libriscv-jit-rt`: executable
+   memory, AOT shared-object loading, and shared guest-arena mappings.
+   Embedded AOT translations require no unsafe code. Interpreter builds
+   should have no runtime dependencies; `jit` adds Cranelift.
+2. **Guest faults return errors.** Guest input must not panic the host.
    `clippy::{indexing_slicing, unwrap_used, expect_used, panic}` warn in
-   non-test code to keep this honest.
-3. **Behaviourally identical to the C++ interpreter.** Same guest-visible
-   semantics, same syscall results, same exception kinds, and the same
-   retired-instruction count in `--accurate` mode. The C++ `rvlinux` is the
-   oracle (see Testing).
-4. **Fast.** Match C++ tailcall dispatch and get close to C++ threaded
-   (computed goto), which is ~4% faster on coremark (see Baseline). Measured,
-   not guessed: coremark, dhrystone and STREAM from `../libriscv/binaries`.
-5. **Ergonomic embedding API**, idiomatic Rust rather than a transliteration of
-   the C++ templates.
+   non-test code.
+3. **C++ interpreter compatibility.** Match guest-visible results, system
+   calls, exception kinds, and retired-instruction counts in `--accurate`
+   mode. The C++ `rvlinux` interpreter is the reference.
+4. **Measured performance.** Target C++ tail-call dispatch performance and
+   approach threaded dispatch, approximately 4% faster on CoreMark. Measure
+   CoreMark, Dhrystone, and STREAM from `../libriscv/binaries`.
+5. **Idiomatic embedding API.** Express the C++ architecture through Rust
+   ownership, traits, and error handling.
 
 ## Scope
 
-In scope: the interpreter, **RV64 only**, extensions I M A C F D Zba Zbb Zbc
-Zbs Zicond Zbkb Zfh(min) Zcb Zimop/Zcmop and V with Zvbb and Zvfhmin (all of
-RVA23U64); ELF loading; flat arena memory
-with virtual paging; dynamic executables (through `ld.so`); Linux, newlib and minimal syscall sets; vmcall/preempt;
-fork/CoW; serialization; threads; native heap/libc; debugger, disassembler and
-GDB stub.
+RV64 only: I, M, A, C, F, D, Zba, Zbb, Zbc, Zbs, Zicond, Zbkb,
+Zfh(min), Zcb, Zimop/Zcmop, and V with Zvbb and Zvfhmin (RVA23U64).
 
-**Out of scope** (inherently need `unsafe` or native code generation):
+The port covers ELF loading, arena memory with virtual paging, dynamic
+executables through `ld.so`, Linux/newlib/minimal system calls, VM calls,
+preemption, copy-on-write forks, serialization, threads, native heap/libc,
+and debugging interfaces. The phase checklists distinguish completed and
+planned features.
 
-| C++ component | Files | Why |
+| Excluded C++ component | Files | Disposition |
 |---|---|---|
-| Binary translation to C | `tr_*.cpp`, `tr_*.hpp` | Compiles C and `dlopen`s it. Replaced by translation to safe Rust (see "AOT") |
-| libtcc JIT | `tr_tcc.cpp` | Same |
-| asmjit JIT | `asmjit/` | Replaced by the Cranelift JIT (see "JIT"), not ported |
-| Assembly dispatch | `amd64/` | Hand-written asm |
-| Windows-specific shims | `win32/` | Revisit after Linux parity; most of it is replaced by `std` |
-| RV32 | `rv32i.cpp`, the `W == 4` paths everywhere | Not needed; dropped on 2026-11-12 to keep the port non-generic |
-| RV128 | `rv128i*.cpp`, `rva128_instr.cpp` | Low value |
-| C API | `../libriscv/c/` | An `extern "C"` API needs `unsafe`; if wanted, put it in a separate crate outside the forbid policy |
+| Binary translation to C | `tr_*.cpp`, `tr_*.hpp` | Replaced by safe Rust AOT translation |
+| libtcc JIT | `tr_tcc.cpp` | Replaced by the Rust backends |
+| asmjit JIT | `asmjit/` | Replaced by Cranelift |
+| Assembly dispatch | `amd64/` | Requires assembly |
+| Windows-specific shims | `win32/` | Deferred until Linux parity; `std` replaces most shims |
+| RV32 | `rv32i.cpp`, `W == 4` paths | Removed on 2026-11-12; no width generics |
+| RV128 | `rv128i*.cpp`, `rva128_instr.cpp` | Outside the supported architecture scope |
+| C API | `../libriscv/c/` | Would require a separate crate permitting unsafe code |
 
 ## Architecture decisions
 
-Decided (implemented in Phase 0):
-
-- **RV64 only, no width generics.** C++ `template <int W>` is gone: registers
-  and guest addresses are `u64`, and `Machine`, `Cpu` and `Memory` are plain
-  types. (Phase 0 had a `Width` trait for RV32/RV64; it was removed when RV32
-  went out of scope.)
-- **Errors, not exceptions.** `MachineException` → `MachineError { kind, message, data }`
-  with `ExceptionKind` mirroring the C++ enum in order. The dispatch loop
-  returns `Result`; there is no unwinding (`panic = "abort"` in release).
-- **Instruction formats.** `union rv32i_instruction` → `Instr(u32)` with
-  zero-cost per-format views (`instr.itype().signed_imm()`).
-- **Dispatch: guaranteed tail calls.** See "Dispatch" below.
-- **CMake options → Cargo features** where they change behaviour
-  (`ext-a`, `ext-c`, `ext-f`, `ext-v`, `fcsr`, `debug-checks`). Options that
-  only select a dispatch strategy or JIT have no equivalent. `ext-c` also
-  selects the decoder layout (one entry per 2 bytes, as C++
-  `compressed_enabled`), so it changes block structure and therefore where
-  timeouts land; the default build matches the C++ default.
-
-Decided in Phase 1:
-
-- **Memory representation.** The C++ flat read-write arena (`Vec<u8>`,
-  zero-allocated so the OS commits it lazily, plus one page of padding so a
-  wide access at the last address needs no size check). Guest loads and
-  stores check it first with the two compares of `memory_inline.hpp`: reads
-  in `[0x1000, arena_size)`, writes in `[initial_rodata_end, arena_size)`.
-  (Phase 1 had only this; see "Virtual paging" for what replaced the
-  "protection fault otherwise".)
-
-Decided in Phase 5 (moved up, for dynamic executables):
-
-- **Virtual paging: always on, behind the arena.** The oracle is built with
-  `RISCV_FLAT_RW_ARENA` *and* `RISCV_VIRTUAL_PAGING`, so that is the only
-  configuration (no feature, no enum of backends). The arena fast path is
-  unchanged; what used to be a protection fault is now a `#[cold]` call
-  into the page table. See "Virtual paging".
-- **Machine shape.** `Machine { cpu, memory, .. }` is not generic. System
-  call handlers are `fn(&mut Machine) -> Result<()>` in a per-machine table
-  (C++'s is per process). Userdata (C++'s `void*` user pointer) is an
-  owned `Box<dyn Any + Send + Sync>`, type-checked on access
-  (`set_userdata`, `userdata::<T>()`, `userdata_mut`, `take_userdata`);
-  an `Arc` in it shares state with the host like the C++ pointer. Forks
-  don't get it, as in C++. (The generic `Machine<U>` recommended below
-  wasn't worth making every machine type generic: userdata is only read
-  from host callbacks, never on the dispatch path.)
-- **Custom instructions.** C++'s process-wide
-  `CPU::on_unimplemented_instruction` is a per-machine hook,
-  `set_on_unimplemented_instruction(fn(Instr) -> Option<CustomInstruction>)`,
-  kept by forks. The decoder's final fall-through (and only it, as in
-  C++) is the `isa::rvi::Custom` op, which asks the hook when it
-  *executes* rather than when the entry is decoded, so decoded segments
-  shared between machines don't depend on any machine's hook. There is
-  no disassembler yet, so a custom instruction has no printer.
-- **One definition per instruction.** Each instruction is a unit type
-  implementing `isa::Op` (the C++ precise handler). The dispatcher wraps the
-  same `exec` in its generic handlers (`seq::<O>`, `function::<O>`,
-  `funcblock::<O>`), so the fast and precise interpreters can't drift
-  apart; only block-ending instructions have dedicated tail-call handlers.
-
-To decide at the start of the phase that needs them (recommendation given):
-- **Host access to guest memory (Phase 3).** C++ hands out raw pointers. Rust
-  hands out `&[u8]` / `&mut [u8]` borrowing the memory, plus typed helpers
-  (`read::<T>`, `write`, `memstring`, `memview`). Zero-copy is preserved; the
-  borrow checker replaces the "pointer is valid until the next mmap" rule.
-  POD reinterpretation goes through explicit `from_le_bytes` (no `bytemuck`
-  unless we accept the dependency).
-- **Syscall handlers and userdata (Phase 3).** Recommend handlers as plain
-  `fn(&mut Machine<W, U>) -> Result<()>` stored in a fixed table (no boxing,
-  matches C++ `syscall_t*`), and userdata as a generic `Machine<W, U = ()>`
-  field so handlers can borrow `machine.memory` and `machine.userdata`
-  disjointly. Avoid `Box<dyn Any>` downcasts on the hot path.
-- **Floating point.** Use `f32`/`f64` with explicit NaN-boxing helpers
-  (`rvfd.hpp`). Rounding modes/flags only under the `fcsr` feature, like C++.
-- **Threads/fork.** `Machine` is `Send + Sync` (checked at compile time),
-  so a machine shared between threads can be forked from. Fork shares
-  pages via `Arc` (decided in Phase 3, see "Fork"). The only global state
-  is C++'s: the process-wide cache of shared execute segments (see
-  "Shared execute segments").
+- **RV64 types.** Registers and addresses are `u64`; `Machine`, `Cpu`, and
+  `Memory` are non-generic. The original RV32/RV64 `Width` trait was removed.
+- **Errors.** `MachineError { kind, message, data }` replaces
+  `MachineException`. `ExceptionKind` preserves C++ enum ordering.
+  Dispatch returns `Result`; release builds use `panic = "abort"`.
+- **Instructions.** `Instr(u32)` replaces `union rv32i_instruction`, with
+  format accessors such as `instr.itype().signed_imm()`.
+- **Dispatch.** Guaranteed tail calls with `become`; see "Dispatch".
+- **Features.** Behavioral CMake options map to Cargo features, including
+  `ext-a`, `ext-c`, `ext-f`, `ext-v`, `fcsr`, and `debug-checks`.
+  `ext-c` selects one decoder entry per 2 bytes instead of 4, affecting
+  block structure and timeout locations. Default features match the
+  default C++ decoder configuration. Dispatch-selection options have no
+  equivalent; JIT options use the Rust backend.
+- **Memory.** A lazily committed, zero-initialized arena has one padding
+  page for wide accesses starting at its last valid address. Guest reads
+  use `[0x1000, arena_size)` and writes use
+  `[initial_rodata_end, arena_size)`. Other accesses use virtual paging,
+  matching `RISCV_FLAT_RW_ARENA` plus `RISCV_VIRTUAL_PAGING`.
+- **System calls and userdata.** Handlers are per-machine
+  `fn(&mut Machine) -> Result<()>` entries. Userdata is an owned
+  `Box<dyn Any + Send + Sync>`, checked by type through `set_userdata`,
+  `userdata`, `userdata_mut`, and `take_userdata`. An `Arc` shares host
+  state. Forks do not inherit userdata. Generic userdata was rejected
+  because access occurs in host callbacks, outside dispatch.
+- **Custom instructions.** `set_on_unimplemented_instruction` installs a
+  per-machine hook inherited by forks. Only the decoder's final fallback
+  invokes it, during execution rather than decoding, so shared segments
+  remain independent of machine hooks. Custom printing awaits a disassembler.
+- **Instruction definitions.** Each instruction implements `isa::Op`.
+  Generic dispatch handlers (`seq`, `function`, `funcblock`) reuse the
+  precise `exec`; block-ending instructions have dedicated tail-call handlers.
+- **Host memory access.** Borrowed slices and typed helpers replace raw
+  pointers. POD values use explicit little-endian conversions.
+- **Floating point.** `f32`/`f64` operations use explicit NaN-boxing helpers.
+  Full FCSR rounding and flag emulation remains unimplemented.
+- **Threads and forks.** `Machine` is `Send + Sync`, checked at compile
+  time. Forks share pages through `Arc`; execute segments use a process-wide
+  shared cache.
 
 ## Toolchain
 
-Pinned nightly in `rust-toolchain.toml` (currently `nightly-2026-09-28`,
-rustc `d080e7dff`). We need it for `become` (`feature(explicit_tail_calls)`);
-the handlers also use `feature(rust_preserve_none_cc)` and `feature(fn_align)`
-(see Dispatch).
-The feature is still flagged *incomplete* upstream, so a miscompile is
-possible; the difftests and instruction-count checks are the safety net.
+`rust-toolchain.toml` pins `nightly-2026-09-28` (rustc `d080e7dff`). Dispatch
+requires `explicit_tail_calls`, `rust_preserve_none_cc`, and `fn_align`.
+Explicit tail calls remain an incomplete compiler feature; differential
+tests and instruction-count checks detect regressions.
 
-The pin also lists the `riscv64gc-unknown-linux-gnu` target, so that
-`rustup toolchain install` (and so CI) gets the standard library the Rust
-guests of the tests and examples are built with (`testutil::build_rust`,
-linked with the RISC-V cross gcc).
+The pin includes `riscv64gc-unknown-linux-gnu` for Rust test and example
+guests built by `testutil::build_rust` and linked with RISC-V GCC.
 
-Bumping the pin is a deliberate change of its own: update `rust-toolchain.toml`,
-run the full test suite including `--ignored`, re-run the benchmarks and record
-any change in Baseline. If `become` stabilises, move to stable and drop the
-`#![feature]`. `tail_call_tests.rs` checks that indirect `become` is still
-a real tail call in an unoptimised build (it overflows the stack otherwise).
+Update the toolchain separately from unrelated changes. Run the full suite,
+including `--ignored`, repeat benchmarks, and record baseline changes.
+When `become` stabilizes, migrate to stable and remove the feature gate.
+`tail_call_tests.rs` verifies that indirect `become` calls do not grow the
+stack in unoptimized builds.
 
 ## Dispatch
 
-Decision: **tail-call threaded dispatch with `become`**, modelled on C++
-`tailcall_dispatch.cpp` (clang `musttail` + `preserve_none`). It's the fastest
-dispatch available in safe Rust. Each handler ends by tail-calling the next
-handler through a function pointer. So every instruction has its own indirect
-branch, which is what makes computed goto fast. `match` gives one shared branch,
-and on the C++ side `switch` is ~28% slower than computed goto on coremark.
+Dispatch uses **tail-call threading with `become`**, following C++
+`tailcall_dispatch.cpp` (Clang `musttail` and `preserve_none`). Each handler
+tail-calls the next through a function pointer, giving each instruction its
+own indirect branch. A `match` dispatcher shares one branch; the C++ switch
+dispatcher measured approximately 28% slower than computed goto on CoreMark.
 
-How the C++ version maps over:
+C++ dispatch mapping:
 
 | C++ (`tailcall_dispatch.cpp`) | Rust |
 |---|---|
 | `INSTRUCTION(bc, name)`: `static TcoRet<W> name(DecoderData<W>* d, DecodedExecuteSegment<W>* exec, CPU<W>& cpu, addr_t pc, InstrCounter& counter)` | `extern "rust-preserve-none" fn name(exec: &DecodedSegment, cache: &[DecoderEntry], i: usize, m: &mut Machine, counter: Counter, ins: u32, pc: u64) -> Exit` with one signature for all handlers. The order puts `ins` in rcx, where variable shifts want their count (cl) |
-| `MUSTTAIL return computed_opcode<W>[bc](...)` | `become (entry.handler)(..., entry.instr)`. Store the handler `fn` in the decoder entry itself, so there's no second table lookup |
+| `MUSTTAIL return computed_opcode<W>[bc](...)` | `become (entry.handler)(..., entry.instr)`. Store the handler `fn` in the decoder entry itself, so there is no second table lookup |
 | `VIEW_INSTR_AS(fi, FasterItype)` reading `d->instr` | The caller passes the entry's (re-encoded) bits as `ins`, so a handler never looks up its own entry |
-| `d += 1` pointer bump | index `i + 1`; read with `exec.cache.get(i)`. That's one bounds check per instruction (a compare and a predicted branch), the price of safe Rust |
+| `d += 1` pointer bump | index `i + 1`; read with `exec.cache.get(i)`. That is one bounds check per instruction (a compare and a predicted branch), the price of safe Rust |
 | `__attribute__((preserve_none))` | `extern "rust-preserve-none" fn` (`feature(rust_preserve_none_cc)`). Without it every handler saved and restored six callee-saved registers: it cut CoreMark's host instructions by 17% |
-| (handler placement left to the compiler) | Hot handlers are 64-byte aligned (`#[rustc_align(64)]`, `feature(fn_align)`). Otherwise the interpreter's speed shifted by a few percent with wherever unrelated changes placed them; aligned, fixed-workload CoreMark took 2.5–5% fewer cycles (32-byte alignment didn't help) |
+| (handler placement left to the compiler) | Hot handlers are 64-byte aligned (`#[rustc_align(64)]`, `feature(fn_align)`). Otherwise the interpreter's speed shifted by a few percent with wherever unrelated changes placed them; aligned, fixed-workload CoreMark took 2.5–5% fewer cycles (32-byte alignment did not help) |
 | `return RETURN_VALUES()`, `next_execute_segment(...)` exits | `become halt_exit(...)` etc.: exits are tail calls to cold handlers too, so a fast handler makes no calls and needs no stack frame |
 | `BEGIN_BLOCK()` adds the block's instruction count; `OVERFLOW_CHECK()` only on branches/jumps | Same. The counting has to match exactly to keep instruction-count parity |
 | `cpu.trigger_exception()` throws | Store the `MachineError` in the machine and return `Exit::Fault`. The return value is a one-byte enum |
-| `next_execute_segment()` on out-of-segment jumps | Return `Exit::Jump`; `dispatch_simulate` switches segment and re-enters the chain with `BEGIN_BLOCK`. Returning is needed because the chain borrows the segment, and it's a slow path anyway. A jump to a STOP beginning a block of another usable segment (a VM call returning to the exit function) stops with that block counted, without switching: switching costs atomic reference counting, twice per VM call (an empty `vmcall` went from 65 to 23 ns) |
+| `next_execute_segment()` on out-of-segment jumps | Return `Exit::Jump`; `dispatch_simulate` selects the segment and re-enters with `BEGIN_BLOCK`. The chain must return to release its segment borrow. A jump to a block-start STOP in another usable segment counts the target block and stops without switching, avoiding two atomic reference-count updates per VM call (empty `vmcall`: 65 to 23 ns) |
 
 Ownership: the decoded segment sits behind an `Arc` (C++ already shares
 segments via `shared_ptr`). The dispatcher clones it out, so `&exec` and
@@ -191,24 +142,20 @@ follows `cpu_dispatch.cpp`:
 
 - the counter is recorded before an illegal-opcode fault (tailcall leaves it);
 - an ECALL whose handler stops the machine or changes PC resumes at
-  `regs.pc + 4` (tailcall resumes at `regs.pc` when it's outside the segment);
+  `regs.pc + 4` (tailcall resumes at `regs.pc` when it is outside the segment);
 - other SYSTEM instructions retrieve both counters, and if the machine stopped
   or PC changed, continue *at* `regs.pc` (tailcall continues at `pc + 4` when
   stopping);
 - the entry check is `begin <= pc < end` (tailcall: `pc + 2 <= end`).
 
-Chains are unbounded, as in C++. They end on counter overflow, `stop()`, a
-syscall that needs to leave the dispatcher, or a fault. That's only safe
-because `become` is guaranteed: never write a dispatch tail call as a plain call.
-
-Phase 1 built this dispatcher directly with a simple decoder cache (one entry
-per 2 bytes: handler + instruction bits + block length), so there was no
-`match` interpreter to throw away later. Phase 4 added the bytecodes below.
+Handler chains have no fixed length. They end on counter overflow, `stop()`,
+a system call requiring a dispatcher exit, or a fault. Always use `become`
+for dispatch tail calls to prevent stack growth. Phase 1 introduced this
+dispatcher and its decoder cache; Phase 4 added specialized bytecodes.
 
 ### Bytecodes
 
-The fast path is a port of C++'s threaded bytecodes, and that's where the
-interpreter's speed comes from:
+The fast path ports C++'s threaded bytecodes:
 
 - `decode::fast_handler` is `decode_bytecodes.cpp` + `threaded_rewriter.cpp`:
   it picks the bytecode and re-encodes the operands into the
@@ -219,7 +166,7 @@ interpreter's speed comes from:
 - `bytecode.rs` is `bytecode_impl.cpp`: one handler per bytecode, reading
   the pre-decoded operands. They never return a `Result`: the only fallible
   ones, loads and stores, read the flat arena inline (`Memory::arena_read`,
-  which can't fail) and tail-call a cold `*_slow` handler for the page
+  which cannot fail) and tail-call a cold `*_slow` handler for the page
   table and faults. C++ gets the same effect from exceptions. In between,
   a `*_cached` handler serves page cache hits outside the arena
   (`Memory::read_cached`/`write_cached`, stores only to unshared pages of
@@ -236,13 +183,11 @@ the same; the rewriter's C++-exact bits are kept for fault data, see
 - C.SUB, C.AND, C.SUBW, C.ADDW, C.MUL, C.SRAI and C.LUI: new compressed
   bytecodes (`c_op`, `c_srai`, `c_lui`), hot in compiled code.
 
-C.LD (`RV32C_BC_LDD`) and SRAIW (`RV64I_BC_SRAIW`) used to be in this list:
-C++ had the handlers but never selected them (and its rewriter's C.LD case
-swapped the destination and base registers). C++ selects both now, with
-the swap fixed, and so does the port. C.LD's slow path alone took ~10% of
-the interpreter's time on CoreMark.
+Both implementations now select C.LD (`RV32C_BC_LDD`) and SRAIW
+(`RV64I_BC_SRAIW`) bytecodes. The upstream C.LD operand swap is fixed.
+Previously, the C.LD slow path consumed about 10% of CoreMark interpreter time.
 
-`rvi_fuse.cpp` isn't ported: nothing in C++ calls `try_fuse`.
+`rvi_fuse.cpp` is not ported: nothing in C++ calls `try_fuse`.
 
 `tests/bytecodes.rs` runs random programs through the bytecodes and the
 precise interpreter and compares registers, memory and faults.
@@ -274,9 +219,9 @@ LCG loop, 206.8M instructions, same machine and date:
 
 Fixed-workload CoreMark, measured with the bench before it became a
 CoreMark 1.0 run (see "CoreMark 1.0" below), by wall-clock time of the
-whole process. Freestanding, built with our port (`crates/testutil/guests/coremark`,
-from `../coremark` or `$COREMARK_DIR`, eembc/coremark `eefc986e`), 4000
-iterations, `-O2`, wall-clock time of the whole process, best of 5, on
+complete process. Freestanding builds use `crates/testutil/guests/coremark`,
+with sources from `../coremark` or `$COREMARK_DIR` (eembc/coremark `eefc986e`),
+4000 iterations, `-O2`, and the best of five process wall times, measured on
 2026-11-13, with the bytecodes (see "Bytecodes"). C++ is upstream
 `e806d460` (with its C.LD and SRAIW bytecodes, which made C++ threaded ~12%
 faster), asmjit built by `scripts/build-cpp-reference.sh asmjit`. All runs
@@ -297,7 +242,7 @@ The guest's clock is `rdinstret`, so its output is deterministic (the same
 ELFs are difftests), and CoreMark's 10-second rule passes on a nominal
 clock. asmjit's instruction count only bounds execution: `rdinstret` read
 from native code can be stale, which stops CoreMark's clock and fails that
-rule, so variants that don't count exactly had to be validated by their
+rule, so variants that do not count exactly had to be validated by their
 CRCs only.
 
 Wall-clock differences of a few percent are noise on the dev machine; by
@@ -321,13 +266,12 @@ exact-counting variants report 1435905543 / 1266007356 instructions:
 | C++ asmjit (up front) | 401 ms | 401 ms |
 | C++ asmjit (background) | 378 ms | 374 ms |
 
-The Rust JIT doesn't pay off here: the executable segment holds all of libc
-(460 KB), and compiling it takes ~1.9 s with Cranelift, after which
-CoreMark runs in ~260 ms. asmjit compiles it in ~150 ms. Lazy compilation
-(see Phase 4) is what fixes this. (Since then, a segment's regions are
-compiled on up to 16 threads, the same image as on one: on a 28-core Xeon
-Gold 6132, compiling this segment went from 3.1 s to 0.29 s of wall time,
-for 18% more CPU time.)
+Compilation dominates this workload: the 460 KB libc segment takes about
+1.9 s in Cranelift before CoreMark executes in 260 ms; asmjit compilation
+takes about 150 ms. Lazy compilation is planned in Phase 4. Subsequent
+parallel compilation on up to 16 threads reduced segment compilation from
+3.1 to 0.29 s on a 28-core Xeon Gold 6132, with 18% more CPU time and
+identical output.
 
 ### CoreMark 1.0
 
@@ -398,466 +342,279 @@ with returns through the entry table then; see "Native calls" under JIT.)
 
 ## JIT
 
-The `jit` feature (`MachineOptions::jit`, `rvlinux --jit`) is the
-counterpart of C++'s asmjit backend, built on Cranelift instead of porting
-`asmjit/`. Code: `crates/libriscv/src/jit/` (`classify.rs`: instruction
-selection, `region.rs`: segment analysis and region formation, `emit.rs`:
-Cranelift IR, linking) and `crates/libriscv-jit-rt`.
+The default `jit` feature provides the Cranelift backend, replacing C++ asmjit.
+`MachineOptions::jit` enables it per machine. `rvlinux` enables JIT execution
+by default; `-n`/`--no-translate` or `--no-jit` selects interpretation.
+`--no-default-features` excludes the runtime and Cranelift. Interpreter-only
+`libriscv` builds must explicitly select ISA features; `rvlinux` selects them.
 
-It is a default feature of both `libriscv` and `rvlinux` (2026-11-14), and
-`rvlinux` built with it runs the JIT, with the code cache directory for
-dynamic executables, unless given `-n`/`--no-translate` (or `--no-jit`).
-`--no-default-features` builds leave it out (`libriscv` then needs its
-extension features listed; `rvlinux` lists them itself), so that the
-interpreter-only build, with no unsafe code in any crate, stays one flag
-away.
+Instruction selection and region analysis are in `codegen/`; compilation and
+caching are in `jit/`. Executable memory and native entry are isolated in
+`libriscv-jit-rt`. JIT execution currently supports x86-64. AArch64 requires
+an instruction-cache flush in the runtime. Cranelift x64 tail calls require
+`preserve_frame_pointers`.
 
-**Unsafe boundary.** Generating code needs no `unsafe`; mapping it executable
-and calling it does. That lives in `libriscv-jit-rt`, a small crate with
-its own lint table (`unsafe_code = "deny"`, every block documented): it
-copies the linked image into an `mmap` (`memmap2`) or, for cached code,
-finds it in the program or a `dlopen`ed shared object, validates the entry
-table and the guest-memory windows against the real arena length, and
-enters code through one `transmute`d trampoline pointer. `libriscv` stays
-`forbid(unsafe_code)`. The generated code's own memory safety (the inlined
-arena bounds checks, or the address mask, see "N-bit address space") is
-the trust boundary; the rt crate documents the contract the code generator
-must keep. Besides other region functions, native code only calls
-Cranelift's rounding and FMA libcalls (only used on hosts without SSE4.1
-or FMA), and the host for dyncalls: through a trampoline pointer in the
-state block, which hands the host (the machine) back all of itself and
-afterwards takes its register files and arena again, leaving native code
-if the arena moved or the code's windows no longer fit (see "Dyncalls"). The code is position-independent (`is_pic`), so libcalls go
-through a GOT: for the JIT, a table appended to the image that points at
-plain Rust helpers in `emit.rs`; for saved code (see "Code cache"), the
-system linker's GOT, pointing at `libm`.
+### Unsafe boundary
 
-**Design** (mirrors `aj_translate.cpp`/`aj_emit.cpp`):
+`libriscv` generates and links code through safe APIs and enforces
+`forbid(unsafe_code)`. `libriscv-jit-rt` maps executable memory with `memmap2`,
+loads cached objects, validates entry tables and memory layouts, and calls a
+trampoline. Its `unsafe_code = "deny"` policy requires documented exceptions.
 
-- Execute segments are compiled when created, or with
-  `MachineOptions::jit_background` (`rvlinux`'s default, as in C++) on a
-  background thread while the interpreter runs them (see "Background
-  compilation" below). Compilable instructions are grouped into regions
-  (`codegen::region`, shared with AOT) that grow along fall-through,
-  direct branches (loops stay inside) and over calls to their return
-  address, stopping at called functions' entries, indirect jumps,
-  uncompiled instructions and other regions, at most 512 instructions.
-  A region at the limit still takes in the rest of a loop of at most
-  1 KiB whose head it holds (up to 1024 instructions in all): a loop cut
-  in two makes every iteration a native call into the other region,
-  which reloads every register. STREAM built `-O0` (`stream.dyn`, whose
-  `main` is ~900 instructions with the kernels' loops across the limit)
-  ran its Copy kernel at 2.1 GB/s that way, 17.9 GB/s with the loops
-  whole. (C++ asmjit caps regions at 1024 instructions,
-  `asmjit_region_instr_max`, without regard for loops.)
-  One Cranelift function per region, `tail` calling convention, signature
-  `(state, pc, counter, depth) -> (target, counter)`.
-- Region-to-region transfers are native tail calls (`return_call`; indirect
-  jumps via the entry table and `return_call_indirect`), and guest calls
-  are native calls (see "Native calls" below), so calls, returns and loops
-  never go back through the interpreter.
-- Guest registers (integer and FP, the latter as raw 64-bit patterns) live
-  in SSA variables, loaded on function entry and stored on exit; `x0` is
-  the constant zero (C++ asmjit's `get(0)`; nothing writes it, the
-  register file included). Arena loads/stores are inlined with `Memory`'s
-  exact range checks, against windows that are constants in the code (see
-  "Bounds checks and register pressure").
-  An access outside them leaves native code at that instruction
-  (`EXIT_SLOW`): the interpreter runs it through the page table and
-  finishes the (already counted) block.
-- Decoder entries at block starts that native code can be entered at get the
-  `dispatch::jit_enter` handler (C++ patches decoder entries the same way).
-  Only decoder block starts are patched: the interpreter falls through the
-  other entries mid-block, already counted (C++ patches every region entry
-  and over-counts then). Native entries inside a decoder block, such as a
-  loop head that straight-line code runs into, are entered when a block
-  *begins* there in the dispatcher loop (`dispatch_chain`): resuming after
-  a halt, after a background-compilation slice, or in a new segment.
-  Before that, a loop running while its background compilation finished
-  stayed interpreted to its end (`binaries/measure_mips/fib64`: 800 ms
-  instead of 95 ms).
-  Valid dyncall words (`dyncall.rs`, C++ `dyncall.hpp`) are system calls
-  numbered by their index, not custom instructions as in C++. A dyncall
-  never changes PC (it is never clone-like or an exit), so it doesn't end
-  its block: the interpreter runs it mid-block with the `dyncall`
-  bytecode, and native code calls the handler (see "Dyncalls" below).
-  Both go through `dispatch::run_dyncall`: the
-  handler sees the PC, the counter (the block counted, as threaded
-  handlers see it) and the limit; a stop, or a penalty that takes the
-  count up to the dyncall to the limit, halts at the next instruction with
-  that count, while a block whose count merely crosses the limit (penalty
-  or not) runs to its end; a segment the handler made
-  stale is left; otherwise the block goes on.
-  An over-long block forced to end at a dyncall keeps the dyncall bytecode
-  instead of FUNCBLOCK. So the interpreter and the JIT agree on dyncalls
-  exactly, faults and instruction counts included (C++'s interpreter loses
-  a handler's penalty; asmjit doesn't), for handlers that keep the
-  dyncall's register promise.
-  Native code exits to the interpreter on anything it doesn't compile
-  (system calls, CSRs incl. FCSR, atomics, Zfa, Zfhmin, FENCE.I, CBO,
-  CLMUL), on faults and at the instruction limit, with exactly the PC,
-  registers and counter the interpreter would have. FUNCBLOCK entries
-  (the decoder's split of over-long blocks) are compiled: the instruction,
-  then `NEXT_BLOCK`'s limit check and the next block's count, as
-  `dispatch::funcblock` does, except where `funcblock`'s precise handler
-  rejects an encoding the fast path accepts (FMADD.H/.Q, a no-op in the
-  fast path), which stays interpreted. (They used to exit, which cost ~5% of
-  CoreMark in `jit_enter` and the interpreter.)
-- F and D (not in the `debug-checks` build, which NaN-boxes): Cranelift's
-  IEEE operations as they are, whatever is fastest. For non-NaN inputs
-  that's the interpreter's result (both round to nearest on the host, and
-  ignore the instruction's rounding mode, as C++ does without FCSR
-  emulation); which NaN comes out is the host's (NaN payloads belong to
-  FCSR emulation; C++ asmjit canonicalises in FCVT.S.D).
-  FMIN/FMAX with one NaN operand return the other operand (a number, as
-  C's `fmin` requires), with two the canonical NaN, like the interpreter
-  and C++ asmjit. FCVT to integers is exact:
-  the instruction's rounding mode (DYN reads FCSR.frm, which native code
-  can't change), saturation, NaN to the maximum, like C++'s helper call. A
-  single-precision write keeps the upper half of the register (no
-  NaN-boxing), like the interpreter.
-- Instruction selection follows `decode::fast_handler`, not the precise
-  decoder, quirks included.
-  Counting follows the dispatcher: block counts on block entry, checks at the
-  same block ends, and mid-block exits pre-subtract the target's count.
-- Stale segments are interpreted (native code doesn't check staleness after
-  slow-path instructions, and nothing it runs can make a segment stale).
-- x86-64 only for now: AArch64 needs an instruction-cache flush in the rt
-  crate. Cranelift's x64 tail calls need `preserve_frame_pointers`.
+Generated code must enforce arena bounds or address masking. External calls
+are limited to region functions, floating-point rounding/FMA helpers on hosts
+without SSE4.1/FMA, and the host dyncall trampoline. Code is position-independent:
+JIT libcalls use an appended GOT pointing to Rust helpers; saved objects use
+the system linker's GOT and `libm`.
 
-**Dyncalls** (2026-11-15; C++ asmjit `emit_dyncall`): native code calls
-the handler of a dyncall in the middle of its block itself, instead of
-leaving for the dispatcher (which stored every register, unwound every
-native frame, and re-entered after the handler with all registers
-reloaded and the guest call stack gone). It stores the registers the
-dyncall promises its handler reads (`codegen::calls::dyncall_regs`: the
-`a0..` inputs, `fa0-fa7` unless the word promises no FP access, and `sp`,
-so that a handler can preempt into the guest below the live frames),
-calls the host through `JitState::host_call` with the dyncall word, PC
-and counter, and reloads the counter and the promised outputs. It stores
-the outputs before the call too: a handler that doesn't write one leaves
-it as it was, which includes a value native code computed and hadn't
-stored yet (`jitdifffuzzer`: `slti a0, ...` then a dyncall with no inputs
-and one output reloaded the stale `a0`). FP outputs are FP inputs already. Region
-summaries include those registers, so native callers store and reload
-them around calls into a region with a dyncall. On the host side
-(`jit::JitHost`, a `libriscv_jit_rt::Host`), the call runs the handler
-as the dispatcher would (`dispatch::call_dyncall`) and lets native code
-go on unless the handler faulted, stopped the machine (or penalized it
-to the limit) or made the segment stale; then native code leaves with
-`EXIT_HOST` and the dispatcher continues from the outcome exactly as after
-the dyncall exit. A dyncall that ends its block (the segment's last
-instruction, or an over-long block forced to end there) still leaves
-with `EXIT_DYNCALL`. The rt crate's trampoline catches a handler's panic
-and resumes it once native code has returned, and takes the machine's
-register files and arena again after every call, without revalidating
-them when nothing changed; native code leaves if the arena moved (it and
-its native callers keep the arena pointer in registers), and the process
-aborts if the register files moved (they are inside the borrowed
-machine, so they can't). The handler isn't baked into the code as C++
-does: system call tables are per machine and installed after
-`Machine::new` (which compiles), cached code must stay free of absolute
-host addresses, and a Rust shim is needed anyway to call a Rust-ABI
-`fn(&mut Machine)` with the machine whole, so the shim looks the handler
-up (two instructions of ~180 per call). A loop calling a `dyncall; ret`
-function (`tests/jit.rs`-style, 2^25 calls): 13.8 to 6.7 ns per call
-(the interpreter: 9.9 ns), 320 to 179 instructions. Asteroids
-(`examples/asteroids`, 20 seeds, 4770 frames): 2.31 to 1.74 µs per frame
-with the JIT (the interpreter: 3.8 µs).
+### Regions and dispatch
 
-**Bounds checks and register pressure** (2026-11-13; the JIT was 18-24%
-behind asmjit on CoreMark 1.0, `--nbit-address-space` closed most of it,
-so the checks were the cost). Each region function used to keep the arena
-pointer, both windows' base and length and the instruction limit live in
-registers throughout. That forced spills: each check reloaded two values
-from the stack, and the exit arguments were built on the fast path. Now:
+Each region is a Cranelift `tail` function:
+`(state, pc, counter, depth) -> (target, counter)`. Regions follow fall-through,
+direct branches, and call return addresses. They stop at called-function
+entries, indirect jumps, unsupported instructions, or other regions. The normal
+limit is 512 instructions, extended to 1024 to retain loops of at most 1 KiB
+whose headers are already included. Keeping STREAM's approximately
+900-instruction `-O0` loop intact increased Copy throughput from 2.1 to 17.9 GB/s.
 
-- The windows are constants in the code (C++ `aj_machine_info`'s baked
-  arena bounds): a check is `lea`/`cmp`/`jae`. The layout
-  (`libriscv_jit_rt::MemoryLayout`: N-bit mask or windows) is part of the
-  shared segment key, and `CodeMemory::enter` refuses code whose windows
-  aren't inside the machine's (the interpreter runs it then). The windows
-  are final before any execute segment is created (`loader.rs`).
-- Each exit (slow access, limit, misaligned jump) is a cold block of its
-  own, which materialises the exit kind and PC.
-- The instruction limit is read from the state block at each check (as
-  asmjit compares against memory), not kept in a register.
-- One check covers several accesses: the first access through a base
-  register checks the span of offsets of the accesses through it up to the
-  end of its straight-line run (a label, a control-flow instruction, a
-  FUNCBLOCK) or until the register is written. The interpreter checks only
-  an access's start address, so the span check passes exactly when all of
-  the accesses' checks would; when it fails, native code leaves at the
-  first access and the interpreter finishes the block, as for any slow
-  access. Results and counts stay the interpreter's, unlike C++'s binary
-  translator, which elides checks within the arena's over-allocation of
-  an earlier one and so lets accesses at the window edges through. When
-  the write window lies inside the read window (a loaded program), a store
-  check also covers the loads whose offsets lie inside the stores' span:
-  they lie between two writable addresses. `tests/jit.rs`
-  (`merged_bounds_checks_match_the_interpreter`, which also runs a minimal
-  ELF so the write window starts at the end of read-only data) sweeps base
-  registers across the window edges.
+Region transfers use native tail calls, directly or through an entry table.
+Guest registers are SSA variables loaded at entry and stored on exit; FP
+registers retain raw bits and x0 remains zero. Instruction selection follows
+`decode::fast_handler`, including compatibility quirks. Unsupported instructions
+return to the interpreter with matching PC, registers, and counter.
 
-Backward conditional branches invert their condition so that Cranelift
-lowers the taken path (limit check, jump to the loop head) right after the
-branch, as asmjit's `jcc notaken` + back-edge check: Cranelift places a
-`brif`'s else successor next, which put the loop exit inline and cost a
-second taken branch per iteration. A 5-instruction loop went from ~3 to ~2
-host cycles per iteration (asmjit `--accurate` parity), CoreMark rv64gc
-~4% (2026-11-13). Forward branches keep the guest's fall-through inline.
+Only decoder block starts are patched with `dispatch::jit_enter`. Mid-block
+native entries, including loop headers, are selected by `dispatch_chain` when
+execution begins a block there. Patching fall-through entries would double-count
+instructions. FUNCBLOCK entries compile the precise instruction followed by the
+usual block-end check, except encodings rejected by the precise handler but
+accepted by the fast path, such as FMADD.H/.Q.
 
-Tried and dropped: making the fall-through of an in-region conditional
-branch a plain label instead of an entry (asmjit's leaders aren't these),
-so checks could carry across not-taken branches. It increased host
-instructions by 2% and branch misses by 12% on CoreMark.
+Block entry adds the decoder count; checks occur at interpreter-equivalent
+block ends. Mid-block exits subtract the target's count before continuation.
+Stale segments are interpreted. Native instructions cannot make a segment stale;
+host calls recheck staleness.
 
-**Native calls** (2026-11-14; C++ asmjit `emit_direct_call`, the same
-design as AOT's, see "Native calls" under AOT, sharing
-`codegen::calls`). A guest call whose return address is a label of the
-caller's region is a Cranelift `call` (`call_indirect` through the entry
-table for an indirect call) instead of a tail call: the caller stores the
-registers the callee's `Summary` may read, calls with `depth + 1`,
-reloads those it may write, and continues at the return address if the
-callee returned there; any other return target goes on to its own
-caller. A guest return (`jalr x0` through `ra` or `t0`) returns its
-target; leaving for the host stores the exit in the state block and
-returns `DONE`, which every caller passes on. The trampoline loops on
-returned targets through the entry table (`EXIT_INDIRECT` if there's no
-entry). Past `DEPTH` (32) nested calls a call is a tail call as before.
-Before, the return came back through the entry table into a fresh frame
-with every register reloaded, and the host never predicted it.
-Freestanding CoreMark (30000 iterations, rv64imafdc, no instruction
-limit): N-bit 1.28 to 1.07 s, checked 1.57 to 1.35 s; `--accurate`
-retires the same instruction count, 1.61 to 1.38 s. Compiling takes
-longer: static glibc CoreMark 1.5 to 2.0 s (`--fuel 1`), mostly
-regalloc2 around the calls, which clobber every register in Cranelift's
-`tail` convention. Regions of up to 2048 instructions compiled 15% slower
-still and ran no faster.
+### Floating point
 
-**Background compilation** (C++ `asmjit_background_callback` +
-`livepatch.hpp`). C++ compiles on an embedder thread, patches a *copy* of
-the decoder cache and then live-patches the running one so that threads
-executing it switch over at their next block. Patching decoder entries
-that another thread may be executing needs shared mutable handlers, which
-safe Rust can't do without slowing every dispatch. Instead:
+F/D compilation is disabled with `debug-checks`, which enables NaN-boxing.
+Arithmetic otherwise uses host IEEE round-to-nearest operations, matching the
+interpreter's default non-FCSR behavior. NaN payloads depend on the host.
+FMIN/FMAX return the numeric operand for one NaN and canonical NaN for two.
+Integer FCVT honors the encoded rounding mode, including DYN from FCSR.frm,
+saturates, and converts NaN to the maximum. Single-precision writes preserve
+the upper register half without NaN-boxing.
 
-- A `std::thread` compiles from an `Arc` of the segment (compilation only
-  reads it) and publishes a patched copy *in the segment itself*
-  (`DecodedSegment::finish_background_jit`, a `OnceLock`). The
-  compilation belongs to the segment, not to the machine that started it:
-  every machine holding the segment (the creator, its forks, machines
-  sharing it through the process-wide cache) gets the native code, as
-  with C++'s live-patching of the shared segment. Nobody has to wait for
-  it, before forking or otherwise.
-- While one of a machine's segments has an outstanding compilation
-  (running, or finished but not switched to), `dispatch_simulate` runs in
-  slices of `jit_background_slice` instructions (default 2^20). Between
-  slices the machine switches its segments, and the current one, to
-  their published copies. A segment created during an unsliced run
-  (`init_execute_area`: code mapped at runtime) that starts compiling
-  begins a slice at the next limit check that host code or a segment
-  change hands back (`dispatch::begin_slice`). Before, slicing was only
-  decided when the run began, so when nothing was compiling then (`ld.so`
-  from the code cache), `libc.so` and the program `ld.so` mapped stayed
-  interpreted for good.
-- Slices end at the dispatcher's own instruction-limit checks, and the next
-  slice begins the block there, exactly what the uninterrupted run does, so
-  results and counts are the same whenever the code arrives. System calls
-  see the real limit (the slice end is translated in and out), a `stop()`
-  or a new limit from a handler ends slicing, and the PC is only published
-  where an uninterrupted run would publish it (it's observable after a
-  fault). The one check that halts *at* an instruction it already ran is
-  a CSR instruction's (C++ halts there at the limit, and so does this):
-  for a slice's limit, it ends the slice at the next block instead, or the
-  next slice would run the instruction again. Vector loops read the `vl`
-  CSR on every iteration, which made that visible. `jit::tests` checks all
-  of this with a compilation that never finishes.
-- Results for segments that went stale meanwhile are dropped (the copy
-  shares the original's stale flag, so marking either marks both).
-  `Machine::wait_for_jit` blocks until the compilations of the machine's
-  segments have finished, whoever started them. A compilation that
-  panics publishes "nothing compiled", so nobody waits forever.
+### Dyncalls
 
-**Testing.** The difftests run every guest a second time with `--jit` when
-`rvlinux` is built with the feature (the default; `cargo test --workspace
---no-default-features` runs only the interpreter). `testutil::run_rust`
-passes `--no-translate` like the reference, so tests interpret unless they
-ask for `--jit`. `crates/libriscv/tests/jit.rs` compares complete
-machine state (registers, PC, counter, memory, error) between JIT and
-interpreter for hand-written and random programs at ~50 instruction limits
-each, and the same with background compilation (where the code arrives at
-an arbitrary point), and the native-call programs shared with
-`tests/aot.rs` (also in the background and N-bit);
-`LIBRISCV_JIT_FUZZ=<programs>[:<seed>]` runs longer sessions (400k
-programs clean on 2026-11-12, 30k with native calls on 2026-11-14). FP programs are straight-line
-code with a block end after every instruction, compared exactly up to the
-first NaN in an FP register (then with any NaN matching any NaN, once);
-the integer programs also contain the FP instructions that only move bits
-(loads, stores, moves, sign injection, FCLASS, compares, integer
-conversions), compared exactly. With the feature, the difftests run
-`--jit` both with background compilation and with `--no-background`.
+Valid `dyncall.rs` words invoke the system call selected by their immediate.
+They cannot change PC and normally execute mid-block. `dispatch::run_dyncall`
+publishes PC, counter, and limit. A stop or penalty reaching the retired count's
+limit halts immediately after the call; a limit crossed only by the block's
+count is checked at the block end. Stale segments are left. Forced block ends
+retain the dyncall bytecode. Interpreter and JIT results, faults, and counts
+match when handlers obey the encoded register contract.
 
-**Code cache** (2026-11-13; the JIT counterpart of C++'s translation
-cache and embedded translations in `tr_translate.cpp`, `jit/cache.rs`,
-`libriscv-jit-rt`'s `linked.rs`): Cranelift's output for a segment, saved
-and used again by later runs. It is a cache of what the JIT compiled, not
-an ahead-of-time compiler. Nothing else translates the code, so cached
-code behaves exactly like the JIT (the ahead-of-time translator, to
-Rust, is a separate thing: see "AOT"). A machine with
-`MachineOptions::jit_cache_output` (a `jit_cache::JitCacheOutput`) records
-the linked image of every segment it compiles (`emit::Image`: code with
-inter-function calls resolved, libcall sites left as `R_X86_64_GOTPCREL`).
-It doesn't share segments while saving, so it compiles every one.
-`JitCacheOutput::write_object` writes one ELF relocatable object (written
-by hand in `cache.rs`, no new dependency), and `write_shared_object` links
-it with `$CC`/`cc -shared -nostdlib ... -lm`. Each segment gets a record
-(magic, code and metadata as `R_X86_64_PC64` offsets, lengths) in the
-section `libriscv_jitcache`. A weak table symbol, `libriscv_jitcache_table`,
-lists the records for `dlsym`. With only PC-relative references, the
-sections are read-only and a shared object has no run-time relocations.
-`jit_cache::load_shared_object` (`rvlinux --jit-load`) `dlopen`s one, and
-objects linked into the program (`rvlinux`: `RVLINUX_JIT_EMBED=a.o:b.o` at
-build time) are found through the linker's `__start_`/`__stop_` symbols
-for that section. `libriscv-jit-rt` defines an empty record there so the
-symbols always exist. The sections carry `SHF_GNU_RETAIN` against
-`--gc-sections`. Both end up in one process-wide registry, consulted when
-a segment is created (`MachineOptions::jit_cache`, default on, works
-without `jit` too). A hit installs the code instead of compiling it
-(`CodeMemory::linked`, which keeps a shared object loaded while its code
-is in use). The key is the segment (address, length, CRC32-C and a 64-bit
-hash of the code, execute-only, libc fast path), the memory layout baked
-into the code, and a build fingerprint: libriscv version, host ISA and
-Cranelift flags, extension features, `JitState` offsets and a hash of the
-code generator's sources (`jit/{emit,mod}.rs` and `codegen::SHARED_SOURCES`:
-`codegen/*.rs`, `native_code.rs`, `decoder_cache.rs`, `decode.rs`,
-`bytecode.rs`, `instruction.rs`, `native/libc.rs`). The key type,
-`codegen::NativeKey`, is the one translations use; the code is hashed once
-per segment for both. So code from another build, CPU or arena size is skipped,
-not run (`verbose_loader` reports hits and misses). The key's CRC32-C and
-FNV hash tell segments apart but are forgeable in milliseconds (CRC32-C is
-linear, the FNV step invertible), so each unit's metadata (format
-`RVJITM02`; `RVJITM01` units are ignored) also stores the guest code it
-was compiled from, and a unit is only installed for a segment with exactly
-those bytes (`Meta::fits`, as `shared_segment` compares bytes for the
-in-process cache). That covers the cache directory, `--jit-load` and
-embedded units alike; units with one key but different code are all kept
-in the registry and the segment's bytes pick one. Loading a shared object
-or linking an object still runs its code, like any native library: only
-load files you would run. Segments with breakpoints are never cached. Loading a static glibc C++ program's 20 MB of code takes 0.14 s,
-against 12 s to compile it (debug build). Tests: `libriscv`'s
-`tests/jit_cache.rs` (two segments, library API), the
-`saved_libcalls_match_the_interpreter` unit test (baseline x86-64, libcalls
-through `libm`), and `rvlinux`'s `tests/jit_cache.rs` (static executable,
-`-Q`, bad files; ignored because slow: the dynamic executable (~20 s, it
-compiles `libc.so`) and the embedded object (builds `rvlinux` again in
-`target/jit-embed`)). Not yet: saving code that came from the cache
-(a machine saving code compiles everything instead), AArch64.
+Mid-block JIT dyncalls use `JitState::host_call`. Native code stores promised
+integer inputs and outputs, FP registers unless excluded by the encoding, and
+`sp` for nested preemption. Outputs are stored before the call so an unwritten
+output retains its current value. Afterwards it reloads the counter and outputs.
+Region summaries include these registers for native callers.
 
-**Cache directory** (2026-11-14; C++'s `translation_cache`, which
-`dlopen`s `/tmp/rvbintr-<hash>.so` per segment, or compiles and writes
-it): `MachineOptions::jit_cache_dir` (a `jit_cache::CacheDir`: a path,
-whether it covers the initial segment, and address ranges). With `jit`,
-each segment it covers is looked up in
-`<dir>/<build fingerprint>/<vaddr>-<key hash>.so` (`dlopen`ed once per
-process), and if the JIT compiles it, written there (linked in a private
-temporary directory, mode 0700 and an unpredictable name, the object
-written with `create_new`, then renamed into place, so concurrent
-processes are fine and nobody can plant a file or symlink in the way).
-**Trust** (security review, finding 1: a guest could save its own code
-under a system library's forged key, and later runs would execute it in
-place of the library): a segment is only *saved* if its bytes came from a
-file the host chose: the initial segment when `CacheDir::initial_segment`
-says so, or a segment in `ranges` whose bytes are exactly those of a
-`FileDescriptors::pinned_mappings` file mapped over it (`mmap` records
-each pinned-file mapping in `Memory`, the last 64; at segment creation
-the file is read again and compared, `Memory::came_from_pinned_file`, so
-guest writes after the mapping are caught without tracking them). Never
-a rebuilt segment (`rebuilt_from`). Looking up is still by address range
-(safe: bytes are compared). A process saves at most `MAX_SAVES` (32)
-files and `MAX_SAVE_BYTES` (512 MiB), and nothing to a build subdirectory
-holding `MAX_DIR_FILES` (256) entries. Directories are created with mode
-0700, and the cache directory, its build subdirectory and each file must
-be owned by the effective user (`libriscv_jit_rt::effective_uid`, a
-`safe` `geteuid` declaration) and not writable by group or others, or
-nothing is loaded from or saved to them; the build subdirectory and file
-must not be symlinks. Tests: the unit tests in `jit/cache.rs`
-(`cached_code_is_only_used_for_the_code_it_was_compiled_from`,
-`cache_paths_must_be_private`, `temporary_files_are_new`,
-`saves_are_limited`), `mman.rs`'s
-`only_code_from_pinned_files_is_saved_to_the_cache_dir`, and
-`tests/jit_cache_integrity.rs` (x86-64 Linux: a shared object with a
-forged key is not used; code given to `init_execute_area` in a cache
-range is not saved).
-The write is part of the compilation, also in the background; such
-compilations are counted, and `jit_cache::wait_for_saves` waits for them,
-since background threads don't keep a process alive. Unlike saving to a
-`JitCacheOutput`, it doesn't stop a machine from sharing segments.
-Nothing is ever deleted (a new build gets a new subdirectory).
-`rvlinux`'s JIT (on by default) uses it for dynamic executables: the dynamic linker (the
-initial segment, always `DYNAMIC_LINKER`: the program's `PT_INTERP` never
-picks the host file, see "Dynamic executables")
-and the pinned library slots (see "Execute segments
-from pages" under memory), never the program, in
-`--jit-cache-dir`, else `$XDG_CACHE_HOME/rvlinux/jit` or
-`~/.cache/rvlinux/jit`. `--no-jit-cache` turns it off. The first run
-waits at exit for the libraries still compiling (stderr says so);
-`libc.so`'s code is 36 MB. `stream.dyn` with `-j`: 3.5 s and 7.5 s of CPU
-compiling `libc.so` in the background every run before; 0.88 s with the
-cache (and the region and slicing fixes). Tests: `cache_directory` and
-the ignored `cache_directory_dynamic_executable` in `rvlinux`'s
-`tests/jit_cache.rs`.
+The host trampoline invokes the per-machine handler and reacquires the register
+files and arena. Stops, faults, limit-reaching penalties, and stale segments
+return `EXIT_HOST`; block-ending dyncalls use `EXIT_DYNCALL`. A moved arena
+forces an exit because callers retain its pointer. Moved register files abort
+the process, violating the borrowed-host contract. Handler panics are caught
+and resumed after native code returns. Handler lookup remains dynamic because
+tables are per machine and cached code contains no absolute host addresses.
 
-**N-bit address space** (C++ `translate_automatic_nbit_address_space`,
-`MachineOptions::jit_automatic_nbit_address_space`, `rvlinux
---nbit-address-space`): with a power-of-two arena, native loads and stores
-use `arena + (addr & (arena_size - 1))` without any check (a 32-bit mask
-is a zero extension), like asmjit's `arena_index`. Native code then reads
-and writes anywhere in the arena, read-only data and page 0 included, and
-addresses outside it wrap instead of going to the page table; the
-interpreter is unchanged. The arena is rounded up to a power of two for
-it (`Memory::new`: `rvlinux`'s default 4000 MiB becomes 4 GiB, reported
-under `verbose_loader`), and `Machine::new` fails with `OutOfMemory` if
-that adds more than 256 MiB (more likely a mistake than intended). C++'s
-asmjit leaves other sizes checked, and its binary translator rounds up
-only the mask, so its masked accesses can run past the arena's mapping
-(a C++ bug; we grow the arena instead). With 4 GiB the mask is a 32-bit
-add (`lea r32`) and a zero extension: the JIT emits that explicitly,
-LLVM finds it from the AOT code's `& 0xffffffff`; the offset is added before truncating, so negative offsets
-wrap inside the arena. The mask is a constant in the code; `CodeMemory` records it
-and refuses to enter code whose mask plus the widest access doesn't fit in
-the arena (which has a padding page for exactly that). Tests:
-`tests/nbit_arena.rs` (port of `nbit_arena.cpp`) and the `nbit_*` cases
-in `tests/jit.rs`.
+Measured on 2026-11-15: a `dyncall; ret` loop improved from 13.8 to 6.7 ns/call
+(interpreter: 9.9 ns), and from 320 to 179 host instructions/call. Asteroids
+improved from 2.31 to 1.74 µs/frame over 4,770 frames and 20 seeds
+(interpreter: 3.8 µs/frame).
 
-**No instruction limit** (C++ `translate_ignore_instruction_limit`,
-`MachineOptions::jit_ignore_instruction_limit`, set by `rvlinux` unless
-`--accurate`, as in C++; 2026-11-14): JIT code and translations neither
-count instructions nor check the limit, so a loop in native code runs until
-it leaves native code (a system call, a fault, code it can't run). It is
-`MemoryLayout::unlimited`, so it is part of every key (shared segments,
-the JIT cache, translations) and `CodeMemory` knows it. `native_enter`
-enters such code with the counter as it is (entry block counted) instead
-of pre-subtracting the entry block, and doesn't pre-subtract after a
-dyncall either, so the counter only grows: it counts what the interpreter
-runs, and the dispatcher still stops at the limit. `rdinstret` sees that
-undercount: freestanding CoreMark, whose clock it is, then fails its
-10-second rule (its CRCs are right). Removing the checks and the counter
-register took freestanding CoreMark (30000 iterations, N-bit) from 1.21 to
-1.10 s (AOT) and 1.48 to 1.30 s (JIT). Tests: `unlimited_*` in
-`tests/jit.rs` and `tests/aot.rs`.
+### Bounds checks and register pressure
 
-**Speculation.** Only N-bit code is safe against speculative out-of-bounds
-loads (Spectre v1): its index is `addr & mask` into an arena of at least
-`mask + 8` bytes, on every path. Checked code (JIT and AOT, and the
-interpreter's `Memory` fast paths) compares and branches, then loads at
-`arena + addr`: a mispredicted check reads anywhere within 2^64 of the
-arena. C++ wraps the address in `RISCV_SPECSAFE`
-(`__builtin_speculation_safe_value`, GCC only) in its translator's checked
-accesses; nothing here does yet.
+Arena windows are constants in compiled code and part of `MemoryLayout` and
+shared-segment keys. `CodeMemory::enter` requires them to fit the machine's
+windows and arena. The loader finalizes windows before creating segments.
+Checks lower to `lea`/`cmp`/`jae`; the instruction limit is read from state at
+each check. Exit arguments are materialized in separate cold blocks.
 
-**Performance** (2026-11-12, freestanding CoreMark built from
-`../coremark/barebones`, 4000 iterations, `--accurate`, best of 3):
+One check can cover the offset span of accesses through an unchanged base
+register within a straight-line run. Labels, control transfers, and FUNCBLOCK
+end a run. A store check can cover enclosed loads when the write window lies
+inside the read window. Span checks preserve individual start-address checks;
+failure exits at the first access for interpretation. The
+`merged_bounds_checks_match_the_interpreter` test sweeps window boundaries.
+
+Backward conditional branches keep the checked loop path inline, matching
+asmjit's layout. This reduced a five-instruction loop from approximately three
+to two host cycles/iteration and CoreMark rv64gc time by about 4% on 2026-11-13.
+Removing fall-through region entries increased instructions by 2% and branch
+misses by 12%, so that optimization was rejected.
+
+### Native calls
+
+Guest calls whose return address is a label in the caller's region use native
+calls, including indirect calls through the entry table. The caller stores
+registers the callee's `Summary` may read and reloads those it may write.
+Matching returns continue at the return label; other targets propagate to the
+caller. Guest returns through `ra` or `t0` return a target. Host exits return
+`DONE`, propagated through all callers. The trampoline dispatches other targets
+through the entry table or returns `EXIT_INDIRECT` when no entry exists.
+Beyond `DEPTH` (32), calls use tail calls to bound host stack use.
+
+On 2026-11-14, freestanding CoreMark (30,000 rv64imafdc iterations) improved
+from 1.28 to 1.07 s with N-bit accesses, 1.57 to 1.35 s with checked accesses,
+and 1.61 to 1.38 s with `--accurate`. Static glibc compilation increased from
+1.5 to 2.0 s, mainly in regalloc2 around calls that clobber Cranelift's `tail`
+register set. Raising region limits to 2048 instructions increased compilation
+time by another 15% without improving execution.
+
+### Background compilation
+
+`MachineOptions::jit_background` is the `rvlinux` default. A worker compiles an
+`Arc<DecodedSegment>` and publishes a patched copy through `OnceLock`
+(`finish_background_jit`). Every machine sharing the segment receives the
+result, including forks. Safe Rust avoids mutating handlers in a running cache.
+
+While compilation or installation is pending, dispatch runs in
+`jit_background_slice` slices, default 2^20 instructions. Between slices,
+finished copies replace the machine's segments. Compilations started during an
+unsliced run begin slicing at the next limit check returned by host code or a
+segment change (`begin_slice`). Deferred rebuilds also use slices to track heat.
+
+Slice boundaries preserve block counting, real limits visible to handlers, and
+observable PC updates. Stops and handler changes to the real limit end slicing.
+CSR instructions that halt at their own PC use the next block for slice-only
+limits to avoid executing the CSR twice. `jit::tests` checks these cases with a
+compilation that never finishes.
+
+Stale results are discarded; original and compiled copies share a stale flag.
+`Machine::wait_for_jit` waits for all compilations held by the machine, including
+ones started elsewhere. A panic publishes an empty result to release waiters.
+
+### Code cache
+
+`jit/cache.rs` saves Cranelift output for reuse. `JitCacheOutput` records each
+compiled `emit::Image`; saving machines compile their own segments instead of
+using cached or shared segments. `write_object` writes an ELF relocatable
+object without additional dependencies. `write_shared_object` links with
+`$CC` or `cc -shared -nostdlib ... -lm`.
+
+Each `libriscv_jitcache` record contains magic, PC-relative code and metadata
+offsets (`R_X86_64_PC64`), and lengths. Libcalls use `R_X86_64_GOTPCREL`.
+The weak `libriscv_jitcache_table` symbol supports `dlsym`; embedded objects
+use `__start_`/`__stop_` symbols and `SHF_GNU_RETAIN`. An empty runtime record
+ensures section symbols exist. Shared objects need no runtime relocations in
+these read-only sections.
+
+`jit_cache::load_shared_object` (`--jit-load`) registers shared objects.
+`RVLINUX_JIT_EMBED=a.o:b.o` embeds objects at build time. Both use a process-wide
+registry consulted when creating segments if `jit_cache` is enabled, including
+when per-machine JIT compilation is disabled. `CodeMemory::linked` retains the
+shared object while its code is used.
+
+`codegen::NativeKey` includes segment address, length, CRC32-C, a 64-bit code
+hash, execute-only and libc patch settings, memory layout, and a build
+fingerprint. The fingerprint covers version, host ISA, Cranelift flags,
+extension features, `JitState` offsets, JIT sources, and `codegen::SHARED_SOURCES`.
+Mismatched builds, CPUs, and layouts are ignored; `verbose_loader` reports
+lookups. CRC32-C and FNV are forgeable, so metadata `RVJITM02` also stores the
+original guest bytes and `Meta::fits` requires an exact match. `RVJITM01` units
+are ignored. Colliding units remain distinct. Breakpoint segments are excluded.
+Loading or linking native objects executes trusted host code; byte matching
+does not validate malicious native code.
+
+Loading a static glibc C++ program's 20 MB image took 0.14 s versus 12 s to
+compile in a debug build. Tests cover library and CLI APIs, multiple segments,
+libcalls through `libm`, invalid files, dynamic executables, and embedded
+objects. Slow dynamic and embedded tests are ignored by default. Re-exporting
+cached code and AArch64 support remain unimplemented.
+
+### Cache directory
+
+`MachineOptions::jit_cache_dir` uses a `CacheDir` with a path, initial-segment
+policy, and address ranges. Files use
+`<dir>/<build fingerprint>/<vaddr>-<key hash>.so` and are loaded once per process.
+Writes link in a private, unpredictable mode-0700 temporary directory, create
+objects with `create_new`, and rename the result atomically.
+
+Saving requires code verified against a host-selected file: an explicitly
+covered initial segment, or a pinned-file mapping with exact bytes re-read by
+`Memory::came_from_pinned_file`. The latest 64 mappings are tracked. Rebuilt
+segments are never saved. Lookups require matching bytes as well as range.
+Limits are 32 saves and 512 MiB per process, and 256 entries per build directory.
+Directories and files must be owned by the effective user and not writable by
+group or others; build directories and files must not be symlinks. These checks
+prevent guest-controlled cache substitution and unsafe path access.
+
+Background saving is part of compilation. Call `jit_cache::wait_for_saves`
+before exit; worker threads do not keep the process alive. Directory caching
+preserves segment sharing and retains old build directories.
+
+For dynamic executables, `rvlinux` caches its fixed dynamic linker and pinned
+library slots, excluding the program. The path is `--jit-cache-dir`,
+`$XDG_CACHE_HOME/rvlinux/jit`, or `~/.cache/rvlinux/jit`. `--no-jit-cache` disables
+it. Exit waits for pending saves. With cache and dispatch fixes, `stream.dyn`
+improved from 3.5 s wall time and 7.5 s CPU time to 0.88 s; compiled `libc.so`
+occupies about 36 MB. Tests cover forged keys, permissions, temporary-file
+creation, save limits, pinned-file provenance, and CLI directory reuse.
+
+### N-bit address space
+
+`jit_automatic_nbit_address_space` (`--nbit-address-space`) uses
+`arena + (addr & (arena_size - 1))`. Native accesses can modify read-only data
+and page zero and wrap outside addresses into the arena, bypassing paging.
+Interpreter semantics are unchanged. Arena size rounds up to a power of two;
+4000 MiB becomes 4 GiB. Rounding by more than 256 MiB returns `OutOfMemory`.
+The arena is enlarged with the mask, avoiding the C++ translator's possible
+out-of-mapping accesses.
+
+For 4 GiB, the JIT emits a 32-bit add and zero extension; LLVM derives this
+from AOT masking. Offsets are added before truncation. `CodeMemory` verifies
+that the mask plus the widest access fits the padded arena.
+`tests/nbit_arena.rs` and JIT `nbit_*` tests cover these rules.
+
+### Instruction limits
+
+`jit_ignore_instruction_limit`, enabled by `rvlinux` unless `--accurate`,
+disables native counting and limit checks. Native loops run until leaving
+native code. Interpreter blocks still count and enforce the limit; system
+calls still allow `stop()`. Counters therefore undercount total execution.
+The setting is part of `MemoryLayout` and all native-code keys.
+`native_enter` retains entry counts rather than subtracting them, including
+after dyncalls, so counters remain monotonic.
+
+`rdinstret` observes the undercount; instruction-clock CoreMark can fail its
+10-second rule despite valid CRCs. Removing native counting reduced
+freestanding CoreMark (30,000 iterations, N-bit) from 1.21 to 1.10 s for AOT
+and 1.48 to 1.30 s for JIT. `unlimited_*` tests cover both backends.
+
+### Speculative execution
+
+N-bit masking constrains each access to an arena of at least `mask + 8` bytes.
+Checked JIT code uses `select_spectre_guard` conditional moves on bounds checks
+and entry-table lookups. Guards are enabled by default through
+`jit_spectre_guards`; `--no-spectre-guards` disables them for trusted guests.
+The setting is part of `MemoryLayout`, preventing incompatible cache reuse.
+Guards cost about 25% of checked CoreMark native performance. AOT and interpreter
+checked accesses currently rely on branches and do not provide these guards.
+
+### Validation
+
+Differential tests run interpreter, background JIT, and upfront JIT
+configurations against C++. `testutil::run_rust` defaults to `--no-translate`.
+`tests/jit.rs` compares complete machine state across handwritten and random
+programs at approximately 50 limits, including background compilation, native
+calls, and N-bit layouts. `LIBRISCV_JIT_FUZZ=<programs>[:<seed>]` extends runs.
+FP comparisons are exact until the first NaN, then accept any NaN once;
+bitwise FP operations and integer programs compare exactly.
+
+Historical performance, 2026-11-12: freestanding CoreMark, 4,000 iterations,
+`--accurate`, best of three. Later measurements are in "Baseline".
 
 | | rv64imc | rv64imc_zba_zbb_zbs |
 |---|---|---|
@@ -866,182 +623,124 @@ accesses; nothing here does yet.
 | C++ threaded | 1876 ms | 1792 ms |
 | C++ asmjit | 239 ms | 244 ms |
 
-Execution is within ~5% of asmjit, and the JIT's instruction counts are
-exact (asmjit's are off by a few). Cranelift compiles more slowly: compiling
-the segment up front takes ~60 ms of CoreMark's 0.34 s wall time (asmjit:
-0.26 s total). Next steps: background or lazy compilation, register passing
-across tail calls, AArch64 (F/D came later). Background compilation (added later, see
-Baseline for current numbers) saves ~5-10 ms on CoreMark, the same as
-asmjit's: during the compile, the interpreter only gets through ~1/7 of
-what native code would have.
+JIT execution was within approximately 5% of asmjit with exact instruction
+counts. Compilation took about 60 ms of a 0.34 s process runtime, compared
+with asmjit's 0.26 s total. Background compilation later saved 5–10 ms.
 
 ## AOT
 
-The optional `aot` feature (`libriscv::aot`, `rvlinux --aot-save`,
-`--aot-save-shared`, `--aot-load`, `RVLINUX_AOT_EMBED`) translates execute
-segments to **safe Rust** ahead of time: the counterpart of C++'s binary
-translation to C (`tr_emit.cpp`, `tr_translate.cpp`, `tr_compiler.cpp`),
-added 2026-11-13. Code: `crates/libriscv/src/aot/` (`emit.rs`: one Rust
-function per region, `structure.rs`: control flow, `mod.rs`: keys,
-registry, output). It needs no dependency and no unsafe code.
+The optional `aot` feature translates execute segments to safe Rust, replacing
+C++ translation to C (`tr_emit.cpp`, `tr_translate.cpp`, `tr_compiler.cpp`).
+It adds no dependencies and requires no unsafe code for embedded translations.
+`aot/emit.rs` generates region functions, `structure.rs` lays out control flow,
+and `mod.rs` manages keys, registration, and output.
 
-**Use.** A machine with `MachineOptions::aot_output` (an `AotOutput`)
-translates every segment it creates and records it; it runs normally
-otherwise. `AotOutput::source()` is one Rust file defining `mod
-translation` with `META` (keys, entries, patches as `u64`s) and `enter`
-(std types only, so the host and the translation share no types):
+### Usage and registration
 
-* **Embedded** (`include!` it, `aot::register(translation::META,
-  translation::enter)`): compiled into the program like any other code,
-  under `forbid(unsafe_code)`. `rvlinux` builds files listed in
-  `RVLINUX_AOT_EMBED` into itself (`build.rs`) with just the `aot` feature:
-  no crate in that build has unsafe code. The including crate needs
-  `feature(explicit_tail_calls, rust_preserve_none_cc)`.
-* **Shared object** (`AotOutput::write_shared_object`, `$RUSTC` or
-  `rustc` with `RUSTUP_TOOLCHAIN` set to the toolchain libriscv was built
-  with, `-C opt-level=3 -C target-cpu=native`, extra flags from
-  `$LIBRISCV_AOT_RUSTFLAGS`): the same source after a prologue with two
-  `extern "C"` exports (`libriscv_aot_meta`, `libriscv_aot_enter`), whose
-  few lines are the only unsafe code in it. Loading
-  (`aot::load_shared_object`, feature `aot-dylib`) is in
-  `libriscv-jit-rt`'s `aot` module (`dlopen`, two symbols, `RawCall`
-  built from borrows). Unlike JIT code, what runs behind the boundary is
-  safe Rust that can only touch the registers and arena it is passed.
+`MachineOptions::aot_output` records translations of every created segment
+while execution continues normally. `AotOutput::source()` produces one Rust
+file defining `mod translation`, `META`, and `enter`, using only standard types
+across the host interface.
 
-Translations are keyed like the JIT cache (`codegen::NativeKey`: segment
-address, length, CRC32-C, 64-bit hash, execute-only, libc fast path; the
-memory layout; a fingerprint of `aot/*.rs`, `codegen::SHARED_SOURCES` and
-the extension features) in a process-wide registry consulted when a segment
-is created (`MachineOptions::aot`, default on). A hit installs the code
-instead of the JIT (`native_code::NativeSegment`, shared with the JIT,
-with `dispatch::native_enter`); with `verbose_loader`, hits and misses
-are reported. Machines translating don't share segments (like machines
-saving JIT code); a segment without a translation is shared with machines
-without `aot`. Translating machines key with the N-bit mask too, also with
-`aot` off. The generated source doesn't depend on the host CPU, but a
-shared object built with `target-cpu=native` does: `META` carries a word
-of the x86-64 target features the translation was compiled with
-(`cfg!(target_feature)`, evaluated where it is compiled; `ABI_VERSION` 2),
-and a CPU lacking any refuses it instead of dying of SIGILL.
+- **Embedded:** include the source and call
+  `aot::register(translation::META, translation::enter)`. The host crate needs
+  `explicit_tail_calls` and `rust_preserve_none_cc`. `RVLINUX_AOT_EMBED`
+  embeds listed files in `rvlinux`; the `aot` feature alone permits a build
+  with no unsafe code in any crate.
+- **Shared object:** `AotOutput::write_shared_object` uses `$RUSTC` or `rustc`
+  with the build's toolchain unless `$RUSTUP_TOOLCHAIN` overrides it.
+  Compilation uses `-C opt-level=3 -C target-cpu=native`; additional flags
+  come from `$LIBRISCV_AOT_RUSTFLAGS`. Two C exports,
+  `libriscv_aot_meta` and `libriscv_aot_enter`, form the unsafe boundary.
+  `aot::load_shared_object` requires `aot-dylib` and uses the runtime's
+  `dlopen` wrapper and borrowed `RawCall`. Translated code remains safe Rust.
 
-**Semantics.** Exactly the JIT's: the same instruction selection
-(`codegen::{classify, region}`, moved out of `jit/`), the same counting (block counts on entry, mid-block exits pre-subtract), the same
-exits (`native_code::EXIT_*`: halt, jump, indirect, slow access,
-misaligned jump, dyncall) back to `native_enter`. F/D use Rust's IEEE
-operations; FMIN/FMAX, FCVT to integers and FCLASS are written out like
-the interpreter's, and FCVT.S.D/D.S give the canonical NaN like the
-interpreter (as does the JIT); otherwise which NaN comes out is the
-host's (as for the JIT). The JIT makes native calls the same way (see
-"Native calls" here and under JIT).
+Translations use `codegen::NativeKey`: segment address, length, CRC32-C,
+64-bit code hash, execute-only and libc patch settings, memory layout, and a
+fingerprint of AOT/shared sources and extension features. `MachineOptions::aot`
+is enabled by default; matching translations take precedence over JIT.
+`verbose_loader` reports hits and misses. Translating machines create their
+own segments. Untranslated segments can be shared with machines that have AOT
+disabled. Translation output includes the N-bit layout even if AOT execution
+is disabled.
 
-**Code shape** (`aot/emit.rs`): per region, `extern "rust-preserve-none"
-fn r<N>(s: &mut S, xs, fr, m, pc, counter, depth) -> (target, counter)`
-(`xs`/`fr` the integer and FP register files, `m` the arena), in modules
-of 40 regions (`rustc` splits codegen units by module: one module per
-segment compiled static glibc on one thread). Guest registers it uses are
-locals, loaded on entry and the written ones stored at the single exit
-(C++ register caching). Leaving is an `A` value: return to the host with
-an exit kind, a direct tail call to another region (`become r<M>(..)`),
-an indirect jump through the segment's entry table (`become f(..)`, a
-`OnceLock`ed table of `fn` pointers by decoder index), or a guest return
-(`jalr x0, rs1` with `rs1` `ra` or `t0`), which returns its target to the
-native caller (`enter` loops on such targets through the table). Guest
-memory is a `&mut [u8; N]`, `N` covering the layout's windows plus the
-widest access: after the window check (the interpreter's: start address
-only) every index is provably in bounds and no second check is emitted.
-Accesses through one base register in a straight-line run share one
-check of their offset span, as in the JIT: it computes `k = base + lo -
-window`, compares `k` with the window length minus the span, and the
-accesses index `k + constant`, which LLVM proves in bounds. A base
-register the region never writes gets one check of the span of all its
-accesses in the region, on entry (`RegionWriter::region_checks`), into a
-bool that the first access of each run tests: it leaves at the same
-instruction a run check would (or earlier, when only the wider span
-fails, which only costs speed), and replaces the run checks that LLVM
-otherwise hoists into the entry one by one (core_state_transition did
-eight on every call). The instruction limit and the rounding mode are
-locals: read through `s`, they were reloaded after every guest store. The
-register files and the arena are `&mut` parameters of their own, not
-fields of `S` (they were until 2026-11-14): LLVM marks them `noalias`, so
-it knows a guest store leaves the registers alone, and forwards an inlined
-callee's register loads from the caller's stores (see "Inlining"). With an
-N-bit address space accesses are masked, without checks.
+Generated source is independent of the host CPU. Shared objects compiled with
+`target-cpu=native` record required x86-64 features in `META` (ABI version 2)
+and are rejected on incompatible CPUs.
 
-**Native calls** (2026-11-14; C++ `emit_function_call`). A call (`jal`,
-or `jalr` with a link register, including `auipc`+`jalr` with a constant
-target, `Analysis::jalr_target`, which `-mno-relax` code uses for every
-call; such a `jalr` jumps without reading its base register, so it is
-never a region entry: not when it's a block start, a direct target or
-itself the target of a constant `jalr`, which `jitdifffuzzer` found
-jumping to itself, and the region size limit never separates it from its
-constant) is a Rust call when its return address is a label of the caller's
-region: regions keep a call's return address (unless
-something calls it: after a `noreturn` call it begins another function)
-and are capped at 512 instructions, since they are whole functions. The
-caller stores the registers the callee may read, calls (directly, or
-through the entry table for an indirect call), reloads those it may
-write, and continues at the return address if the callee returned there;
-any other return target goes on to its own caller, and so does `DONE` (an
-exit to the host, already in `S::out`). What a region may read and write
-is a `Summary` (`codegen::calls`, shared with the JIT): its own registers and, to a fixed point, those of the
-regions it transfers to; all of them after an indirect jump. Region
-checks only cover base registers no native callee may write. Past `DEPTH`
-(32) nested calls, a call is a tail call as before, and the return comes
-back through the table. Before this, a call in a loop cost three
-region transfers, each storing and reloading every register (CoreMark's
-`core_bench_state` ran 9x the instructions native code does).
+### Semantics and code generation
 
-**Inlining** (2026-11-14, `emit::inlined`). A native call still cost about
-as much as a small callee's body: the stores and reloads, the callee's
-loads and stores of its own, its entry dispatch, and the caller's spills
-around the call (`rust-preserve-none` keeps nothing in registers across
-it). A region that is called natively and never tail-calls
-(`emit::self_contained`: it leaves only by guest returns, native calls
-and exits to the host) is `#[inline(always)]`, if its size with what is
-inlined into it is at most 256 instructions, and that times its call
-sites at most 1024 (or the size at most 16). Inlined at a call with a
-constant entry, LLVM folds its entry dispatch, and with the `noalias`
-register files its registers are plain values again. Tail calls are what
-rules a region out: LLVM turns a `become` in an inlined body into a plain
-call, which would let guest code grow the host stack without bound. So an
-inlined region's own native calls past `DEPTH` leave for the host
-(`EXIT_JUMP`; the host continues at the callee, with the depth back at
-0) instead of tail-calling; its only `become` left is the root
-dispatch's for an unknown entry, which a constant entry folds away (and
-which an entry missing from the root is missing from the table too). A
-cycle of calls isn't inlined. Larger limits (512 / 2048) ran fewer
-instructions on CoreMark but took more cycles.
+AOT shares instruction selection, regions, counting, and exit handling with
+the JIT through `codegen` and `native_code`. F/D arithmetic uses host IEEE
+operations. FMIN/FMAX, integer FCVT, and FCLASS follow interpreter behavior;
+FCVT.S.D/D.S canonicalize NaNs. Other NaN payloads depend on the host.
 
-**Devirtualization** (2026-11-14, `emit::address_taken`). An indirect
-call (`jalr` with a link register and no constant target) stores and
-reloads every register. If the segment takes the address of at most 4
-labels (`auipc`, `lui` or `li` followed by an `addi` of the same
-register: `la`, `lla`, a `lui` pair; not an `auipc` alone, which before a
-call is the previous call's return label), an indirect call first
-compares its target with each, and on a match makes the direct native
-call, with that callee's `Summary`, inlined if it qualifies. CoreMark's
-list sort calls its comparator (`cmp_idx` or `cmp_complex`) this way.
+Each region is an `extern "rust-preserve-none"` function:
+`r<N>(state, integer_regs, fp_regs, arena, pc, counter, depth) -> (target, counter)`.
+Modules contain 40 regions to allow parallel rustc code generation.
+Guest registers are local values, loaded at entry and written at exit.
+Transfers use direct `become`, an entry-table `become`, a guest return target,
+or an `A` host-exit value. The entry table is initialized through `OnceLock`.
 
-**Control flow** (`aot/structure.rs`). A `loop { match pc { .. } }`
-dispatcher (what `structure::dispatch` writes) was 2.4x slower than the JIT
-on a static glibc program: LLVM doesn't thread constant `pc` assignments
-through the loop header (DFA jump threading didn't help either), so every
-transfer was an indirect jump with all registers merged at one point.
-Regions are laid out as structured code instead, after Ramsey's "Beyond
-Relooper" (ICFP 2022): forward branches `break 'b<n>` out of labeled
-blocks, back edges `continue 'l<n>` loops. Every label is an entry (a
-root `match pc`); entering a loop at the side would be irreducible, so
-such entries (and statically irreducible edges) go to a copy of the
-loop's body without its header, which enters the loop at its header;
-nested loops recursively (a copy made for an entry from inside an
-enclosing loop counts as inside it). Growth is bounded by the nesting
-depth. With native calls every call in a loop puts a return address (an
-entry) inside it, so a region whose code would grow past 2x is laid out
-with no entries inside loops (but at their headers): the host and the
-table can't enter there, and the interpreter runs on to the next entry
-(at most to the loop header). Past 8x even so, or if the result isn't
-reducible, the region falls back to the dispatcher (static glibc has one
-such region, CoreMark none).
+Arena parameters use `&mut [u8; N]`, sized for the layout's windows plus the
+widest access. Start-address checks permit LLVM to prove indices in bounds
+without extra slice checks. Unchanged base registers share offset-span checks
+within straight-line runs. Region-wide checks for bases never modified by the
+region or its native callees can replace repeated run checks. A wider failed
+check may cause an earlier interpreter fallback without changing results.
+N-bit accesses use masking instead.
+
+Instruction limit and rounding mode are locals. Register files and arena use
+separate mutable parameters so LLVM can infer `noalias`, preserve register
+values across guest stores, and forward inlined register accesses.
+
+### Native calls
+
+Calls use native Rust calls when their return address belongs to the caller's
+region. Regions retain return labels unless another function calls that label,
+and normally contain at most 512 instructions. Direct targets include
+`auipc`+`jalr` pairs recognized by `Analysis::jalr_target`. Such a `jalr` cannot
+be a region entry or be separated from its constant-producing instruction.
+
+The caller stores registers the callee may read and reloads those it may write.
+`codegen::calls::Summary` propagates register effects to a fixed point; indirect
+jumps conservatively include all registers. Matching returns continue in the
+caller; other targets and `DONE` propagate outward. Beyond `DEPTH` (32), calls
+become tail calls to bound host stack use.
+
+### Inlining and devirtualization
+
+Self-contained regions, which exit only through guest returns, native calls,
+or host exits, qualify for `#[inline(always)]`. Including inlined callees,
+size must be at most 256 instructions and size × call sites at most 1024,
+unless size is at most 16. Recursive cycles are excluded. Larger limits
+(512/2048) reduced CoreMark instruction counts but increased cycles.
+
+Inlining folds constant-entry dispatch and register synchronization. Regions
+with tail transfers are excluded because LLVM can convert an inlined `become`
+to a regular call. Inlined regions exit with `EXIT_JUMP` past the depth limit
+instead of tail-calling, preventing unbounded host stack growth.
+
+When at most four labels have their addresses taken, indirect calls compare
+the target against them and use direct calls and callee summaries on matches.
+Address detection recognizes `auipc`, `lui`, or `li` plus matching `addi`.
+An isolated `auipc` before a call is excluded. This optimizes CoreMark's
+indirect comparator calls.
+
+### Control flow
+
+`aot/structure.rs` follows Ramsey's "Beyond Relooper" (ICFP 2022). Forward
+branches become labeled `break`; back edges become loop `continue`. A root
+`match pc` dispatches entries. Side entries and irreducible edges use copies of
+loop bodies without their headers, completing a partial iteration before
+joining the loop header. Nested loops are handled recursively.
+
+If all entries would exceed 2× code growth, weak entries inside loops are
+removed. The interpreter continues to the next available entry, at most the
+loop header. Growth beyond 8× or unreduced control flow falls back to a
+`loop { match pc { .. } }` dispatcher. LLVM does not thread constant PCs
+through that loop header; this fallback measured 2.4× slower than JIT on a
+static glibc program. Static glibc required one fallback region; CoreMark none.
 
 **Performance** (2026-11-13, idle box, release `rvlinux`): static glibc
 collatz 229 ms vs JIT 237 ms (interpreter 1893 ms); CoreMark 1.0 (bench
@@ -1053,9 +752,8 @@ iterations, wall time, rv64imafdc / +zba_zbb_zbs): JIT 1.64 / 1.60 s,
 AOT 1.48 / 1.48 s (1.50 / 1.50 s before region checks and locals), with
 `--nbit-address-space` (now 4 GiB at the default `-m`) JIT 1.45 / 1.40 s
 and AOT 1.19 / 1.23 s. Native x86-64 `-O2` CoreMark runs the same
-iterations in ~0.63 s. What the checked build still pays is the one
-compare per access in pointer-chasing loops (no shared base to merge)
-and the precise exits it needs.
+iterations in ~0.63 s. Checked builds retain one comparison per access in
+pointer-chasing loops, where bases cannot be shared, plus precise exit handling.
 2026-11-14, same CoreMark, rv64imafdc, N-bit: no instruction limit 1.10 s
 (from 1.21), native calls 0.97 s, the call depth in a register and one
 borrow per register file 0.89 s, no side entries in large regions
@@ -1081,12 +779,10 @@ cycles per iteration, interleaved against a build of the previous commit:
 
 N-bit AOT runs CoreMark at native speed (per function, every part was
 within ~1% of native but the list sort's comparator calls, before the
-`noalias` change). The `noalias` change is what made inlining pay off:
-an inlined callee loads its registers after the caller's guest stores
-(saving `ra` and the `s` registers on the guest stack), and through
-fields of `S` LLVM couldn't tell those didn't change the registers; a
-16-byte load of two registers the caller had just stored separately
-missed store forwarding, 40% of `cmp_complex`'s cycles. The C calling
+`noalias` change). Separate borrows enabled inlining benefits by proving
+that guest stack stores cannot modify register files. Previously, a 16-byte
+register reload following separate stores missed store forwarding and
+consumed 40% of `cmp_complex` cycles. The C calling
 convention for regions was slower than `rust-preserve-none` (611k
 instructions), and turning off LLVM's SLP vectorizer slower too. Static
 glibc: `rustc` 44 to 47 s wall time (CPU 134 to 180 s), the shared object
@@ -1112,7 +808,7 @@ translation (builds `rvlinux` again in `target/aot-embed`).
 
 Not yet: lazy translation, translating only hot code, saving
 translations of segments that came from the cache. For the calls that
-aren't inlined (large callees, tail-calling ones, indirect calls to
+are not inlined (large callees, tail-calling ones, indirect calls to
 other targets): registers passed as arguments across region transfers
 and calls instead of through the register file, and liveness-based
 stores before calls (a callee's `Summary` counts every register it uses
@@ -1121,137 +817,92 @@ these were for on CoreMark.
 
 ## Virtual paging
 
-`memory/paging.rs` and `memory/page.rs` port the paging half of
-`memory.cpp`, `memory_rw.cpp`, `memory_helpers_paging.hpp`,
-`memory_inline_pages.hpp` and `page.hpp`.
+`memory/paging.rs` and `memory/page.rs` port paging support from `memory.cpp`,
+`memory_rw.cpp`, `memory_helpers_paging.hpp`, `memory_inline_pages.hpp`,
+and `page.hpp`.
 
-- **Page table:** `BTreeMap<page number, slot>` into a `Vec` of slots
-  holding `(page number, Page)`; a page keeps its slot while it is in the
-  table. A `Page` is attributes
-  (`PageAttributes`: read/write/exec, copy-on-write, `dont_fork`, a user
-  byte) plus where its bytes are: `Arena` (C++: a non-owning page loaned
-  from the arena), `Owned(Box<[u8; 4096]>)`, or one of the shared static
-  pages, `Zero` (C++ `cow_page`/`guard_page`) and `Host` (C++
-  `host_page`: the exit function and signal trampoline). Owned bytes are
-  an `Arc<[u8; 4096]>`, shared with forks (`Loaned` on their side) until
-  one side writes: a write goes through `Arc::make_mut`, so no write ever
-  reaches bytes another page shows, and there is no `unsafe` and no
-  lifetime juggling. Range operations (`free_pages`, attribute changes and
-  discards of huge ranges) are `BTreeMap::range` walks.
-- **Page cache** (C++ `m_rd_cache`/`m_wr_cache`, `cached_readable_page`,
-  `cached_writable_page`): 512 direct-mapped entries (`pageno % 512`),
-  each the slot of the page last looked up there, as a relaxed
-  `AtomicUsize` (filled through `&self`, like C++'s `mutable` caches,
-  while keeping `Memory` `Sync`). Every lookup tries it before the B-tree.
-  A hit checks the slot's page number, and loads/stores check the page's
-  read/write permission, so the cache can't go stale and nothing
-  invalidates it (C++ caches page pointers and invalidates them at every
-  CoW, protection change, discard and free, a recurring source of bugs).
-  C++ has one entry for reads and one for writes in front of a hash map;
-  here a miss costs a B-tree lookup, so the cache is larger, and a guest
-  can't push lookups past the B-tree's logarithm (a hash keyed by guest
-  page numbers could be flooded). Without an arena (forks), every load
-  and store takes this path; see "Fork" for numbers.
-- **Arena pages:** C++ creates an arena page table entry whenever a slow
-  path first touches the page. Here only arena pages with non-default
-  attributes get an entry; a bitmap (one bit per arena page) records which
-  ones C++ would have, so `pages_active()` (and `getrusage`'s `ru_maxrss`,
-  and `memdiscard`'s choice between its bulk and page-by-page paths) are
-  exactly C++'s.
-- **Semantics:** guest loads/stores in the arena windows ignore page
-  attributes, as in C++; everything else goes through the page table. Host
-  accessors (`memcpy`, `memset`, `memcpy_out`, `memstring_bytes`,
-  `memcmp`, `gather_buffers`, `gather_writable_buffers`) always do, so
-  system calls respect page attributes inside the arena too. `memview`
-  and `memview_mut` take the arena window, else a single gathered buffer
-  (`OUT_OF_MEMORY` if the range isn't contiguous on the host).
-- **Page faults:** a missing page outside the arena reads as the zero page
-  and is created by the first write, until the owned pages reach half the
-  memory limit with an arena (C++ `anywhere_pages`), the whole limit
-  without one; then `OUT_OF_MEMORY`. Attribute-only pages (from
-  `mmap`/`mprotect`) are bounded by 64 × the memory limit in pages. A
-  writable attribute-only page is the zero page, copy-on-write.
-  `set_page_attr` changes a page at a time in order, like C++, but walks
-  the page index for runs of existing pages instead of looking each up
-  (same pages and failures, tested against the loop): one `mprotect` can
-  cover every page.
-- **Execute segments from pages** (`CPU::next_execute_segment`): jumping
-  outside every known segment looks at the page; if it's executable, all
-  adjacent executable pages are copied out and decoded as a new segment
-  (at most `memory_max` bytes, see the differences). FENCE.I and
-  `riscv_flush_icache` mark segments stale, which then get rebuilt the
-  same way. The host code page is an execute-only page, not a segment
-  made at load time. With the JIT, a rebuild from the same bytes at the
-  same address (for the same memory layout) reuses the stale segment's
-  native code instead of compiling it again (`jit::reuse`): C++ compiles
-  again, but a Cranelift compile takes milliseconds per page, and a loop
-  around a FENCE.I made the host spend that every iteration (`vmfuzzer`:
-  754 compiles, 6 s, in 1500 instructions). A rebuild from changed code
-  is interpreted at first and compiled once it is hot: when it has stayed
-  valid while the machine ran `jit_background_slice` instructions (the
-  dispatcher runs in slices while such a segment exists, and each slice
-  counts; `DecodedSegment::defer_jit`). Code rewritten in a loop is then
-  never compiled, and the host time a guest takes stays proportional to
-  its instructions; code generated once and then run is compiled after a
-  slice, as if in the background. Only rebuilds are deferred: a segment
-  for pages that had none is compiled when it's created, as before.
-- **ELF loading:** segments are copied in through the page table (so they
-  can be anywhere, e.g. `-Ttext-segment` above the arena) and get their
-  program header's attributes (`protect_segments`), or RWX.
-- **JIT:** native code inlines the arena window checks only. Anything else
-  exits to the interpreter at that instruction (`EXIT_SLOW`), which runs
-  it through the page table and finishes the block with the interpreter's
-  handlers (the block is already counted), so results and counts don't
-  depend on the JIT. (With an N-bit address space, native code never
-  reaches the page table: see "JIT".) The checks are branches, which a
-  CPU may speculate past (Spectre v1), so the accesses a check covers use
-  the base register through `select_spectre_guard` (a conditional move,
-  never speculated) on the check's own comparison: when it fails, the
-  base is a constant that keeps every covered offset inside the window.
-  Entry table lookups clamp their slot the same way. Even speculatively,
-  guest code reads nothing outside the arena and calls no pointer outside
-  the table, for one move per check; no real address changes. (Clamping
-  every access instead cost CoreMark 27%.) Masked (N-bit) accesses need
-  no guard. C++ asmjit has none. The guards cost about a quarter of
-  CoreMark's native speed with bounds checks (loads wait for their check),
-  so `MachineOptions::jit_spectre_guards` (default on; `rvlinux
-  --no-spectre-guards`) turns them off for trusted guests; the setting is
-  part of the code's `MemoryLayout` (`unguarded`), so cached code is only
-  used with the same one.
+### Page storage and lookup
 
-Dynamic executables: `rvlinux` loads
-`/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1` as the
-machine's binary, with argv `[interpreter, program, args...]`, and lets the
-guest open the program and the allow-listed libraries in
-`/lib/riscv64-linux-gnu/` (mapped to `/usr/riscv64-linux-gnu/lib/`), as C++
-`rvlinux` does. Deliberate divergence: C++ reads the host file the
-program's `PT_INTERP` names (falling back to that path), so an untrusted
-ELF chose a host file before any sandboxing: `/dev/zero` exhausted host
-memory, a FIFO hung `rvlinux`, and any readable RISC-V ELF (relative paths
-too) became the initial segment. `rvlinux` only accepts a `PT_INTERP`
-ending in `ld-linux-riscv64-lp64d.so.1` (kept as argv[0], so counts still
-match the oracle) and otherwise warns and runs its own linker, with that
-path as argv[0]. The linker is read as a regular file of at most 64 MiB
-(`read_host_file`). Tests: `rvlinux`'s `tests/interpreter.rs` (hand-built
-ELFs naming `/dev/zero`, a FIFO, the program itself, and the canonical
-paths). `ld.so` maps the program and libraries with
-`mmap`/`mprotect`, and their code becomes execute segments when first
-jumped to. Instruction counts match the oracle exactly, also for `dlopen`.
-The allow-listed libraries are pinned (`FileDescriptors::pinned_mappings`,
-also in C++ libriscv): `ld.so`'s first `mmap` of one (no address, offset 0)
-goes to its own 16 MiB slot from 1 GiB up, in list order (`libc.so.6` at
-`0x43000000`), if the range is inside the arena and free, and where `mmap`
-would have put it otherwise. Without pinning, a library's address depended
-on the size of the program `ld.so` mapped first, and the JIT cache and AOT
-translations, keyed by address, missed for every other program. With it,
-code saved for `libc.so`/`libstdc++.so` from one program is found for any
-other (a dynamic C++ program: 27 s compiling up front, 0.07 s from the
-cache). Tests: `pinned_file_mappings` (`libriscv`'s `tests/linux.rs`) and
-the `dynamic_pinned_libraries` difftest.
+The page table uses `BTreeMap<page number, slot>` and stable `Vec` slots
+containing `(page number, Page)`. Attributes include read/write/execute,
+copy-on-write, `dont_fork`, and a user byte. Storage is arena-backed, owned,
+or a shared zero/host page. Owned bytes use `Arc<[u8; 4096]>`; writes use
+`Arc::make_mut` to isolate forks. Range operations use `BTreeMap::range`.
 
-Not ported yet: custom page fault/read/write handlers and execute fault
-handlers (embedding API, Phase 3), memory traps (`RISCV_MEMORY_TRAPS`,
-Phase 5) and `insert_non_owned_memory`.
+A 512-entry direct-mapped page cache stores slots as relaxed `AtomicUsize`
+values, allowing lookup through `&self` while preserving `Memory: Sync`.
+Hits validate page number and permissions, requiring no invalidation after
+copy-on-write, protection changes, or removal. Misses have logarithmic B-tree
+cost rather than a guest-controlled hash-collision risk. Arena-free machines
+use this path for every load and store; see fork benchmarks.
+
+Only arena pages with non-default attributes need entries. A bitmap tracks
+C++-equivalent active pages for `pages_active`, `getrusage`'s `ru_maxrss`, and
+bulk-versus-pagewise discard selection.
+
+### Access semantics
+
+Guest arena-window accesses bypass page attributes, matching C++. Other
+loads and stores use paging. Host copy, fill, compare, string, and gather
+helpers enforce page permissions. `memview` and `memview_mut` use an arena
+window or one contiguous gathered buffer; scattered ranges return
+`OUT_OF_MEMORY`.
+
+Missing external pages read from the shared zero page and allocate on write.
+Owned pages are limited to half `memory_max` with an arena, or the full limit
+without one. Attribute-only pages are limited to 64 times the memory limit
+in pages; writable zero pages use copy-on-write. `set_page_attr` preserves
+C++ update and fault order while scanning existing runs through the page index.
+
+ELF segments load through paging and may lie above the arena. Protections
+follow program headers when `protect_segments` is enabled, otherwise RWX.
+
+### Runtime code
+
+`CPU::next_execute_segment` checks target-page execute permission and decodes
+adjacent executable pages, limited to `memory_max` bytes. FENCE.I and
+`riscv_flush_icache` mark segments stale for rebuilding. The host exit page
+is execute-only and decoded on demand.
+
+JIT rebuilds with identical bytes, addresses, and layouts reuse native code
+through `jit::reuse`. Changed rebuilds interpret until they remain valid for
+`jit_background_slice` executed instructions, then compile through
+`DecodedSegment::defer_jit`. New mappings compile normally. This avoids
+recompiling repeatedly modified code; one fuzz case previously compiled
+754 times in 1,500 instructions, consuming 6 s.
+
+Native checked accesses outside arena windows return `EXIT_SLOW` at the
+instruction. The interpreter performs the paged access and finishes the
+already-counted block. N-bit accesses bypass paging. Spectre guards and their
+configuration are described under JIT.
+
+### Dynamic executables
+
+`rvlinux` loads its fixed
+`/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1` with argv
+`[interpreter, program, args...]`. The guest opens the program and allowed
+libraries under `/lib/riscv64-linux-gnu/`, mapped to
+`/usr/riscv64-linux-gnu/lib/`.
+
+`PT_INTERP` cannot choose the host file. Recognized paths ending in
+`ld-linux-riscv64-lp64d.so.1` are retained as argv[0] for instruction-count
+compatibility; other paths produce a warning and use the configured linker
+path. `read_host_file` requires a regular file no larger than 64 MiB.
+`tests/interpreter.rs` covers devices, FIFOs, self-references, and canonical
+paths. This differs from C++'s guest-selected host path, which could block or
+exhaust memory before sandbox setup.
+
+`ld.so` mappings become execute segments when entered. Counts match C++,
+including `dlopen`. `FileDescriptors::pinned_mappings` gives each library a
+16 MiB slot starting at 1 GiB in list order (`libc.so.6`: `0x43000000`).
+The first mapping with no requested address and offset zero uses its slot
+when it fits and is free; otherwise ordinary `mmap` placement applies.
+Stable addresses permit cache and AOT reuse across programs. A dynamic C++
+program measured 27 s with upfront compilation and 0.07 s from cache.
+Tests include `pinned_file_mappings` and `dynamic_pinned_libraries`.
+
+Custom page fault/read/write and execute-fault handlers, memory traps, and
+`insert_non_owned_memory` remain unimplemented.
 
 ## Testing
 
@@ -1260,7 +911,7 @@ Phase 5) and `insert_non_owned_memory`.
 | Unit | `#[cfg(test)]` in each module | Decoding, helpers, edge cases |
 | Integration | `crates/libriscv/tests/` | Ports of `../libriscv/tests/unit/*.cpp` (Catch2 → `#[test]`); guests built with `testutil::build_and_load`. `linux.rs`: `security.cpp`, Linux cases of `protections.cpp`, threads, signals, the file sandbox, and every system call with random arguments. `paging.rs`: the memory cases of `protections.cpp`, `va_execute.cpp` (code on mprotected and high pages, FENCE.I/`riscv_flush_icache`, constant pools) and `dynamic.cpp` (PIE). `vmcall.rs`: `vmcall.cpp` (the fork case included) and preemption (restoring, clobbering, errors, shared budget, nested under background JIT). `custom.rs`: `custom.cpp`'s custom instruction, and userdata (`with_userdata` included). `filesystem.rs`: the file system sandbox (no filter means no access, normalised paths, special files) without a guest toolchain. `dyncall.rs`: `dyncall.cpp`, adapted to dyncalls being system calls (interpreter and JIT, exactly equal). `native.rs`: `native.cpp` (native heap system calls and the guest C++ containers). `native_rust.rs`: `native_rust.cpp` (the guest Rust containers against a Rust guest, built with `testutil::build_rust`; needs the `riscv64gc-unknown-linux-gnu` target of the pinned toolchain). `rust_collections.rs`: guest-built cycles and deep nesting of the Rust containers, without a Rust guest. `brutal.rs`: `brutal.cpp` (forks, stepping a few instructions at a time, copy-on-write and page cache cases) plus fork snapshots, forks of forks, forking from threads and fork page accounting. `rvv.rs`: `rvv.cpp` (RVV 1.0 in inline assembly, `-march=rv64gcv`; also under the JIT). `rva23.rs`: `rva23.cpp` (Zfhmin, Zimop, Zcmop and Zawrs as raw `.insn`) |
 | Example | `examples/asteroids/tests/headless.rs` | The example game played without a terminal: frames at a fixed rate with scripted input, the JIT against the interpreter frame by frame (screens and instruction counts), heap balance across frames. Builds the Rust guest with cargo; skipped without the guest toolchain |
-| Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Static and dynamic glibc C and C++ programs (stdio, malloc, threads incl. `test_threads.cpp`, condvars, abort, a fault with a signal handler, timeouts; dynamic ones run under `ld.so`), code generated at runtime (mprotect, FENCE.I, pages far outside the arena, `dlopen`, an execute fault), `getrusage`'s page accounting, the prebuilt Rust/Zig/newlib fixtures (Go: output only, its count varies under the oracle too) and glibc CoreMark, and `--libc-fastpath` (the guest of `libc_fastpath.cpp` calling every patched function, the glibc C and C++ programs, timeouts, and faults inside patched functions). Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics; RV64IM and RV64IMC+Zcb with Zba/Zbb/Zbc/Zbs/Zicond/Zbkb for bit manipulation; RV64IMFD and RV64IMAFDC+Zcb with Zfhmin/Zfa for floating point; CoreMark (soft-float, F/D, F/D+B), whose clock is the instruction counter so its whole output is compared. `rvlinux --call` (a VM call after the program exits). C++'s RVA23 suite (`../libriscv/tests/rva23/`, port of its `run.sh` and `isa/run.sh`): the ten programs built with the RVA23 compiler (`$RVCC`, default `~/riscv/bin/riscv64-unknown-linux-gnu-gcc`) must print what their host builds print, the instruction-level probe must pass, and both must match the reference, also at timeouts inside vector code; skipped without `$RVCC` (`LIBRISCV_REQUIRE_RVA23=1` fails instead), which CI doesn't have. Each scenario is one test per Rust configuration (`<name>::interp`, `::jit`, `::jit_upfront`), and long fuel loops are split, so the harness runs them concurrently |
+| Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Static and dynamic glibc C and C++ programs (stdio, malloc, threads incl. `test_threads.cpp`, condvars, abort, a fault with a signal handler, timeouts; dynamic ones run under `ld.so`), code generated at runtime (mprotect, FENCE.I, pages far outside the arena, `dlopen`, an execute fault), `getrusage`'s page accounting, the prebuilt Rust/Zig/newlib fixtures (Go: output only, its count varies under the oracle too) and glibc CoreMark, and `--libc-fastpath` (the guest of `libc_fastpath.cpp` calling every patched function, the glibc C and C++ programs, timeouts, and faults inside patched functions). Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics; RV64IM and RV64IMC+Zcb with Zba/Zbb/Zbc/Zbs/Zicond/Zbkb for bit manipulation; RV64IMFD and RV64IMAFDC+Zcb with Zfhmin/Zfa for floating point; CoreMark (soft-float, F/D, F/D+B), whose clock is the instruction counter so its whole output is compared. `rvlinux --call` (a VM call after the program exits). C++'s RVA23 suite (`../libriscv/tests/rva23/`, port of its `run.sh` and `isa/run.sh`): the ten programs built with the RVA23 compiler (`$RVCC`, default `~/riscv/bin/riscv64-unknown-linux-gnu-gcc`) must print what their host builds print, the instruction-level probe must pass, and both must match the reference, also at timeouts inside vector code; skipped without `$RVCC` (`LIBRISCV_REQUIRE_RVA23=1` fails instead), which CI does not have. Each scenario is one test per Rust configuration (`<name>::interp`, `::jit`, `::jit_upfront`), and long fuel loops are split, so the harness runs them concurrently |
 | Instruction | ports of `../libriscv/tests/instructions/` | Per-instruction checks incl. RVC (`test_rv32c.cpp` → `tests/rvc.rs`, widened to RV64) |
 | ISA | `../libriscv/tests/rva23/` | Ported into `difftest.rs` (`rva23_*`, see above); needs a full RVA23 toolchain |
 | Fuzz | `fuzz/` (`cargo fuzz`, a separate workspace; see `fuzz/README.md`) | Port of `../libriscv/fuzz/fuzz.cpp`: `vmfuzzer` (instruction set), `elffuzzer` (ELF loader + Linux system calls, seeded with the prebuilt RV64 ELFs), `nativefuzzer` (native heap and memory system calls; C++ `FUZZ_NAT` without native threads), `syshelperfuzzer` (system call memory helpers). Beyond C++: `linuxfuzzer` (Linux system calls, threads, signals, sandboxed file system), `libcfuzzer` (libc fast path), `forkfuzzer` (forks must continue exactly like their parent), `guestfuzzer` (guest C++ containers), `vmcallfuzzer` (VM calls, nested preemption, dyncalls, system call arguments) and `jitdifffuzzer` (JIT against the interpreter, exact). Built with debug assertions and overflow checks; any panic is a bug. `overnight.sh` runs them all for hours, collecting findings |
@@ -1280,15 +931,15 @@ under Ubuntu's riscv64 glibc: on Linux with the interpreter and `-j`
 VM (`freebsd` job) with the interpreter and `-j`. Loading cached JIT code
 is Linux-only, so on FreeBSD `-j` compiles everything on every run.
 
-The C++ reference is always run with `--no-translate --accurate` so we compare
-against the interpreter with exact instruction counts.
+Run the C++ reference with `--no-translate --accurate` for interpreter
+execution and exact instruction counts.
 `scripts/build-cpp-reference.sh` builds the threaded, tailcall and switch
 variants into `target/cpp-ref/<mode>/rvlinux` for benchmarking
 (`testutil::reference_emulator_variant`).
 
 ## Phases
 
-### Phase 0 — Infrastructure ✅
+### Phase 0 — Infrastructure (complete)
 
 - [x] Cargo workspace, `forbid(unsafe_code)`, clippy/rustfmt config, CI
 - [x] `Width`/`Address`, `MachineError`/`ExceptionKind`, `MachineOptions`, `Instr` formats
@@ -1297,7 +948,7 @@ variants into `target/cpp-ref/<mode>/rvlinux` for benchmarking
 - [x] Difftest scaffolding (ignored until Phase 2)
 - [x] Dispatch decision: pinned nightly + `become`; C++ dispatch variants built and baselined
 
-### Phase 1 — Minimal machine (RV64I + M, freestanding guests) ✅
+### Phase 1 — Minimal machine (RV64I + M, freestanding guests; complete)
 
 Exit criterion: port of the `Execute minimal machine` and freestanding cases of
 `tests/unit/basic.cpp` / `micro.cpp` pass. Met; in addition, freestanding
@@ -1316,85 +967,54 @@ timeouts.
 
 ### Known differences from the oracle
 
-Expected until the listed phase:
+- VMV.X.S, VCPOP.M, and VFIRST.M with rd = x0 decode as NOPs. C++ writes
+  x0, allowing later reads to return nonzero.
+- FMIN/FMAX with one signaling NaN depends on the C++ compiler: Clang's
+  inlined `minnum` returns the numeric operand, matching Rust, while glibc
+  can return quiet NaN. Differential tests exclude this case.
+- Fused FP NaN payloads and signs depend on glibc's host FMA versus Rust's
+  compiler-builtins implementation. Tests compare NaN classification.
+  Results matched on Ryzen 7950X but differed on a GitHub runner.
+- Freestanding guests require `-mno-relax` because no crt0 initializes `gp`.
+- Arena allocation failure aborts the process; C++ throws `OUT_OF_MEMORY`.
+  Memory sizes exceeding the host address space use paging without an arena,
+  matching failed C++ arena mapping.
 
-- VMV.X.S, VCPOP.M and VFIRST.M with rd = x0: the oracle writes x0, which
-  then reads back nonzero; here they are NOPs (`decode::decode_vector`),
-  until C++ fixes it. No compiler emits them.
-- The oracle's FMIN/FMAX result for a single *signaling* NaN operand
-  depends on the C++ compiler: clang inlines `std::fmin` as `minnum` (the
-  other operand, as here), while a call into glibc returns a quiet NaN. The
-  difftests avoid that case.
-- FMADD/FMSUB/FNMADD/FNMSUB NaN results (payload and sign) come from the
-  host's `fma`: C++ calls glibc's, which uses the CPU's FMA instruction,
-  and which NaN operand that returns differs between CPUs; Rust's
-  `mul_add` calls compiler-builtins' software `fma`. They agree on an AMD
-  Ryzen 7950X but differed on a GitHub runner. Calling glibc's `fma` would
-  need `unsafe`. The float difftest compares only whether the result is NaN.
-- Freestanding guests have no crt0 to set `gp`, so with linker relaxation
-  their globals land near address 0 or `-2048`: build them with
-  `-mno-relax`.
-- Arena allocation failure aborts the process (fallible zeroed allocation
-  needs `unsafe`); C++ throws `OUT_OF_MEMORY`. A `memory_max` too large to
-  address at all gets no arena (paging only), like a failed C++ `mmap`.
+Paging and resource-limit differences:
 
-Deliberate, permanent differences in paging:
-
-- Page 0 is a guard page in every machine; C++ only installs it when
-  loading a binary. A machine without a binary also keeps its arena fast
-  path (C++ leaves the boundaries at 0 and serves the arena through the
-  page table, with the same results except for page 0).
-- An execute segment built from executable pages is at most `memory_max`
-  bytes (`OUT_OF_MEMORY` otherwise): C++ would decode e.g. a guest's
-  `mprotect(PROT_EXEC)` of 64 × `memory_max` of attribute-only pages,
-  exhausting host memory.
-- Execute segments are bounded in host memory as well as in number. Each
-  holds a copy of its code and a 16-byte decoder entry per 2 bytes of it,
-  about 9 host bytes per byte of code, outside `memory_max`; together the
-  machine's segments may hold `MachineOptions::execute_segment_memory_max`
-  bytes (default `memory_max`, at least `EXECUTE_SEGMENT_MEMORY_MIN` =
-  256 MiB, i.e. about `memory_max / 9` bytes of code but at least 28 MiB,
-  so programs with large code run under the default `memory_max`), and a
-  new segment past it is `OUT_OF_MEMORY` (`Memory::execute_segments_memory`
-  reports the total). Shared segments count in full in every machine holding them;
-  native code isn't counted, and a background compilation briefly holds a
-  second copy of the segment. And a new segment evicts the (non-main)
-  segments it covers, which C++ keeps and keeps finding first: a segment
-  spans every executable page around the PC, so a guest growing an RWX
-  area a page at a time and jumping into each new page made C++ keep a
-  copy of the whole area per page (16 × 9 × the area; about 5 GB for a
-  48 MiB area). The evicted segments' slots stay taken, so
-  `Max execute segments reached` comes at the same point as in C++. Normal
-  programs, dynamic ones included, never cover an earlier segment, nor
-  come near the limit. An embedder should expect execute segments to add
-  up to `max(memory_max, 256 MiB)` (or the limit set) of host memory per
-  machine on top of guest memory, plus native code with the JIT; with
-  many small machines, set the limit lower.
-- Decoding execute segments at runtime (`next_execute_segment`: a new
-  segment for code mapped while running, or the rebuild of a stale one) is
-  charged as instructions, `len / 4` for its `len` bytes (as
-  `flush_execute_segments` charges, which C++ does too), past a free
-  allowance per machine (`MachineOptions::free_decode_bytes`, default
-  `FREE_DECODE_BYTES` = 16 MiB). C++ never charges, and each decode copies,
-  hashes and decodes the whole executable area around the PC: a guest
-  alternating FENCE.I and jumps into a large executable area made the host
-  decode megabytes per guest instruction (security review: 200
-  instructions took 436 ms), and `stale_restart_pc` only catches the same
-  PC going stale again. New segments share the allowance so that no path
-  that drops segments (eviction) makes decoding free. The dispatcher halts
-  at the charge once it reaches the limit, before the new block (or slice
-  end; charges don't count towards making deferred JIT compilations hot).
-  16 MiB is several times what a dynamic glibc program maps at runtime
-  (`ld.so`, `libc`, `libstdc++`, `libm`, `libgcc_s`: about 4 MiB of text
-  on riscv64; static programs, the Go/Rust/Zig fixtures included, decode
-  their code at load, which doesn't count), so the difftests (`runtime_code`
-  rebuilds 8 KiB) keep C++'s counts. `Machine::penalize` saturates instead
-  of wrapping.
-- Slow-path accesses that cross a page boundary use both pages (C++ reads
-  or writes past the end of a heap page; for arena pages, as here, the
-  next arena bytes).
-- Discarding the host code page gives the machine a zeroed private copy;
-  C++ zeroes the shared static page, for every machine in the process.
+- Page zero is always a guard page, including without a binary. Empty
+  machines retain their arena fast path; C++ uses paging in that case.
+- Segments decoded from pages are limited to `memory_max` bytes; larger
+  ranges return `OUT_OF_MEMORY`. C++ can decode attribute-only ranges up
+  to 64 times the memory limit and exhaust host memory.
+- Execute-segment host storage has a separate
+  `execute_segment_memory_max` limit, defaulting to
+  `max(memory_max, EXECUTE_SEGMENT_MEMORY_MIN)` with a 256 MiB minimum.
+  Code plus decoder entries costs about 9 host bytes per code byte,
+  supporting at least 28 MiB of code by default. Shared segments count in
+  full per machine. Native code is excluded, and background compilation
+  temporarily retains another segment copy. `execute_segments_memory`
+  reports usage; exceeding the limit returns `OUT_OF_MEMORY`.
+- New segments evict covered non-main segments. C++ retains overlapping
+  copies, potentially using about 5 GB for a 48 MiB area grown pagewise.
+  Evicted slots remain occupied to preserve `MAX_EXECUTE_SEGS` timing.
+  Embedders should budget the segment limit in addition to guest memory
+  and native code; reduce it for pools of small machines.
+- Runtime decoding charges `len / 4` instructions after the per-machine
+  `free_decode_bytes` allowance, default 16 MiB. Newly mapped segments and
+  stale rebuilds share the allowance; load-time and explicit
+  `init_execute_area` segments are excluded. C++ charges no runtime
+  decoding. This bounds repeated copying, hashing, and decoding of large
+  areas after FENCE.I; a measured 200-instruction case otherwise consumed
+  436 ms. Charges reaching the limit halt before the next block and do
+  not make deferred compilations hot. Dynamic glibc text is about 4 MiB,
+  within the allowance; existing differential guests retain C++ counts.
+  `Machine::penalize` saturates instead of wrapping.
+- Slow accesses crossing a page boundary use both pages. C++ can access
+  beyond an owned heap page; arena crossings use adjacent arena bytes in
+  both implementations.
+- Discarding the host code page creates a private zeroed copy. C++ can
+  zero the shared page for every machine in the process.
 
 ### VM calls
 
@@ -1438,84 +1058,56 @@ C++ behaviour kept for parity:
   exit function, so the interrupted code continues 4 bytes after it, as
   after any handler that changes PC.
 - `default_exit_function`: when the symbol exists, the host page (with
-  the signal return trampoline) isn't installed.
+  the signal return trampoline) is not installed.
 
 ### Fork
 
-`Machine::fork_with(&self, options)` ports the forking constructor
-`Machine(const Machine&, MachineOptions)` (`fork()` uses the master's own
-options; C++'s default is `MachineOptions{}`). The fork copies the
-registers, instruction counter and limit, threads, program layout, mmap
-free list and LR/SC reservation, and shares the execute segments and the
-system call table (an `Arc`, copied when either side installs a handler;
-C++'s table is per process). Like C++, it gets the default printer, stdin
-and rdtime, no file descriptors and no signal handlers.
+`Machine::fork_with(&self, options)` ports the forking constructor.
+`fork()` reuses the source's options; C++ instead defaults to `MachineOptions{}`.
+A fork copies registers, instruction counter and limit, threads, program layout,
+mmap free list, and LR/SC reservation. Execute segments and the system call
+table are shared; installing a handler makes the table private. Printer,
+stdin, and rdtime callbacks reset to defaults. File descriptors, signal
+handlers, userdata, and native heap state are not inherited.
 
-Memory (`Memory::fork`, C++ `machine_loader`): every page except
-`dont_fork` ones is loaned. Its slot keeps its number, so the fork clones
-the page index as is and maps the slots, an `Arc` increment each;
-writable pages become copy-on-write in the fork. `minimal_fork` loans
-nothing (C++ then also has no page fault handler, expecting a custom one,
-which isn't ported; here the default handler gives zero pages). A fork
-has no arena. Forking a machine that has one with `use_memory_arena` set
-is `ILLEGAL_OPERATION`, as in C++. Without it, the fork gets copies of
-the arena pages C++ has in its page table (C++ loans them out of the
-master's arena) and, like C++, doesn't see arena pages only guest
-loads/stores touched. Machines meant for forking are created with
-`use_memory_arena: false`.
+`Memory::fork` shares pages through `Arc`, excluding `dont_fork` pages.
+Writes on either side use copy-on-write. `minimal_fork` shares no pages;
+the default fault handler then supplies zero pages. Custom fault handlers
+used by C++ minimal forks are not implemented.
 
-Deliberate differences, all stricter than C++:
+Forks have no arena. Create fork sources with `use_memory_arena: false`.
+Forking an arena-backed source with `use_memory_arena` enabled returns
+`ILLEGAL_OPERATION`. With it disabled, arena pages represented in C++'s page
+table are copied; pages touched only through guest arena accesses are excluded,
+matching C++.
 
-- **Forks are snapshots.** The master may run, change and be dropped
-  while forks exist (C++: it must outlive its forks and mostly not
-  change); a write to bytes a fork shares copies them first, on either
-  side. Forks of forks work the same way.
-- A loaned page made writable in a fork (`mprotect`) is copy-on-write,
-  and `madvise(MADV_DONTNEED)` of a read-only loaned page zeroes a copy.
-  C++ writes the master's page in both cases.
+Forks are independent snapshots: the source may run, change, or be dropped,
+and forks may be forked again. Making shared pages writable or discarding
+read-only shared pages creates private copies. C++ requires the source to
+outlive its forks and can modify source pages in these cases.
 
-Forks share the master's execute segments, including ones still being
-compiled in the background (see "Background compilation"), and segments
-a fork creates later (e.g. the host exit page on its first VM call) come
-from the process-wide cache, decoded once (see "Shared execute
-segments").
-
-Native code doesn't *run* in forks yet: a fork has no arena, and
-`JitState::new` refuses windows that don't fit in it, so `jit_enter`
-falls back to the interpreter (the same holds for the masters meant for
-forking, created with `use_memory_arena: false`). C++ asmjit runs in forks
-and reaches the page table from native code; the Cranelift JIT leaves
-native code for every access outside the arena (`EXIT_SLOW`), so it needs
-a page-table path in native code first. JIT code compiled for the
-master's N-bit arena would be refused in a fork anyway.
+Forks share pending background compilations and receive their results.
+Later segments, including the VM-call exit page, can use the process-wide cache.
+Native code currently requires an arena, so forks and arena-free sources use
+the interpreter. Native page-table access is required before JIT execution can
+support them; master-specific N-bit layouts would also be rejected.
 
 ### Shared execute segments
 
-Port of C++ `SharedExecuteSegments` (`decoder_cache.cpp`), on by default
-(`MachineOptions::use_shared_execute_segments`): machines of the process
-that decode the same code at the same address share one
-`Arc<DecodedSegment>`, with its native code. Keyed by address, length,
-CRC32-C (`crc32c`, slicing-by-8 instead of C++'s SSE4.2 instruction,
-which needs `unsafe`), execute-only, and whether and how the JIT compiles
-(none, or its N-bit mask). C++ also keys on the arena boundaries, which
-asmjit bakes into its code; Cranelift code reads them at run time. As in
-C++, the cache entry stays locked while a segment is decoded, so
-concurrent machines decode and compile it once, and a machine compiling
-up front waits for a background compilation of the same segment instead
-of starting its own.
+Port of C++ `SharedExecuteSegments` (`decoder_cache.cpp`), enabled by default
+through `use_shared_execute_segments`. Machines decoding identical code at the
+same address share an `Arc<DecodedSegment>` and native code. Keys include
+address, length, CRC32-C, execute-only and libc patch settings, backend settings,
+and native memory layouts. CRC32-C uses slicing-by-8; C++ uses SSE4.2.
 
-Differences from C++:
+The cache entry remains locked during decoding. Concurrent machines decode
+and compile a segment once; upfront compilation waits for an existing
+background compilation.
 
-- **The code is compared, not just the CRC.** CRC32-C collisions are
-  trivial to construct (the unit test forges one), and C++ hands the
-  registered segment to any machine whose code collides, i.e. one guest's
-  machine can end up executing code another guest supplied. Here a
-  collision gets its own, unshared segment.
-- Stale segments are never handed out; a new one replaces them in the
-  cache.
-- The cache holds segments weakly: they die with the last machine using
-  them (C++ `remove_if_unique` on eviction and destruction), and entries
-  nobody uses are pruned when the map has doubled.
+Lookups compare exact code bytes in addition to CRC32-C, preventing collision
+substitution. Stale segments are replaced. The cache holds weak references;
+segments are freed after their last user, and unused entries are pruned when
+the map doubles in size.
 
 `crates/libriscv/benches/fork.rs` against the same scenario in C++
 (Release, threaded dispatch; master: static glibc, 637 pages), per
@@ -1538,76 +1130,50 @@ do. The bench does that first (`FORK_BENCH_NO_WARMUP=1` skips it).
 
 ### Shared read-only data
 
-Port of C++ `shared_rodata.cpp` and `Memory::prepare_shared_rodata`/
-`publish_shared_rodata` (`memory/shared.rs`), on by default
-(`MachineOptions::use_shared_rodata`) with the `jit` feature, on Linux
-(x86_64, aarch64, riscv64). `rvlinux` turns it off: it runs one machine,
-so an image would only cost a copy. Machines loaded from the same program into arenas of the same size map
-one sealed memfd (`libriscv-rodata`) over guest memory `[0, end)`, where
-`end` is the page-aligned end of the read-only segments (at most the start
-of the first writable one): the program's text and rodata are in host
-memory once, and a pooled VM costs its writable data, stack and heap. The
-first machine publishes the image once it has loaded the program
-(relocations included). Later machines with the same layout attach it
-before loading, after comparing every byte with their own segments (the
-layout only selects candidates), and skip copying what it covers; the
-loader still creates those pages in the page table, without writing them
-(`touch_writable`). The cache holds images weakly: the last machine to
-drop one frees it. Its lock is only held to look up and insert:
-comparisons and image creation happen outside it, so machines can be
-created on many threads at once (an image created concurrently with an
-identical one is dropped in favour of it). Together with shared execute segments this is the
-model of embedders that pool independently created VMs rather than fork
-them (carapace: one `Arc<[u8]>` ELF, `Machine::new` per VM).
+`memory/shared.rs` ports `shared_rodata.cpp` and
+`Memory::prepare_shared_rodata`/`publish_shared_rodata`. Enabled by default
+through `use_shared_rodata` with `jit` on Linux x86_64, aarch64, and riscv64.
+`rvlinux` disables it because its single machine cannot benefit from sharing.
 
-The arena is the one thing that needs `unsafe`: with the feature it is a
-`libriscv_jit_rt::GuestArena` (an anonymous `MAP_NORESERVE` `memmap2`
-mapping that derefs to `[u8]`, on every platform) instead of a
-`Vec<u8>`, and `RodataImage` is the memfd. That's why it lives under
-`jit`. `memfd_create`, `fcntl(F_ADD_SEALS)` and the fixed-address `mmap`
-are declared by hand (like `dlopen`), not through the `libc` crate, for
-the architectures whose flag values they spell out. Nothing else changes: the arena is still
-one contiguous `[u8]`, so the interpreter's `arena_read`/`arena_write`,
-the JIT's base-pointer addressing and AOT code are untouched, and the cost
-is all at machine creation. On Linux the arena lies between two 1 MiB
-inaccessible guards (`GUARD`, `PROT_NONE` address space), so that an
-access just outside it faults instead of reaching other host memory:
-defense in depth under native code's own checks.
+Machines with matching program bytes and arena sizes map one sealed memfd
+(`libriscv-rodata`) over `[0, end)`. `end` is the host-page-aligned read-only
+boundary, at most the first writable segment. The first machine publishes
+after loading and relocations. Later machines compare every covered byte,
+attach before loading, and skip covered copies while retaining page-table
+entries through `touch_writable`.
 
-The mapping also lets a discard of the arena (`memdiscard`: `madvise
-(MADV_DONTNEED)`, anonymous `mmap`, `munmap`) do what C++ does: hand whole
-host pages back to the kernel (`GuestArena::zero_pages`, Linux only,
-never over an attached image, whose pages would read as the image again)
-instead of zeroing them by hand, for ranges of 256 KiB or more. The
-`Vec<u8>` arena (no `jit` feature) can't, so it scans for non-zero 4 KiB
-chunks, and reading untouched pages faults each one in: Go guests discard
-large ranges over a hundred times at startup, which makes a Go hello world
-take about 370 ms there (184k page faults), against about 12 ms with the
-feature or in C++.
+Images use weak references and are released after their last user. The cache
+lock covers lookup and insertion only; comparisons and creation occur outside
+it. Concurrent identical candidates converge on one image. This supports pools
+of independently created machines sharing an `Arc<[u8]>` ELF.
+
+`libriscv_jit_rt::GuestArena` owns an anonymous `MAP_NORESERVE` `memmap2`
+mapping exposed as `[u8]`; `RodataImage` owns the memfd. Interpreter, JIT,
+and AOT access paths retain the same arena representation. Linux-specific
+sealing and fixed-address calls use explicit declarations for supported
+architectures. Two inaccessible 1 MiB guards surround the arena as additional
+protection; native code still enforces its own access checks.
+
+For discards of at least 256 KiB, Linux mappings reclaim whole anonymous host
+pages through `GuestArena::zero_pages`. Attached image pages are excluded,
+because discarding them would restore image contents. Without `jit`, the
+`Vec<u8>` arena scans nonzero 4 KiB chunks for zeroing. Repeated Go startup
+discards measured about 370 ms and 184,000 page faults with vector storage,
+versus 12 ms with mapped storage or C++.
 
 Differences from C++:
 
-- **The image is mapped copy-on-write** (`PROT_READ | PROT_WRITE`,
-  `MAP_PRIVATE`), not `PROT_READ | MAP_SHARED`. Its pages are the memfd's
-  page-cache pages, shared by every machine, until a store reaches one,
-  which gets a private copy of that page only. C++ relies on the write
-  boundary and turns sharing off where stores can get past it: with
-  virtual paging (which this port always has: a guest can `mprotect` its
-  rodata writable, and the page table then writes the arena) and with an
-  encompassing N-bit arena (masked stores aren't checked). Here both work,
-  and behave exactly as without sharing (`tests/shared_rodata.rs`), so
-  N-bit address masking keeps its speed with shared rodata. The seals
-  (write, grow, shrink, seal) keep the file's bytes from changing or
-  disappearing (no `SIGBUS`).
-- Images are whole *host* pages (C++: guest pages, which breaks with
-  larger host pages).
-- A discard (`memdiscard`) of rodata zeroes it, as C++ does with paging
-  (C++'s "never touches read-only data" test is about its arena without
-  paging); with sharing, the zeroed pages are private to that machine.
-- If mapping the image over a loaded arena fails, the range is mapped
-  again privately and refilled from a view of the image taken before
-  the arena was touched (C++ leaves whatever the failed `mmap` left).
-  The image is also mapped `MAP_NORESERVE`, like the arena it replaces.
+- Images use `PROT_READ | PROT_WRITE` with `MAP_PRIVATE`. Stores create
+  private pages, preserving isolation with virtual paging, `mprotect`,
+  and N-bit masking. C++ uses read-only `MAP_SHARED` and disables sharing
+  when those modes allow writes. Write/grow/shrink/seal seals prevent
+  mutation and truncation-induced `SIGBUS`.
+- Image sizes use whole host pages, including hosts with pages larger
+  than guest pages.
+- Discarding read-only data zeroes private pages, matching paging semantics
+  without changing other machines.
+- Failed attachment over a loaded arena restores a private mapping from an
+  image view acquired before modification. Images use `MAP_NORESERVE`.
 
 ### Linux system calls
 
@@ -1631,7 +1197,7 @@ the guest raw host access, the port is deliberately stricter:
 - The filters get an absolute, lexically normalised guest path
   (`FileDescriptors::normalize_path`: `.`, `..` and repeated slashes
   collapsed, a trailing slash kept), and the host opens that path or the
-  filter's rewrite of it, so `..` can't escape a prefix check. A path
+  filter's rewrite of it, so `..` cannot escape a prefix check. A path
   relative to a directory descriptor is joined to the directory's guest
   path (`OpenFile::guest_path`) before filtering; C++ filters the
   relative tail and opens it relative to the host directory. Relative
@@ -1641,14 +1207,14 @@ the guest raw host access, the port is deliberately stricter:
 - `openat` refuses (`EACCES`) files that are neither regular files nor
   directories unless `permit_special_files` is set: a FIFO, a terminal or
   `/proc/self/fd/0` could block the host thread in `open` or `read`
-  outside the instruction limit. Without `libc` there's no portable
+  outside the instruction limit. Without `libc` there is no portable
   `O_NONBLOCK`, so the type of what the path resolves to (symbolic links
   followed) is checked before opening, and the opened file's again after.
-  `faccessat`'s `R_OK`/`W_OK` probes don't open such files either. C++
+  `faccessat`'s `R_OK`/`W_OK` probes do not open such files either. C++
   opens anything the filter admits; `rvlinux` sets `permit_special_files`
   (its filter is an exact allow-list that includes `/dev/urandom`).
-- `dup` returns a virtual descriptor (C++: a host number the guest can't
-  use), `dup3` can't replace descriptors (`EPERM`), `pipe2` and
+- `dup` returns a virtual descriptor (C++: a host number the guest cannot
+  use), `dup3` cannot replace descriptors (`EPERM`), `pipe2` and
   `getdents64` are `ENOSYS` (a pipe nobody reads would block the host),
   reading fds 1/2 is `EBADF`, and the guest can have at most 1024 files
   open (`EMFILE`).
@@ -1667,14 +1233,14 @@ System calls reach guest memory through the gather functions with C++'s
 buffer counts (`read`/`pread64` 512, `write` 64, file `mmap` 256), so a
 range of more scattered pages than that is `OUT_OF_MEMORY`, as in C++.
 
-### Known C++ quirks kept for parity
+### C++ compatibility behavior
 
-Bugs or oddities in C++ that the port reproduces on purpose:
+The port preserves these C++ behaviors unless an explicit difference is listed:
 
 - C++'s tail-call and threaded dispatchers disagree observably (see
   "Dispatch"); the port follows the threaded one.
 - `R_RISCV_RELATIVE` relocations write the symbol value, not base + addend.
-- The precise JALR doesn't clear bit 0 of the target (an odd target faults);
+- The precise JALR does not clear bit 0 of the target (an odd target faults);
   the dispatcher's JALR does.
 - CSRRW on an unknown CSR falls through to CSRRS.
 - Exception data for a force-ended segment end is C++'s re-encoded bytecode
@@ -1692,19 +1258,19 @@ Bugs or oddities in C++ that the port reproduces on purpose:
 - C.J is only decoded if 4 bytes at its target are inside the segment
   (C.BEQZ/C.BNEZ: 2 bytes), so a `c.j` to the segment's last halfword is an
   illegal instruction.
-- The compressed slow path (`RV32C_BC_FUNCTION`) doesn't check for a stale
+- The compressed slow path (`RV32C_BC_FUNCTION`) does not check for a stale
   segment afterwards, unlike the 4-byte one.
 - A misaligned SC fails (`rd = 1`) without faulting and, unlike an
   aligned SC, keeps the reservation; a misaligned LR raises
   `DEADLOCK_REACHED` with data 0.
 - Not reproduced: C++ registers an execute segment before decoding it and
-  leaves it registered if decoding throws; here it's registered only when
+  leaves it registered if decoding throws; here it is registered only when
   complete.
 - `rvlinux` keeps the NUL terminator of `PT_INTERP` in a dynamic
   executable's `argv[0]` (C++ copies the whole `p_filesz` into a
   `std::string`), so that string takes one byte more on the stack.
 - Guest stores inside the arena's write window, and loads in its read
-  window, ignore page attributes (`mprotect(PROT_NONE)` doesn't stop them);
+  window, ignore page attributes (`mprotect(PROT_NONE)` does not stop them);
   system calls and other host accesses respect them.
 - `memdiscard` (`MADV_DONTNEED`, anonymous `mmap`) zeroes read-only memory
   too, and a run of whole untouched arena pages is wiped without looking at
@@ -1714,22 +1280,22 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   truncates the address to an `int`.
 - A futex wait that would deadlock (no other runnable thread) writes 8
   zero bytes at the futex address and returns 0. When the running thread
-  exits and nothing is suspended, the main thread is resumed even if it's
+  exits and nothing is suspended, the main thread is resumed even if it is
   blocked (it leaves the blocked list here; see below). Exiting threads
-  clear their TID word but don't wake futex waiters; futex timeouts are
+  clear their TID word but do not wake futex waiters; futex timeouts are
   ignored.
 - `getrandom` of more than 256 bytes returns -1 (not an errno) and charges
   20k instructions per byte; `uname` says "RISC-V C++ Emulator";
   `readlinkat` with a buffer over 1024 bytes is `ENOMEM`; `nanosleep`
   writes the clamped request back; `sigaction` reports an unset handler as
   `~0xF`.
-- EBREAK isn't a block end, so a handler's `stop()` only takes effect at
+- EBREAK is not a block end, so a handler's `stop()` only takes effect at
   the next check (C++ `basic.cpp` accepts both 51 and 25 EBREAKs).
 - The host-side `membuffer`, `memstring_view` and `try_memmove` take the
   arena fast path after checking only the arena's size, not its read or
   write windows or page attributes (`memstring_view` even below
   `RWREAD_BEGIN`), and `memcpy_from` uses the arena's write window for its
-  source. `memcmp` doesn't check that the start is readable on its arena
+  source. `memcmp` does not check that the start is readable on its arena
   fast path, only the end.
 - Not reproduced (C++ bug): the slow path of `memcmp(const void*,
   address_t, size_t)` compares the host byte as a signed `char`, flipping
@@ -1744,11 +1310,11 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   Outside the arena it compares a page-bounded stretch at a time, not a
   byte at a time with two page lookups per byte as C++ does (same result
   and faults): one native memcmp of up to 512 MiB runs before its penalty
-  is charged, so the instruction limit can't bound it.
+  is charged, so the instruction limit cannot bound it.
 - Not reproduced (C++ bugs): `ppoll` with a NULL timeout faults in C++;
   killing a suspended thread (`tgkill`) leaves a dangling pointer in C++'s
   scheduler lists, here the thread is removed from them; a signal number
-  above 64 throws `std::out_of_range`, here it's `ILLEGAL_OPERATION`.
+  above 64 throws `std::out_of_range`, here it is `ILLEGAL_OPERATION`.
 - Not reproduced (C++ bug, as far as the port's reading of `threads.hpp`
   goes): the main thread resumed while blocked (above) stays in C++'s
   blocked list, so it gains an entry each time it blocks again (a guest
@@ -1760,7 +1326,7 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   schedule exactly as in C++.
 - Not reproduced (C++ leak, as far as the port can tell without the C++
   tree): per-thread signal state (altstack, the registers a handler
-  interrupted) stays in C++'s map after its thread exits, and TIDs aren't
+  interrupted) stays in C++'s map after its thread exits, and TIDs are not
   reused, so a guest grows host memory (about 1 KB a thread, outside
   `memory_max`) by creating threads that touch it. Here a thread's state
   goes when it exits, and `sigaltstack` without a new stack (and
@@ -1769,7 +1335,7 @@ Bugs or oddities in C++ that the port reproduces on purpose:
 - Not reproduced (C++ bugs): `nanosleep` and `clock_nanosleep` charge one
   instruction per microsecond requested, computed in C++ in an `int64_t`
   that overflows (undefined) for requests of 292 years and more; here the
-  charge saturates (`u64::MAX / 1000` at most), so `tv_sec = 2^55` isn't
+  charge saturates (`u64::MAX / 1000` at most), so `tv_sec = 2^55` is not
   free while the host sleeps. Smaller requests charge exactly what C++
   does. C++ clamps only the seconds to `NANOSLEEP_MAX_SECONDS`, so a host
   sleep could last almost two; here the whole sleep is clamped, while the
@@ -1790,7 +1356,7 @@ Bugs or oddities in C++ that the port reproduces on purpose:
 - `native/mod.rs`: `Machine::setup_native_heap` (malloc, calloc,
   realloc, free, meminfo), `setup_native_memory` (memcpy, memset, memmove,
   memcmp, strlen, strncmp, the reserved call, backtrace), `arena()`,
-  `transfer_arena_from`, with C++'s penalties. Forks don't get the arena
+  `transfer_arena_from`, with C++'s penalties. Forks do not get the arena
   (a C++ TODO). Guest-to-guest copies use `Memory::memcpy_within`
   (C++ `memcpy(dst, machine, src, len)` with the same machine), which
   copies overlapping arena ranges like `memmove` (C++'s `std::memcpy`
@@ -1827,7 +1393,7 @@ Differences from C++:
   machine installs the fast path, every machine of the process has its
   handler). Forks keep their master's chain.
 - Shared execute segments are keyed on whether the libc fast path patched
-  them, and segments with breakpoints aren't shared. (C++ keys on neither,
+  them, and segments with breakpoints are not shared. (C++ keys on neither,
   so a machine can get another machine's patched segment.)
 - The JIT never compiles SYSTEM entries (`DecoderEntry::is_system`), so it
   leaves native code in front of a patched entry and the interpreter runs
@@ -1838,7 +1404,7 @@ Differences from C++:
   - With the C extension, C++ gives the entries in front of a patched
     function (or a breakpoint) in its block an instruction count of 0
     (`create_block_ending_entry_at`'s TODO), so code falling through into
-    it wasn't counted. Here they count the instructions up to and
+    it was not counted. Here they count the instructions up to and
     including the patched entry. The patched entry itself still counts 0,
     as in C++, so calls count exactly as there.
   - C++ only finds the block start through entries in front of the patch,
@@ -1846,8 +1412,8 @@ Differences from C++:
     function was then never recognised). Here the search steps over it.
   - A patched function returning to its own entry (`ra` = its address,
     which no real caller does) falls through to the next instruction,
-    since PC didn't change, and the call counts nothing. Here such a call
-    counts one instruction, so a cycle of patched functions can't run
+    since PC did not change, and the call counts nothing. Here such a call
+    counts one instruction, so a cycle of patched functions cannot run
     for free.
 
 ### Phase 2 — Linux userspace parity
@@ -1869,127 +1435,69 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 
 ### Guest containers
 
-`guest/` ports the host-side views of libstdc++'s `std::string`,
-`std::vector`, `std::unordered_map` and `std::variant` (64-bit layouts
-only). C++ reinterprets guest memory as the mirror structs and changes
-them in place through pointers; a string (SSO) and a map (`before_begin`,
-`single_bucket`) point back into themselves. Without `unsafe` there are
-no references into guest memory, so:
+`guest/` provides host-side RV64 layouts for C++ standard containers and Rust
+collections. See the `guest` module documentation for API details.
 
-- The containers are `GuestPod` value types with the guest layout
-  (`GuestStdString`, `GuestStdVector<T>`, `GuestStdUnorderedMap<K, V, H>`,
-  `GuestStdVariant<E>`): readable, copyable (shallow, like C++), nestable,
-  passable to `vmcall` by value (pushed and relocated, as `setup_call`).
-- Every change happens in place in guest memory, through a typed handle
-  `GuestPtr<T>` (C++ `GuestRef`/`memarray` pointer). The map's routines
-  read and write its fields at its address, so the self-pointers can't go
-  stale. Handles don't borrow the machine; methods take it.
-- C++'s type-trait dispatch becomes traits: `GuestType` (`free_at`,
-  `relocate_at`, `free_value`: `free_guest_object`,
-  `relocate_guest_object`, `free()` on a host copy), `GuestInit<T>`
-  (`construct_guest_object` from a host value: `&str` for a string, a
-  slice for a vector, a `HashMap` or pairs for a map), `GuestHashKey` /
-  `GuestKeyArg<K>` (`GuestStdHash`), `ToHost` (`guest_host_type`).
-- The map's `CacheHashCode` parameter is a type, `StdHash` (follows
-  `std::hash<K>`) or `CustomHash` (no cached hash codes), as Rust const
-  generic defaults can't depend on `K`.
-- A variant's alternatives are a Rust enum declared with
-  `guest_variant!`; `VariantAlternative<E>` gives `index_of`, `get`,
-  `get_if`, `holds_alternative`, and `GuestPtr::emplace<T>` constructs an
-  alternative from a host value. C++'s converting `set(Arg)` (picking the
-  alternative from a host value's type) has no equivalent: the caller
-  names the alternative.
-- `ScopedArenaObject<T>` owns a `T` on the native heap. Its destructor
-  can't reach the machine, so it has `free(machine)` instead (and is
-  `#[must_use]`).
+C++ mirrors implement `GuestPod`: `GuestStdString`, `GuestStdVector<T>`,
+`GuestStdUnorderedMap<K, V, H>`, and `GuestStdVariant<E>`. Copies are shallow.
+Mutations use `GuestPtr<T>` at the guest address, preserving string SSO and
+map self-pointers. Methods take the machine without retaining a borrow.
 
-The Rust collections (`guest_rust_*.hpp`) are not a port but a Rust
-scripting layer with `std` names (see the `guest` module docs):
-`GuestRustString`, `GuestRustStr`, `GuestRustVec<T>`, `GuestRustSlice<T>`,
-`GuestRustBox<T>`, `GuestRustBoxedSlice<T>`, `GuestRustBoxedStr`,
-`GuestRustEnum<E, Tag>` and `GuestRustAttributes<V>` (with
-`GuestRustAttr<V>`), in the layouts rustc emits for
-`riscv64gc-unknown-linux-gnu` (`Vec` = `{ cap, ptr, len }`; checked by the
-layout probes of `tests/native_rust.rs`). Nothing in them points into
-itself, so:
+`GuestType` defines freeing and relocation, `GuestInit` constructs from host
+values, `GuestHashKey`/`GuestKeyArg` implement guest hashing and equality,
+and `ToHost` copies into host values. Hash policy types `StdHash` and
+`CustomHash` replace C++'s `CacheHashCode` template default. `guest_variant!`
+declares alternatives; `VariantAlternative` provides typed access. `emplace`
+requires the caller to select an alternative explicitly.
+`ScopedArenaObject<T>` owns a native-heap value and requires explicit
+`free(machine)` because `Drop` cannot access the machine.
 
-- They are host-side copies of the guest words: `&mut self` methods change
-  the copy, and the `GuestPtr<T>` methods of the same names read, change and
-  write back the collection in place (`GuestPtr::modify` is the general
-  form). Names follow `std`: `len`, `is_empty`, `push`, `pop`, `truncate`,
-  `extend_from_slice`, `reserve(additional)`, `reserve_exact`, `get` (an
-  `Option`),
-  `insert`/`remove`/`contains_key`/`iter` on the map,
-  `from_raw_parts`/`into_raw`, `as_str`/`as_slice` (the guest borrow),
-  `to_str` (a validated host `&str`), `to_string_lossy`. Every method that
-  touches guest memory takes the `Machine` and returns a `Result`.
-- `GuestRustBox<T>` is the host's owner of a guest value: it dereferences
-  to its `GuestPtr<T>` and is passed to a VM call as the pointer (a
-  `Box<T>`/`&T` parameter). It keeps few methods of its own (`new`,
-  `from_raw`, `into_raw`, `is_null`, `free`) so as not to shadow the boxed
-  value's in-place methods.
-- No `Drop` (dropping needs the machine): `free` is the guest's drop glue,
-  and what hands a value over (`pop`, `remove`, `into_raw`) leaves freeing
-  it to the caller.
-- The walks that follow guest pointers recursively (freeing, and copying
-  nested values to the host) stop at `guest::MAX_NESTING` (128) pointers
-  deep with an error: the guest controls every pointer, and a cycle (a
-  list holding itself) or a deep chain overflowed the host's stack, which
-  aborts the process. `tests/rust_collections.rs` checks both, and that
-  real nesting below the limit is freed completely, without a Rust guest;
-  `rustguestfuzzer` fuzzes the whole layer on guest-supplied bytes.
-- Copies to the host (`ToHost`, `to_string`, `to_bytes`, `to_vec`,
-  `to_string_vector`, `to_map`, C++ and Rust containers alike) charge what
-  they allocate (text bytes, at least one byte per element, box and map
-  entry) to one budget per top-level copy, `guest::MAX_HOST_COPY` (64 MiB,
-  4 × `MAX_BYTES`) unless `guest::with_host_copy_limit` sets another, and
-  fail with `IllegalOperation` when it runs out (a thread-local like the
-  nesting counter). The per-container `MAX_BYTES` limits alone bound each
-  piece, not the whole: aliased elements (every `String` of a `Vec`
-  pointing at one 16 MiB buffer) made the host allocate up to TiBs, and
-  shared subtrees took exponential work, with guest memory untouched. Not
-  in C++ (which checks per element too, and so has the same weakness): a
-  deliberate difference, as no guest-visible result changes. The budget
-  is per call; hosts that keep copies across calls (and zero-copy
-  sysargs followed by `.to_vec()`) must bound their own totals, as the
-  `asteroids` log does (`MAX_LOG_BYTES`). Tested in
-  `tests/rust_collections.rs`.
-- Allocation follows `RawVec`: constructing from host values allocates
-  exactly (`String::from`, `to_vec`), growing doubles from the minimum
-  capacity, and zero-sized elements are never allocated (their stored
-  capacity is 0 whatever the length).
-- A Rust enum is declared with `guest_rust_enum!`: the user's enum is the
-  guest type (`match value.value()`); `is::<T>`/`get::<T>`, and in place
-  `variant::<T>`/`insert::<T, _>`, are for generic code. Unit variants are
-  `()`. The tag must be at least as wide as the payload alignment, and no
-  variant may point into itself (const assertions in `PAYLOAD_OFFSET`).
-  `=> HostName` also declares the host enum of `ToHost::to_host`.
-- `Machine::syscall_handler(n)` lets an embedder chain onto an installed
-  system call: `tests/native_rust.rs` chains counters onto the native
-  memory functions.
-- The Rust guest calls every host function with a counted dyncall
-  (`.insn i 0x5b, 7, x(16+inputs), x(24+outputs), number`), which is a
-  system call here (see "JIT"): no `a7`, and the asm operands are only the
-  registers the host touches. The native heap and memory functions and the
-  test's own host functions are plain system call handlers.
-- Beyond C++, for host functions called by Rust guests: a guest `&str`
-  argument (pointer and length) is a `SysArg` both as a borrowed,
-  UTF-8-checked `&str` and as an unread `GuestRustStr`; and
-  `Machine::with_userdata` lends a handler its userdata and the machine at
-  once, so it can change its state with what it borrows from guest memory
-  (`userdata_mut` borrows the whole machine). The userdata moves out and
-  back, without allocating.
-- `examples/asteroids` is a worked example of the whole layer: the game of
-  `../libloong/examples/gamedev`, with a Rust engine and the game logic as
-  a Rust RV64GCB script. Its `guest/src/host.rs` is the guest half:
-  `host_functions!` turns declarations into safe functions over naked
-  dyncall stubs, with the register counts computed from the argument types
-  (a `&str` is two integer registers, `f32` one FP register), and
-  `native_heap!`/`native_memory!` hand the global allocator and memcpy and
-  friends to the host. One file of system call numbers (`src/api.rs`) is
-  included by both sides. Its headless tests play the game under the
-  interpreter and the JIT, which must agree on every frame and instruction
-  count.
+Rust scripting types include `GuestRustString`, `GuestRustStr`, `GuestRustVec`,
+`GuestRustSlice`, sized and unsized boxes, `GuestRustEnum`, and
+`GuestRustAttributes`/`GuestRustAttr`. Layouts match rustc's
+`riscv64gc-unknown-linux-gnu` output, including `{ cap, ptr, len }` vectors,
+verified by `tests/native_rust.rs`.
+
+- Value methods update host copies. `GuestPtr` methods read, modify, and
+  write guest objects in place; `GuestPtr::modify` provides the general form.
+  Names follow `std`, including `push`, `pop`, `reserve`, `get`, and map methods.
+  Guest memory operations take `Machine` and return `Result`.
+- `GuestRustBox<T>` owns a guest value and dereferences to its `GuestPtr`.
+  VM calls pass its address as a `Box<T>`, `&T`, or pointer argument.
+- Collections require explicit `free`. Ownership-returning methods such as
+  `pop`, `remove`, and `into_raw` transfer freeing responsibility to callers.
+- Recursive freeing and host copying stop at `MAX_NESTING` (128), returning
+  an error for cycles or excessive depth instead of overflowing the host stack.
+- Host copies share a top-level `MAX_HOST_COPY` budget, default 64 MiB
+  (4 × `MAX_BYTES`), overridable by `with_host_copy_limit`. Text, elements,
+  boxes, and entries charge their allocations, with at least one byte per
+  item. Exhaustion returns `IllegalOperation`. Per-container limits alone
+  cannot bound aliased or exponentially shared guest structures. Hosts
+  retaining copies across calls must enforce aggregate limits; direct copies
+  of zero-copy arguments also require host limits. Asteroids uses
+  `MAX_LOG_BYTES` for this purpose. Tests cover both nesting and copy budgets
+  in `tests/rust_collections.rs`.
+- Allocation follows `RawVec`: construction uses exact capacity, growth
+  doubles from minimum capacities, and zero-sized elements never allocate
+  and store capacity zero.
+- `guest_rust_enum!` declares guest alternatives and optionally a host enum
+  through `=> HostName`. Unit variants use `()`. Tags must be at least as
+  wide as payload alignment, and alternatives must not contain self-pointers;
+  `PAYLOAD_OFFSET` enforces these constraints at compile time.
+
+Rust guest host calls use counted dyncalls, with no `a7` and only declared
+register operands. Native heap and memory operations are ordinary system call
+handlers; `Machine::syscall_handler` supports chaining for instrumentation.
+A guest `&str` can be decoded as validated borrowed text or an unread
+`GuestRustStr`. `Machine::with_userdata` temporarily moves state out to allow
+simultaneous state updates and guest-memory borrows without allocation.
+
+`examples/asteroids` demonstrates this API with a Rust engine and RV64GCB game
+script. Shared `src/api.rs` numbers define the ABI. `host_functions!` derives
+register counts and safe wrappers over naked dyncall stubs;
+`native_heap!`/`native_memory!` forward allocation and memory operations.
+Headless tests compare every frame and instruction count between interpreter
+and JIT. `rustguestfuzzer` exercises collection operations on supplied bytes.
 
 ### Phase 3 — Embedding API
 
@@ -1998,7 +1506,7 @@ itself, so:
 - [ ] Call-depth handling
 - [ ] `PreparedCall` (`prepared_call.hpp`)
 - [x] Guest memory views, `copy_to/from_guest`, `memstring`, `stack_push` (`memory/helpers.rs`: `Buffer`/`membuffer`, `strlen`, `memstring_view`, `memview`/`memview_mut` with `maxlen`, typed `memarray`/`memspan`/`try_memarray` as `GuestSlice`/`GuestSliceMut` over `GuestPod`, `try_memmove`, both `memcmp`s, machine-to-machine `memcpy_from`, `read_value`/`write_value`; `stack_push_value`)
-- [x] Shared ELF: `Machine::new(Arc<[u8]>, options)` and `Memory::binary() -> &Arc<[u8]>`, so many machines run one ELF without copying it. C++'s `Machine(std::string_view)` borrows the caller's bytes, which must outlive the machine; here they're shared by reference count instead (forks share the machine's)
+- [x] Shared ELF: `Machine::new(Arc<[u8]>, options)` and `Memory::binary() -> &Arc<[u8]>`, so many machines run one ELF without copying it. C++'s `Machine(std::string_view)` borrows the caller's bytes, which must outlive the machine; here they are shared by reference count instead (forks share the machine's)
 - [x] Printer / stdin / rdtime hooks
 - [x] Userdata (`set_userdata`/`get_userdata`; `with_userdata`, not in C++), custom instructions (`on_unimplemented_instruction`); see "Architecture decisions"
 - [x] Fork with CoW (`machine.cpp`, `cpu.cpp`, `memory.cpp` `machine_loader`), page caches; see "Fork". (C++ `Memory::reset()` is empty: nothing to port)
@@ -2050,7 +1558,7 @@ itself, so:
 - [x] Virtual paging (`memory_helpers_paging.hpp`, `memory_inline_pages.hpp`, `page.hpp`, paging parts of `memory.cpp`/`memory_rw.cpp`/`cpu.cpp`); see "Virtual paging" (page caches included)
 - [ ] Memory traps (`RISCV_MEMORY_TRAPS`)
 - [ ] Sockets, epoll, poll, select (`posix/socket_calls.cpp`, `linux/syscalls_{epoll,poll,select}.cpp`)
-- [x] Fuzzing harness (`fuzz/`; `nativefuzzer` without native threads), plus targets C++ doesn't have (Linux personality, libc fast path, forks, guest containers, VM calls, JIT differential)
+- [x] Fuzzing harness (`fuzz/`; `nativefuzzer` without native threads), plus targets C++ does not have (Linux personality, libc fast path, forks, guest containers, VM calls, JIT differential)
 
 ## File mapping
 

@@ -20,7 +20,7 @@ use crate::vmcall::{ArgRegs, VmCallArg};
 /// head of the list of every node), the element count, the rehash policy
 /// (max load factor, next resize) and `_M_single_bucket`.
 ///
-/// A bucket doesn't point at its first node but at the node *before* it,
+/// A bucket does not point at its first node but at the node *before* it,
 /// so the bucket of the first node points at `before_begin`, inside the
 /// map; a map with one bucket uses `single_bucket` as its bucket array.
 /// So a map must be told when it moves ([`GuestPtr::relocate`]), and
@@ -153,7 +153,7 @@ fn corrupt_list() -> crate::MachineError {
 
 /// Cycle detection for a walk over guest nodes (Brent's algorithm). The
 /// guest controls the `_M_nxt` pointers, and bounding a walk by the
-/// guest's element count isn't enough: a cyclic list with a huge count
+/// guest's element count is not enough: a cyclic list with a huge count
 /// kept the host busy (and collecting entries) all but forever. Not in
 /// C++, which loops there. Constant memory; a list without a cycle never
 /// fails the check.

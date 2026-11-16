@@ -1,10 +1,10 @@
 # libriscv-rs
 
-Safe-Rust port of C++ libriscv (a RISC-V userspace emulator for sandboxing and
-scripting). **Read `PORTING.md` first**: scope, architecture decisions, phase
-plan and the C++ → Rust file mapping live there.
+Rust port of C++ libriscv, a RISC-V userspace emulator for sandboxing and
+scripting. Read `PORTING.md` for scope, architecture, implementation status,
+and the C++ to Rust file mapping.
 
-## Where things are
+## Repository layout
 
 - C++ reference source: `../libriscv` (or `$LIBRISCV_CPP`). Library code is in
   `../libriscv/lib/libriscv/`; `../libriscv/AGENTS.md` is its architecture guide.
@@ -31,14 +31,16 @@ cargo run --release -p asteroids             # example game: Rust engine + Rust 
 rvlinux dynamic.elf                          # JIT by default (-n interprets); caches ld.so + system libraries in ~/.cache/rvlinux/jit by itself (--jit-cache-dir, --no-jit-cache)
 ```
 
-Expected durations (warm build, 32 cores): the whole suite ~48 s with the JIT
-(~42 s without an RVA23 toolchain),
-the default (test binaries run one after another: `difftest.rs` ~18 s, bounded
-by one up-front JIT compile of static libstdc++; `libriscv`'s tests ~21 s,
-`shared_rodata.rs`'s `jit_runs_on_shared_rodata` alone ~7 s), ~9 s without (`--no-default-features`). Cranelift is always built optimized
-(`[profile.dev.package."*"]`); our crates stay at opt-level 0. A test that
-loops over many runs should be split into separate tests (see `difftests!`)
-so the harness runs them concurrently. Never `git stash` work to time HEAD.
+Expected durations for a warm build on 32 cores: approximately 48 s with
+JIT, 42 s without an RVA23 toolchain, and 9 s with `--no-default-features`.
+Test binaries run sequentially: `difftest.rs` takes about 18 s, including an
+initial JIT compilation of static libstdc++; `libriscv` tests take about
+21 s, including 7 s for `jit_runs_on_shared_rodata`.
+
+Cranelift is optimized through `[profile.dev.package."*"]`; workspace crates
+use opt-level 0. Split independent test runs into separate tests so the
+harness can execute them concurrently; see `difftests!`. Never use `git stash`
+to benchmark HEAD.
 
 ```sh
 cargo fmt --all
@@ -48,8 +50,8 @@ cargo bench -p rvlinux --bench coremark   # CoreMark: Rust interpreter/JIT vs C+
 fuzz/do_fuzz.sh vmfuzzer -- -max_total_time=300   # libFuzzer (vmfuzzer/elffuzzer/syshelperfuzzer); needs cargo-fuzz
 ```
 
-Toolchain: pinned nightly (`rust-toolchain.toml`) for `become`. Don't bump it
-as a side effect of other work; see "Toolchain" in `PORTING.md`.
+Toolchain: pinned nightly (`rust-toolchain.toml`) for `become`. Do not bump it
+as part of unrelated work; see "Toolchain" in `PORTING.md`.
 
 Guests compile with `riscv64-linux-gnu-gcc-14` (`$RCC`); outputs are cached in
 `target/riscv-guests/`. Rust guests (`testutil::build_rust`, `tests/native_rust.rs`)
@@ -57,51 +59,42 @@ need `rustup target add riscv64gc-unknown-linux-gnu` for the pinned toolchain.
 
 ## Rules
 
-- **No `unsafe`.** Enforced by `forbid(unsafe_code)`; never work around it
-  (no `allow`, no unsafe-using helper crates added to dodge it). The one
-  exception is `crates/libriscv-jit-rt`, the executable-memory runtime of the
-  default-on `jit` feature (it also loads AOT shared objects for `aot-dylib`,
-  and owns the guest arena mapping for shared rodata):
-  keep its unsafe surface minimal and documented, and keep everything else
-  (including `libriscv/src/jit/` and `aot/`) unsafe-free. Code the AOT
-  translator generates is safe Rust too.
-- **Guest input must never panic the host.** Return `MachineError`. Use
-  `get`/`get_mut`, checked/wrapping arithmetic and `try_into` on anything a
-  guest controls. The clippy lints `indexing_slicing`, `unwrap_used`,
-  `expect_used`, `panic` warn in non-test code; fix them rather than allowing
-  them, except where an invariant is provable locally (then `#[allow]` with a
-  comment stating the invariant).
-- **Match the C++ interpreter exactly** — results, exception kinds, syscall
-  behaviour and retired-instruction counts. When unsure what's correct, the C++
-  source and the oracle decide, not the spec alone. If you find a C++ bug, note
-  it in the PR and keep parity unless told otherwise.
-- **Port the tests with the code.** Each ported C++ file should bring the
-  corresponding `../libriscv/tests/unit/*.cpp` cases along as Rust tests.
-- **Dispatch tail calls must use `become`**, never a plain call in tail
-  position. Handler chains are unbounded, and only `become` guarantees they
-  don't grow the stack. All handlers share one signature (see "Dispatch" in
-  `PORTING.md`). For dispatch structure, `../libriscv/lib/libriscv/tailcall_dispatch.cpp`
-  is the reference.
-- Start each new module with a `//! Port of <C++ files>.` header.
-- Keep `rvlinux`'s summary output byte-compatible with the C++ emulator
-  (`>>> Program exited, exit code = N (0xN)`, `Instructions executed: N ...`);
-  `testutil::parse_run_output` depends on it.
-- Update the checkboxes/status in `PORTING.md` in the same commit as the work.
-- No new runtime dependencies in `libriscv` without asking. Dev-dependencies
-  are fine.
-- Out-of-scope C++ components (binary translation to C, libtcc, asmjit, asm
-  dispatch, win32, RV32, RV128, C API) are listed in `PORTING.md`; don't port
-  them. The JIT is Cranelift-based instead, and AOT translates to safe Rust
-  (see "JIT" and "AOT" in `PORTING.md`). The port
-  is RV64 only: no width generics, no `W == 4` paths.
-- Where C++'s tailcall and threaded dispatchers disagree, follow the threaded
-  one (`cpu_dispatch.cpp`): it's what the oracle runs. See "Dispatch" in
-  `PORTING.md`.
+- **Enforce safe Rust.** Do not bypass `forbid(unsafe_code)` with `allow`
+  or helper crates. Only `crates/libriscv-jit-rt` may contain unsafe code,
+  for executable memory, AOT shared-object loading, and guest arena mappings.
+  Keep that boundary minimal and documented. JIT generation and generated
+  AOT bodies must remain safe Rust.
+- **Guest input must not panic the host.** Return `MachineError`. Use checked
+  access, checked or wrapping arithmetic, and fallible conversions for
+  guest-controlled values. Resolve clippy warnings for `indexing_slicing`,
+  `unwrap_used`, `expect_used`, and `panic`. A locally provable invariant may
+  justify `#[allow]`; document it in a comment.
+- **Preserve C++ interpreter behavior:** results, exception kinds, system
+  calls, and retired-instruction counts. Resolve ambiguities using the C++
+  source and reference emulator. Record upstream bugs in the PR and preserve
+  compatibility unless instructed otherwise.
+- Port corresponding `../libriscv/tests/unit/*.cpp` cases with each implementation.
+- Use `become` for every dispatch tail call. Handler chains are unbounded;
+  ordinary calls can overflow the stack. Use the shared signature described
+  in `PORTING.md` and the structure in
+  `../libriscv/lib/libriscv/tailcall_dispatch.cpp`.
+- Start new modules with `//! Port of <C++ files>.`.
+- Preserve byte-compatible `rvlinux` summaries for `testutil::parse_run_output`:
+  `>>> Program exited, exit code = N (0xN)` and `Instructions executed: N ...`.
+- Update `PORTING.md` status entries with implementation changes.
+- Ask before adding runtime dependencies to `libriscv`. Dev dependencies
+  require no approval.
+- Follow the exclusions in `PORTING.md`: C translation, libtcc, asmjit,
+  assembly dispatch, Windows shims, RV32, RV128, and the C API. Use Cranelift
+  for JIT and safe Rust for AOT. Keep the port RV64 only, without width
+  generics or `W == 4` paths.
+- Where C++ tail-call and threaded dispatch differ, follow the reference's
+  threaded implementation (`cpu_dispatch.cpp`); see "Dispatch" in `PORTING.md`.
 
 ## Integration tests
 
 Integration test files start with
 `#![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]`
-because clippy's in-test exemptions don't cover helper functions. Gate tests
+because clippy's in-test exemptions do not cover helper functions. Gate tests
 needing external tools with `if !testutil::need_compiler() { return; }` /
 `testutil::need_reference()`.

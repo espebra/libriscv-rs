@@ -1,15 +1,12 @@
-//! The guest half of the scripting API: calling host functions, and
-//! handing the heap and the block memory functions to the host.
+//! Guest bindings for host functions, native heap allocation, and memory helpers.
 //!
-//! Every call into the host is a counted dyncall: one custom-2 instruction
-//! (opcode 0x5b, funct3 0b111) whose immediate is the number of the system
-//! call the host installed the function under, and whose register fields
-//! say how many argument registers the host reads (rd = x16 + inputs) and
-//! writes back (rs1 = x24 + outputs, plus 4 when the host also reads or
-//! writes floating-point registers). Unlike an ecall it needs no a7.
+//! Calls use counted custom-2 dyncalls: opcode `0x5b`, funct3 `0b111`, and a
+//! system call number in the immediate. Register fields specify integer input
+//! and output counts (`rd = x16 + inputs`, `rs1 = x24 + outputs`), with 4 added
+//! to rs1 for FP access. No `a7` argument is required.
 //!
-//! Nothing here is specific to the game: the numbers are the embedder's
-//! choice, so they are parameters of the macros.
+//! Macros accept system call numbers chosen by the embedder and are independent
+//! of the game.
 
 /// One dyncall as inline assembly, with exactly the registers the host
 /// touches as operands, so the compiler keeps everything else live across
@@ -268,8 +265,8 @@ pub(crate) use native_heap;
 /// passes `--wrap=memcpy` and friends (see `.cargo/config.toml`), which
 /// sends every call, Rust's and glibc's, to these.
 ///
-/// The bodies are inline assembly on purpose: a byte loop here would be
-/// recognised as a memcpy and turned back into a call to itself.
+/// Inline assembly prevents byte-loop recognition from generating recursive
+/// calls to these wrappers.
 macro_rules! native_memory {
     ($base:expr) => {
         #[unsafe(no_mangle)]

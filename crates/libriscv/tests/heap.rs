@@ -404,7 +404,7 @@ fn high_watermark() {
     let b = arena.malloc(512).unwrap();
     let sz_b = arena.size(b);
     assert_eq!(u64::from(arena.high_watermark()), BEGIN + sz_a + sz_b);
-    // Freeing A doesn't lower the watermark while B is live.
+    // Freeing A does not lower the watermark while B is live.
     arena.free(a);
     assert_eq!(u64::from(arena.high_watermark()), BEGIN + sz_a + sz_b);
     // Freeing B lowers it back to the base.
@@ -448,7 +448,7 @@ fn arena_transfer() {
     assert_eq!(dst.size(a), sz_a);
     assert_eq!(dst.size(c), sz_c);
     assert_eq!(dst.size(b), 0);
-    // Changes to the copy don't affect the original.
+    // Changes to the copy do not affect the original.
     dst.free(a);
     assert_eq!(src.size(a), sz_a);
     dst.free(c);
@@ -491,7 +491,7 @@ fn unknown_free_and_realloc_callbacks() {
 #[test]
 fn seq_alloc_aligned_page_boundary() {
     let mut arena = arena();
-    // With a flat arena it's just malloc.
+    // With a flat arena it is just malloc.
     let addr = arena.seq_alloc_aligned(256, 8, true).unwrap();
     assert!(within(addr));
     assert!(arena.size(addr) >= 256);

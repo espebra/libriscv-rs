@@ -160,7 +160,7 @@ impl Memory {
         }
 
         // A program-provided exit function (C++ `default_exit_function`):
-        // returning to it doesn't need to change execute segment.
+        // returning to it does not need to change execute segment.
         if let Some(name) = options.default_exit_function.as_deref() {
             let addr = self.resolve_address(name)?;
             if addr != 0 {
@@ -171,7 +171,7 @@ impl Memory {
             }
         }
         // Default fallback: install the host code page with the exit
-        // function, enabling VM calls and signal returns. It's executable only, and becomes an
+        // function, enabling VM calls and signal returns. It is executable only, and becomes an
         // execute segment the first time something jumps there.
         if self.exit_address == 0 {
             let host_page = self.mmap_allocate(PAGE_SIZE);

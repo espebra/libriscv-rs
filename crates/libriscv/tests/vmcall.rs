@@ -35,8 +35,7 @@ fn machine_with(binary: &[u8], options: MachineOptions) -> Machine {
         },
     )
     .unwrap();
-    // We need to install Linux system calls for maximum gucciness, and a
-    // Linux environment for runtimes to work well.
+    // Configure Linux system calls and the initial runtime environment.
     machine.setup_linux_syscalls(false, false);
     machine.setup_linux(&["vmcall"], &ENV).unwrap();
     machine
@@ -284,9 +283,8 @@ fn argument_types() {
 
 #[test]
 fn vm_function_call_in_fork() {
-    // The global variable 'value' should get forked as value=1. We assert
-    // this, then we set value=0. New forks should continue to see value=1
-    // as they are forked from the main VM where value is still 1.
+    // Forks initially see value=1. Changes to one fork must not affect
+    // later forks of the source, where value remains 1.
     if !testutil::need_compiler() {
         return;
     }
@@ -775,7 +773,7 @@ fn preempt_restores_or_clobbers_registers() {
     assert_eq!(m.cpu.reg(REG_SP), (before.get(REG_SP) - 16) & !0xF);
     assert_eq!(m.cpu.pc(), m.memory.exit_address() + 4);
 
-    // vmcall starts from the initial stack pointer, whatever SP was.
+    // VM calls reset SP to the initial stack pointer.
     m.cpu.set_reg(REG_SP, 0x1234_5678);
     assert_eq!(m.vmcall("bump", 1).unwrap(), 11);
     assert_eq!(m.cpu.reg(REG_SP), m.memory.stack_initial() & !0xF);
@@ -808,7 +806,7 @@ fn preempt_errors() {
     assert_eq!(m.cpu.registers(), &before);
     let r = m.try_preempt(1000, "crash", (), true).unwrap();
     assert_eq!(r, before.get(REG_ARG0));
-    // Without restoring: whatever the failed call left.
+    // Clobbering preemption retains the failed call's register state.
     m.try_preempt(1000, "spin", 1_000_000, false).unwrap();
     assert_ne!(m.cpu.registers(), &before);
     assert_eq!(m.max_instructions(), 12_345);
@@ -886,7 +884,7 @@ fn try_vmcall_timeout() {
     assert!(!m.instruction_limit_reached());
     let err = m.vmcall_limited(1000, "spin", 1_000_000).unwrap_err();
     assert_eq!(err.kind, ExceptionKind::MaxInstructionsReached);
-    // Unknown functions are address 0, which can't be executed.
+    // Unknown functions are address 0, which cannot be executed.
     let err = m.vmcall("no_such_function", ()).unwrap_err();
     assert_eq!(err.kind, ExceptionKind::ExecutionSpaceProtectionFault);
 }
@@ -1006,7 +1004,7 @@ fn vm_call_and_preemption_jit() {
 }
 
 /// A preemption gets its own slicing state. Here native code is installed
-/// from the handler, so the nested run isn't sliced while the outer one
+/// from the handler, so the nested run is not sliced while the outer one
 /// is, and the nested limit is exactly the outer one: the nested run must
 /// still see (and run to) its own limit, not the end of the outer slice.
 #[cfg(feature = "jit")]

@@ -266,7 +266,7 @@ ops! {
         let v = reg(m, ci.rs2());
         m.memory.write_u64(addr, v)
     }
-    /// C.JR. Like C++ the precise handler doesn't clear bit 0 of the target.
+    /// C.JR. Like C++ the precise handler does not clear bit 0 of the target.
     CJr = |m, i| {
         let target = reg(m, c(i).rd());
         m.cpu.jump(target.wrapping_sub(2))

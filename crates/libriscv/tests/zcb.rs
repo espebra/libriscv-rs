@@ -21,7 +21,7 @@ const MAX_INSTRUCTIONS: u64 = 16_000_000;
 const RESULTS: u64 = 32;
 
 // The guest writes every Zcb instruction as a raw `.insn`, so the assembler
-// never needs to know the extension -- only to emit the halfword we hand it.
+// never needs to know the extension -- only to emit the supplied halfword.
 // -mno-relax: no crt0 sets up gp in a freestanding guest.
 const ARGS: &str = "-std=gnu11 -O1 -static -march=rv64gc -mabi=lp64d -nostdlib \
                     -ffreestanding -mno-relax -Wl,-z,separate-code";

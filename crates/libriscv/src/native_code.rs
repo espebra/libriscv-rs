@@ -1,21 +1,12 @@
-//! Port of the parts of `decoder_cache.cpp` and `cpu_dispatch.cpp` that
-//! hand execute segments over to native code (C++ patches decoder entries
-//! with asmjit functions, or with the functions of a binary translation):
-//! the native code of one execute segment, whoever produced it, and what a
-//! call into it ends with.
+//! Port of native dispatch support in `decoder_cache.cpp` and `cpu_dispatch.cpp`.
 //!
-//! Two backends produce native code: the Cranelift JIT (`jit` feature,
-//! compiled at run time) and the ahead-of-time translation to Rust (`aot`
-//! feature, translated and compiled in an earlier run). Both follow the
-//! same contract, set by the JIT: native code is entered at a block start
-//! with the counter as it was before the block, counts exactly like the
-//! dispatcher, and leaves with one of the `EXIT_*` kinds below and exactly
-//! the PC, registers and counter the interpreter would have had there.
-//! [`dispatch::native_enter`](crate::dispatch::native_enter) continues
-//! from there.
+//! The Cranelift JIT and AOT Rust translator share one native-code contract.
+//! Entry occurs at a block start with the counter excluding that block.
+//! Native code follows dispatcher counting and reports an `EXIT_*` outcome
+//! with interpreter-equivalent PC, registers, and counter values.
+//! [`dispatch::native_enter`](crate::dispatch::native_enter) resumes execution.
 //!
-//! Without either feature [`NativeCode`] has no variants: no segment ever
-//! has native code, and the dispatcher never enters any.
+//! Without `jit` or `aot`, [`NativeCode`] has no variants.
 
 #[cfg(feature = "jit")]
 use std::sync::Arc;
@@ -46,25 +37,21 @@ pub(crate) const EXIT_INDIRECT: u64 = 4;
 /// code at a dyncall that ends its block; otherwise the JIT calls the
 /// handler itself.)
 pub(crate) const EXIT_DYNCALL: u64 = 5;
-/// The JIT ran the dyncall at `exit_pc` and can't go on after it (a stop,
-/// a fault, a stale segment, a moved arena): the host call's outcome says
-/// what next. The registers are stored.
+/// The JIT dyncall at `exit_pc` requires a host exit because of a stop,
+/// fault, stale segment, or moved arena. Registers are stored; the host-call
+/// outcome determines the continuation.
 #[cfg(feature = "jit")]
 pub(crate) const EXIT_HOST: u64 = 6;
 
-/// The guest memory layout native code is built for: a non-zero `mask`
-/// (masked accesses, no windows: the N-bit address space), or the
-/// `(base, len)` windows of the arena that loads and stores check their
-/// address against, as `Memory::read_*`/`write_*` do; and whether it
-/// ignores the instruction limit (`unlimited`).
+/// Native memory layout: a nonzero address mask for N-bit accesses, or
+/// `(base, len)` arena windows for checked accesses. `unlimited` disables
+/// instruction counting and limit checks.
 #[cfg(feature = "jit")]
 pub(crate) use libriscv_jit_rt::MemoryLayout;
 
-/// The guest memory layout native code is built for: a non-zero `mask`
-/// (masked accesses, no windows: the N-bit address space), or the
-/// `(base, len)` windows of the arena that loads and stores check their
-/// address against, as `Memory::read_*`/`write_*` do; and whether it
-/// ignores the instruction limit (`unlimited`).
+/// Native memory layout: a nonzero address mask for N-bit accesses, or
+/// `(base, len)` arena windows for checked accesses. `unlimited` disables
+/// instruction counting and limit checks.
 #[cfg(all(feature = "aot", not(feature = "jit")))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct MemoryLayout {
@@ -115,7 +102,7 @@ pub(crate) enum NativeExit {
         done: crate::dispatch::DyncallDone,
     },
     Fault(MachineError),
-    /// The code can't run with the current memory layout; interpret instead.
+    /// The code cannot run with the current memory layout; interpret instead.
     Unavailable,
 }
 
@@ -292,7 +279,7 @@ impl NativeSegment {
 /// The instruction count the interpreter adds when it begins a block at
 /// `pc` (C++ `BEGIN_BLOCK`): the entry `begin_block!` looks up, including
 /// the padding entries past the segment end (which count one instruction in
-/// the 4-byte layout, where the count is `idxend + 1`). Zero if there's no
+/// the 4-byte layout, where the count is `idxend + 1`). Zero if there is no
 /// entry (the interpreter faults there instead).
 pub(crate) fn block_icount(exec: &DecodedSegment, pc: u64) -> u64 {
     exec.cache

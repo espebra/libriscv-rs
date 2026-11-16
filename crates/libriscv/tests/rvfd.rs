@@ -1,11 +1,7 @@
-//! F/D tests: ports of the FCLASS case of `tests/unit/micro.cpp` and the
-//! FCVT cases of `tests/unit/fp_testsuite.cpp`.
-//!
-//! Not ported yet: the other `fp_testsuite.cpp` cases need `setup_linux`
-//! and `vmcall` (Phases 2–3) or FCSR emulation (the `fcsr` feature, not
-//! ported). The FCVT cases call guest functions with `vmcall` in C++; here
-//! they run the same instructions directly. The difftests cover F/D against
-//! the C++ oracle.
+//! F/D tests ported from FCLASS in `tests/unit/micro.cpp` and FCVT in
+//! `tests/unit/fp_testsuite.cpp`. FCVT instructions execute directly rather
+//! than through C++ guest VM calls. `rvlinux` differential tests compare F/D
+//! against C++. Full FCSR emulation and remaining FP tests are not ported.
 
 #![cfg(feature = "ext-f")]
 #![allow(

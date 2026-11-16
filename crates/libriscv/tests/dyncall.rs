@@ -57,7 +57,7 @@ struct CallState {
 /// fa0-fa1.
 ///
 /// Like the C++ test's decoder hook, the handler rejects a counted word
-/// whose promise doesn't fit it: one input and one output, and FP
+/// whose promise does not fit it: one input and one output, and FP
 /// registers live for 501. The word is read from instruction memory at PC.
 fn call(m: &mut Machine, fp: bool) -> libriscv::Result<()> {
     let word: u32 = m.memory.read_value(m.cpu.pc())?;
@@ -95,7 +95,7 @@ fn call(m: &mut Machine, fp: bool) -> libriscv::Result<()> {
     Ok(())
 }
 
-/// A custom-2 word that isn't a dyncall still goes to the decoder hook.
+/// A custom-2 word that is not a dyncall still goes to the decoder hook.
 fn on_unimplemented(i: Instr) -> Option<libriscv::CustomInstruction> {
     (i.whole() == NOT_A_DYNCALL).then_some(not_a_dyncall)
 }
@@ -249,7 +249,7 @@ fn legacy_call() {
 }
 
 /// The index beyond the system call table is an unhandled system call, and
-/// a custom-2 word that isn't a dyncall is still the decoder hook's.
+/// a custom-2 word that is not a dyncall is still the decoder hook's.
 #[test]
 fn unknown_dyncall_index_and_other_custom_instructions() {
     if !testutil::need_compiler() {
@@ -309,7 +309,7 @@ fn stop_in_counted_call_resumes_exactly() {
         stops += 1;
         assert!(stops < 100);
     }
-    // The remaining calls didn't stop (scenario 2 stops at every call, so
+    // The remaining calls did not stop (scenario 2 stops at every call, so
     // the loop above resumed once per call).
     assert_eq!(machine.instruction_counter(), uninterrupted.counter);
     assert_eq!(machine.cpu.pc(), uninterrupted.pc);

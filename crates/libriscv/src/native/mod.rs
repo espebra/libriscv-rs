@@ -22,7 +22,7 @@ pub use heap::{Arena, ArenaChunk, PointerType, UnknownFree, UnknownRealloc};
 use crate::error::{ExceptionKind, MachineError, Result};
 use crate::machine::{Machine, SyscallHandler};
 
-/// An arbitrary maximum length, just to stop *somewhere* (512 MiB).
+/// Maximum native memory-operation length: 512 MiB.
 pub(crate) const MEMCPY_MAX: u64 = 1024 * 1024 * 512;
 /// 1 MiB of maximally fragmented memory.
 const MEMCPY_BUFFERS: usize = 256;
@@ -64,7 +64,7 @@ pub(crate) fn native_memmove(m: &mut Machine, dst: u64, src: u64, len: u64) -> R
 
 impl Machine {
     /// The native heap (C++ `arena()`). Fails with `SYSTEM_CALL_FAILED`
-    /// when [`setup_native_heap`](Self::setup_native_heap) hasn't been called.
+    /// when [`setup_native_heap`](Self::setup_native_heap) has not been called.
     pub fn arena(&self) -> Result<&Arena> {
         self.arena
             .as_deref()
@@ -96,7 +96,7 @@ impl Machine {
     ///
     /// Each costs 2000 instructions, plus one per byte cleared or two per
     /// byte copied. The memory itself must be mapped, e.g. with
-    /// [`Memory::mmap_allocate`](crate::Memory::mmap_allocate). Forks don't
+    /// [`Memory::mmap_allocate`](crate::Memory::mmap_allocate). Forks do not
     /// get the heap.
     pub fn setup_native_heap(&mut self, sysnum: usize, base: u64, max_memory: u64) -> Result<()> {
         self.setup_native_heap_with_chunks(sysnum, base, max_memory, 0)
@@ -212,7 +212,7 @@ fn syscall_realloc(m: &mut Machine) -> Result<()> {
     let newlen = m.sysarg(1);
     // The arena takes 32-bit pointers (C++ truncates implicitly).
     let (data, srclen) = m.arena_mut()?.realloc(src as PointerType, newlen)?;
-    // When data != src, srclen is the old length, and the chunks don't
+    // When data != src, srclen is the old length, and the chunks do not
     // overlap, so a forwards copy is fine.
     if u64::from(data) != src && srclen != 0 {
         m.memory
@@ -262,7 +262,7 @@ fn syscall_meminfo(m: &mut Machine) -> Result<()> {
 /// Memcpy n+0.
 fn syscall_memcpy(m: &mut Machine) -> Result<()> {
     let (dst, src, len) = m.sysargs::<(u64, u64, u64)>()?;
-    // A zero-length operation touches no memory, and the addresses don't
+    // A zero-length operation touches no memory, and the addresses do not
     // have to be valid (a Rust guest hands out a dangling pointer for
     // every empty slice).
     if len == 0 {

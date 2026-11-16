@@ -1,4 +1,4 @@
-//! Dispatcher behaviour that the difftests can't reach through `rvlinux`:
+//! Dispatcher behaviour that the difftests cannot reach through `rvlinux`:
 //! system call handlers that change PC or stop the machine, and agreement
 //! between the block-counting dispatcher and the precise interpreter.
 
@@ -189,8 +189,8 @@ fn dispatcher_and_precise_interpreter_agree() {
     assert!(fast.instruction_counter() > 100_000);
 }
 
-/// Random code must never panic the host, in either interpreter. A cheap,
-/// deterministic stand-in until the fuzzing harness (Phase 5).
+/// Random programs must not panic either interpreter. Uses deterministic
+/// inputs to complement the fuzzing harness.
 #[test]
 fn random_code_never_panics() {
     let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -228,11 +228,9 @@ fn random_code_never_panics() {
     }
 }
 
-/// Instructions in a block before a breakpoint (or a libc fast-path
-/// function, which ends its block the same way) are counted. With the C
-/// extension they used to count 0, as in C++, so a loop falling through
-/// into the breakpoint ran past any instruction limit; found by
-/// `libcfuzzer`.
+/// Instructions preceding a breakpoint or libc fast-path patch must count
+/// toward the limit. A zero count with the C extension allowed fall-through
+/// loops to bypass the limit. Regression found by `libcfuzzer`.
 #[test]
 #[cfg(feature = "ext-c")]
 fn instructions_before_a_breakpoint_are_counted() {
@@ -266,13 +264,10 @@ fn instructions_before_a_breakpoint_are_counted() {
     assert_eq!(a0, 2 * 1000);
 }
 
-/// A breakpoint (or libc fast-path function) after a 4-byte instruction
-/// in the same block ends the block too. With the C extension the look-back
-/// for the block's start stopped at the empty second half of the 4-byte
-/// instruction, as in C++, leaving the breakpoint in the middle of its
-/// block: its handler saw the block's last PC, so a fast-path function
-/// there wasn't recognised. Found while investigating a `libcfuzzer`
-/// finding.
+/// A breakpoint or libc patch after a 4-byte instruction must end the block.
+/// The backward scan must skip the instruction's empty second decoder slot;
+/// stopping there leaves the patch mid-block and publishes the wrong PC.
+/// Regression found while investigating `libcfuzzer`.
 #[test]
 #[cfg(feature = "ext-c")]
 fn a_breakpoint_after_a_4_byte_instruction_ends_its_block() {

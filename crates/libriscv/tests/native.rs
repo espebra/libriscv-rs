@@ -1,6 +1,6 @@
 //! The native heap, the native memory system calls and the guest C++
 //! containers (`libriscv::guest`): port of `tests/unit/native.cpp`. Native
-//! threads (`setup_native_threads`) aren't ported.
+//! threads (`setup_native_threads`) are not ported.
 
 #![allow(
     clippy::panic,
@@ -671,10 +671,8 @@ fn check_string_states(m: &mut Machine) -> libriscv::Result<()> {
         "this string is far too long for the inline buffer"
     );
 
-    // Short, but still on the heap, which is where the characters must be
-    // read from. The pointer check keeps the test honest: if the guest
-    // compiler ever turns these into inline strings, they stop covering
-    // anything.
+    // A shrunk string must retain its heap allocation. Check the pointer
+    // to ensure the compiler has not replaced it with inline storage.
     let shrunk_addr = m.sysarg(3);
     assert_ne!(shrunk.ptr, shrunk_addr + CppString::DATA_OFFSET);
     assert_eq!(shrunk.size, 5);
@@ -689,7 +687,7 @@ fn check_string_states(m: &mut Machine) -> libriscv::Result<()> {
     assert_eq!(cleared.to_string(m)?, "");
 
     // Cross-reference against the arena, which is the guest heap here:
-    // every string we believe is heap-allocated must point at a live
+    // every heap-allocated string must point at a live
     // allocation large enough for its characters, and every inline one
     // must not point at an allocation at all.
     let arena = m.arena()?;
@@ -816,7 +814,7 @@ fn guest_std_hash_matches_libstdcxx() {
     // std::hash<std::string> is a MurmurHash2 variant. The expected values
     // are the host libstdc++'s (x86_64, GCC 14), for the same strings.
     // (C++ also checks the 32-bit variant, which this RV64-only port
-    // doesn't have.)
+    // does not have.)
     let x1000 = "x".repeat(1000);
     let strings: [(&str, u64); 9] = [
         ("", 6142509188972423790),
@@ -1375,7 +1373,7 @@ const MAP_PROGRAM: &str = r#"
 	}"#;
 
 /// libstdc++'s bucket count after inserting element `i` (0-based) into an
-/// empty map one at a time, as measured on the host (it doesn't depend on
+/// empty map one at a time, as measured on the host (it does not depend on
 /// the key type or the hash function).
 fn libstdcxx_bucket_count(i: u64) -> usize {
     match i {
@@ -2022,7 +2020,7 @@ fn zero_load_factor_map_does_not_overflow() {
     let mut m = bare_machine();
     m.copy_to_guest(MAP, &[0u8; 64]).unwrap();
     let map = GuestPtr::<CppMap<u64, u64>>::new(MAP);
-    // Errors are fine (the guest's map is nonsense); panics are not.
+    // Malformed guest maps may return errors but must not panic.
     let _ = map.insert_or_assign(&mut m, &1u64, &2u64);
     m.copy_to_guest(MAP, &[0u8; 64]).unwrap();
     let _ = map.reserve(&mut m, 10);
@@ -2030,7 +2028,7 @@ fn zero_load_factor_map_does_not_overflow() {
     let _ = map.rehash(&mut m, 10);
 }
 
-/// Run `f` on a thread and fail if it doesn't finish within 10 seconds
+/// Run `f` on a thread and fail if it does not finish within 10 seconds
 /// (instead of hanging the test run).
 fn within_seconds(f: impl FnOnce() + Send + 'static) {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -2085,7 +2083,7 @@ fn cyclic_node_lists_are_rejected() {
             let (m, map) = cyclic_map(count);
             corrupt(map.entries(&m).map(drop));
             corrupt(map.to_map(&m).map(drop));
-            // Looking for a key that isn't there walks the bucket.
+            // Looking for a key that is not there walks the bucket.
             corrupt(map.find(&m, &9u64).map(drop));
             let (mut m, map) = cyclic_map(count);
             corrupt(map.clear(&mut m));

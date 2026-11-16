@@ -77,7 +77,7 @@ pub struct FileDescriptors {
     /// repeated slashes are collapsed before it runs, and a path relative
     /// to a directory descriptor is joined to the directory's guest path
     /// first. So a prefix check like `path.starts_with("/srv/data/")`
-    /// can't be escaped with `..`. Relative paths through `AT_FDCWD` are
+    /// cannot be escaped with `..`. Relative paths through `AT_FDCWD` are
     /// `EBADF` (as in C++, the guest has no host working directory) and
     /// never reach the filter. The filter may rewrite the path: what it
     /// leaves in the string is the host path that is opened, as is (a
@@ -85,7 +85,7 @@ pub struct FileDescriptors {
     ///
     /// The host still resolves symbolic links when it opens the path, so
     /// a link inside an admitted directory leads wherever it points:
-    /// admit only paths whose contents you trust. Files that aren't
+    /// admit only paths whose contents you trust. Files that are not
     /// regular files or directories are refused unless
     /// [`permit_special_files`](Self::permit_special_files) is set.
     pub filter_open: Option<PathFilter>,
@@ -146,7 +146,7 @@ impl FileDescriptors {
     /// root stays at the root), and the result starts with `/`. A relative
     /// path is treated as relative to `/`. A trailing slash (or a final
     /// `.` or `..`) is kept as a trailing slash, so `"/etc/hosts/"` stays
-    /// distinct from `"/etc/hosts"`. Symbolic links aren't consulted: the
+    /// distinct from `"/etc/hosts"`. Symbolic links are not consulted: the
     /// normalised path is the one that is opened.
     pub fn normalize_path(path: &str) -> String {
         let mut parts: Vec<&str> = Vec::new();
@@ -201,13 +201,13 @@ impl FileDescriptors {
         (0..=2).contains(&vfd).then_some(Target::Stdio(vfd))
     }
 
-    /// An open file (C++ `get`, which doesn't let the standard streams through).
+    /// An open file (C++ `get`, which does not let the standard streams through).
     pub fn get(&mut self, vfd: i32) -> Option<&mut OpenFile> {
         self.files.get_mut(&vfd)
     }
 
     /// Close a virtual file descriptor (C++ `erase`). Returns false if it
-    /// wasn't open.
+    /// was not open.
     pub fn erase(&mut self, vfd: i32) -> bool {
         self.files.remove(&vfd).is_some()
     }
@@ -221,7 +221,7 @@ impl FileDescriptors {
     }
 
     /// Writing to files is only allowed in proxy mode (C++ `permit_write`;
-    /// sockets aren't ported yet).
+    /// sockets are not ported yet).
     pub const fn permit_write(&self) -> bool {
         self.proxy_mode
     }

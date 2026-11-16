@@ -60,7 +60,7 @@ impl Drop for SharedObject {
     }
 }
 
-/// Native code in executable memory that this process didn't map itself:
+/// Native code in executable memory that this process did not map itself:
 /// the code of one [`CachedUnit`], for [`CodeMemory::linked`].
 ///
 /// [`CodeMemory::linked`]: crate::CodeMemory::linked
@@ -99,7 +99,7 @@ pub struct CachedUnit {
 /// `record` must point at `RECORD_WORDS` readable, aligned `u64`s, and if
 /// they are a record (the magic matches), its code and metadata must be
 /// where it says, in memory that stays mapped as long as `owner`, or for
-/// the program's lifetime if that's `None`.
+/// the program's lifetime if that is `None`.
 #[allow(unsafe_code)]
 unsafe fn read_record(record: *const u64, owner: Option<&Arc<SharedObject>>) -> Option<CachedUnit> {
     // SAFETY: the caller guarantees `record` points at a whole record.
@@ -139,11 +139,9 @@ pub fn embedded_units() -> Vec<CachedUnit> {
     Vec::new()
 }
 
-/// Load the shared object at `path` (`dlopen`) and return its records. The
-/// object stays loaded as long as code from it is in use.
-///
-/// Loading a shared object runs its code (its initializers, and later the
-/// code of its records): only load files you would also run.
+/// Load `path` with `dlopen` and return its cached-code records.
+/// The object remains loaded while any returned code is in use.
+/// Loading executes initializers and native code; only load trusted objects.
 pub fn load_shared_object(path: &Path) -> io::Result<Vec<CachedUnit>> {
     #[cfg(target_os = "linux")]
     return sys::load(path);
@@ -161,10 +159,9 @@ pub fn load_shared_object(path: &Path) -> io::Result<Vec<CachedUnit>> {
 mod embedded {
     use super::{CachedUnit, RECORD_WORDS, read_record};
 
-    /// An empty record, so that the section (and with it the `__start_` and
-    /// `__stop_` symbols) exists in every program, also without any cached
-    /// code linked in. Its magic is 0: it's skipped. Not `mut`, so that the
-    /// section's flags (read-only data) match those of the records.
+    /// Empty record ensuring the section and its `__start_`/`__stop_` symbols
+    /// exist without embedded code. Zero magic causes it to be skipped.
+    /// Immutable storage preserves the read-only section flags.
     #[allow(unsafe_code)]
     // SAFETY: `link_section` places a plain array of integers in our
     // section. Nothing relies on its position besides `units`, which reads

@@ -1,8 +1,7 @@
 #!/bin/bash
-# Fuzz every target for a long, unattended run (e.g. overnight), splitting
-# the cores between them, and summarise the findings at the end.
+# Run all targets concurrently for a specified duration and summarize findings.
 #
-# Unlike do_fuzz.sh, a finding doesn't stop a target: libFuzzer's fork mode
+# Unlike do_fuzz.sh, a finding does not stop a target: libFuzzer's fork mode
 # keeps going after crashes, OOMs and timeouts (-ignore_*), writing each
 # reproducer to artifacts/<target>/. Corpora accumulate in corpus/<target>/
 # across runs.
@@ -17,7 +16,7 @@
 # Environment:
 #   JOBS          worker processes in total (default: number of cores)
 #   FUZZ_FLAGS    cargo-fuzz flags (default "-s none -a"; jitdifffuzzer adds
-#                 --features jit). AddressSanitizer (-s address) doesn't
+#                 --features jit). AddressSanitizer (-s address) does not
 #                 build, see README.md.
 #   LIBRISCV_CPP  C++ libriscv checkout, for the elffuzzer seeds
 #   NO_JIT=1      skip jitdifffuzzer (it only compares anything on x86-64)
@@ -48,7 +47,7 @@ LOGS="logs/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$LOGS"
 echo "Fuzzing ${#TARGETS[@]} targets x $PER_TARGET workers for ${SECONDS_TOTAL}s; logs in $LOGS/"
 
-# Build first, so the targets don't race on the build directory.
+# Build first, so the targets do not race on the build directory.
 FLAGS="${FUZZ_FLAGS:--s none -a}"
 # shellcheck disable=SC2086
 cargo fuzz build $FLAGS

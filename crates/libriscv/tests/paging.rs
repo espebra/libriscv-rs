@@ -301,7 +301,7 @@ fn fill_execute_segments(m: &mut Machine, len: u64) -> usize {
     panic!("no limit");
 }
 
-/// Segments that don't overlap count together against
+/// Segments that do not overlap count together against
 /// `execute_segment_memory_max`.
 #[test]
 fn execute_segments_are_bounded_by_their_limit() {
@@ -661,7 +661,7 @@ fn riscv_flush_icache_observes_stores_to_instruction_memory() {
     run_all_ways(&binary, "icache", 111_222, true);
 }
 
-/// A linear decode can't tell a constant pool from instructions.
+/// A linear decode cannot tell a constant pool from instructions.
 #[test]
 #[cfg_attr(
     not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
@@ -780,7 +780,7 @@ fn instantiate_pie_machine() {
 
 #[test]
 fn shared_object_needs_a_dynamic_linker() {
-    // This fails because the dynamic linker isn't loaded.
+    // This fails because the dynamic linker is not loaded.
     let Some(binary) = build("int main() { return 666; }", "-shared") else {
         return;
     };
@@ -934,7 +934,7 @@ fn rebuild_loop(area: u64, calls: i32, free_decode_bytes: u64, limit: u64) -> (M
 
 /// Rebuilding a stale execute segment copies and decodes the whole
 /// executable area. Past the free allowance (16 MiB by default; not C++)
-/// it's charged per byte, so a FENCE.I loop over a large area runs into a
+/// it is charged per byte, so a FENCE.I loop over a large area runs into a
 /// small instruction limit after a few rebuilds instead of decoding
 /// megabytes per guest instruction (security review finding 2).
 #[test]

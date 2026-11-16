@@ -2,9 +2,8 @@
 //! `guest/guest_rust_common.hpp`): Rust's `String` and `&str` in guest
 //! memory.
 //!
-//! Rust doesn't stabilize the layout of its collections; what is mirrored
-//! here is what rustc emits for `riscv64gc-unknown-linux-gnu` (checked by
-//! the layout probe in `tests/native_rust.rs`):
+//! Mirrors the layouts emitted by rustc for `riscv64gc-unknown-linux-gnu`,
+//! verified by `tests/native_rust.rs`. Rust collection layouts are unstable:
 //!
 //! ```text
 //!   Vec<T>  = { cap: usize, ptr: *mut T, len: usize }
@@ -13,10 +12,9 @@
 //!   &str    = &[u8] of UTF-8 bytes, the same two words
 //! ```
 //!
-//! The capacity comes first. There is no small-string optimization and no
-//! terminating zero, and nothing points back into itself, so these mirrors
-//! can be moved freely. An empty collection has a capacity of zero and a
-//! dangling, aligned, never-null pointer (Rust holds a `NonNull<T>`).
+//! These layouts have no self-pointers and support bytewise moves. Strings
+//! have no inline storage or NUL terminator. Empty collections have zero
+//! capacity and an aligned, non-null dangling pointer.
 
 use super::{GuestInit, GuestPtr, GuestType, MAX_BYTES, ToHost, container_error, guest_alloc};
 use crate::error::Result;
@@ -24,7 +22,7 @@ use crate::machine::Machine;
 use crate::memory::GuestPod;
 use crate::vmcall::{ArgRegs, VmCallArg};
 
-/// The pointer Rust uses for a collection of `T` that hasn't allocated:
+/// The pointer Rust uses for a collection of `T` that has not allocated:
 /// dangling but aligned (`NonNull::dangling`).
 pub const fn rust_dangling<T: GuestPod>() -> u64 {
     T::ALIGN as u64
@@ -148,8 +146,7 @@ impl GuestRustStr {
     pub fn as_bytes<'a>(&self, m: &'a Machine) -> Result<&'a [u8]> {
         guest_bytes(m, self.ptr, self.len, "Guest Rust &str is too large")
     }
-    /// The text, borrowed from guest memory, or an error when the bytes
-    /// aren't UTF-8 (which Rust guarantees, but a guest can lie).
+    /// Borrow the text from guest memory, returning an error for invalid UTF-8.
     pub fn to_str<'a>(&self, m: &'a Machine) -> Result<&'a str> {
         utf8(self.as_bytes(m)?)
     }
@@ -175,7 +172,7 @@ impl ToHost for GuestRustStr {
 /// has the same methods for a string in guest memory.
 ///
 /// Rust code may assume the bytes are valid UTF-8; it is undefined
-/// behavior in the guest when they aren't. Everything that takes a `&str`
+/// behavior in the guest when they are not. Everything that takes a `&str`
 /// keeps it valid; only raw bytes (`&[u8]` as a [`GuestInit`] source) can
 /// break that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,7 +211,7 @@ impl GuestPod for GuestRustString {
 }
 
 impl GuestRustString {
-    /// The pointer of a string that hasn't allocated anything.
+    /// The pointer of a string that has not allocated anything.
     pub const DANGLING: u64 = rust_dangling::<u8>();
     /// The smallest allocation `RawVec` makes for bytes.
     pub const MIN_CAPACITY: u64 = rust_min_capacity::<u8>();
@@ -269,7 +266,7 @@ impl GuestRustString {
         guest_bytes(m, self.ptr, self.len, "Guest Rust String is too large")
     }
     /// The text, borrowed from guest memory, or an error when the bytes
-    /// aren't UTF-8.
+    /// are not UTF-8.
     pub fn to_str<'a>(&self, m: &'a Machine) -> Result<&'a str> {
         utf8(self.as_bytes(m)?)
     }
@@ -300,16 +297,15 @@ impl GuestRustString {
         self.len = 0;
     }
 
-    /// Make room for at least `additional` more bytes, growing the way
-    /// Rust's `RawVec` does, so that a string built here and one built by
-    /// the guest end up with the same capacity.
+    /// Reserve at least `additional` bytes using Rust `RawVec` growth rules,
+    /// matching capacities produced by the guest.
     pub fn reserve(&mut self, m: &mut Machine, additional: usize) -> Result<()> {
         let total = grown_len(self.len, additional, "Guest Rust String too large")?;
         self.reserve_total(m, total)
     }
 
-    /// Make room for exactly `additional` more bytes, if there isn't room
-    /// already (`String::reserve_exact`).
+    /// Reserve exactly `additional` bytes if capacity is insufficient
+    /// (`String::reserve_exact`).
     pub fn reserve_exact(&mut self, m: &mut Machine, additional: usize) -> Result<()> {
         let total = grown_len(self.len, additional, "Guest Rust String too large")?;
         if total <= self.cap {
@@ -343,8 +339,7 @@ impl GuestRustString {
         Ok(())
     }
 
-    /// Release the allocation, leaving `String::new()`: what dropping the
-    /// string does in the guest.
+    /// Free the allocation and reset to `String::new()`, matching guest drop behavior.
     pub fn free(&mut self, m: &mut Machine) -> Result<()> {
         if self.cap != 0 {
             super::guest_free(m, self.ptr)?;

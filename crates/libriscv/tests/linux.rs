@@ -116,7 +116,7 @@ fn cross_page_memory_access() {
 
 #[test]
 fn faccessat_respects_permission_checks() {
-    // C3: the guest can't probe the host file system.
+    // C3: the guest cannot probe the host file system.
     if !testutil::need_compiler() {
         return;
     }

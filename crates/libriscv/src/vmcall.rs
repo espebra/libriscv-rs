@@ -5,7 +5,7 @@
 //!
 //! C++ passes arguments as a variadic template pack and picks what to do
 //! with each one by type. Here the arguments are a tuple of [`VmCallArg`]s
-//! (a single argument doesn't need the tuple, `()` is none), with the same
+//! (a single argument does not need the tuple, `()` is none), with the same
 //! per-type rules:
 //!
 //! | Argument | C++ | Goes to |
@@ -100,8 +100,8 @@ impl ArgRegs {
     }
 }
 
-/// One argument of a VM call (see the module documentation for the
-/// built-in ones). Implement it to pass your own types.
+/// One VM call argument. Implement this trait for custom argument types;
+/// see the module documentation for built-in implementations.
 pub trait VmCallArg {
     /// Put the argument where the callee expects it.
     fn pass(&self, m: &mut Machine, regs: &mut ArgRegs) -> Result<()>;
@@ -195,7 +195,7 @@ impl<T: GuestPod> VmCallArg for Vec<T> {
 
 /// Pass a [`GuestPod`] by pointer: its bytes are pushed onto the guest
 /// stack and the address is the argument (C++ does this for any
-/// standard-layout argument that isn't a number).
+/// standard-layout argument that is not a number).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OnStack<T>(pub T);
 
@@ -239,10 +239,10 @@ tuple_args!(A B C D E F G H I J);
 tuple_args!(A B C D E F G H I J K);
 tuple_args!(A B C D E F G H I J K L);
 
-/// The function a VM call calls: an address, or the name of an ELF symbol
-/// (looked up in the symbol table every time; cache it with
-/// [`Machine::address_of`] for repeated calls). Like C++, an unknown name
-/// is address 0, which faults when the call jumps there.
+/// VM call target: a guest address or ELF symbol name.
+/// Symbol names are resolved on every call. Cache [`Machine::address_of`]
+/// for repeated calls. An unknown symbol resolves to address 0 and faults
+/// when executed, matching C++.
 pub trait CallTarget {
     /// The function's address.
     fn address(&self, m: &Machine) -> Result<u64>;
@@ -292,29 +292,24 @@ impl Machine {
         Ok(())
     }
 
-    /// Port of `Machine::vmcall`: call a guest function from the host, with
-    /// a fresh stack, and run it until it returns (to the exit function,
-    /// which stops the machine). Returns `a0`.
+    /// Call a guest function with a fresh stack and return its `a0` value.
+    /// The function returns through the exit function, which stops the machine.
     ///
-    /// **No instruction limit:** this runs without counting instructions
-    /// (C++ `simulate_inaccurate`), so a guest function that loops forever
-    /// hangs the calling host thread. Only use it on trusted guest code;
-    /// for untrusted code use [`vmcall_limited`](Self::vmcall_limited) or
-    /// [`try_vmcall`](Self::try_vmcall) with a nonzero limit. The machine
-    /// must not be running (use [`preempt`](Self::preempt) from a system
-    /// call).
+    /// Execution has no instruction limit or counting (C++ `simulate_inaccurate`).
+    /// An infinite loop blocks the calling host thread. Use only with trusted code;
+    /// for untrusted code, use [`vmcall_limited`](Self::vmcall_limited) or
+    /// [`try_vmcall`](Self::try_vmcall) with a nonzero limit.
+    /// The machine must be idle; use [`preempt`](Self::preempt) from a system call.
     pub fn vmcall(&mut self, func: impl CallTarget, args: impl VmCallArgs) -> Result<u64> {
         self.vmcall_limited(u64::MAX, func, args)
     }
 
-    /// [`vmcall`](Self::vmcall) with at most `max_instructions`
-    /// instructions, counted from zero; reaching the limit is a
-    /// `MAX_INSTRUCTIONS_REACHED` error (C++ `vmcall<MAXI>`).
+    /// Call with an instruction limit counted from zero.
+    /// Reaching the limit returns `MAX_INSTRUCTIONS_REACHED` (C++ `vmcall<MAXI>`).
     ///
-    /// **A limit of 0 means no limit**, like `u64::MAX` (as in C++): the
-    /// call then runs uncounted, exactly like [`vmcall`](Self::vmcall). A
-    /// limit computed from a budget that has run out (0) must be checked
-    /// by the caller, or an untrusted guest runs unbounded.
+    /// Both 0 and `u64::MAX` disable counting and the limit, matching
+    /// [`vmcall`](Self::vmcall). Check exhausted budgets before calling:
+    /// passing 0 runs untrusted code without a limit.
     pub fn vmcall_limited(
         &mut self,
         max_instructions: u64,
@@ -330,14 +325,12 @@ impl Machine {
         Ok(self.return_value())
     }
 
-    /// [`vmcall_limited`](Self::vmcall_limited), where reaching the limit
-    /// isn't an error (C++ `vmcall<MAXI, false>`): it returns `a0` as it
-    /// is, and [`instruction_limit_reached`](Self::instruction_limit_reached)
-    /// tells whether the function returned.
+    /// Call with a limit, returning the current `a0` on timeout
+    /// (C++ `vmcall<MAXI, false>`). Use
+    /// [`instruction_limit_reached`](Self::instruction_limit_reached) to detect timeout.
     ///
-    /// **A limit of 0 (or `u64::MAX`) means no limit**, as for
-    /// [`vmcall_limited`](Self::vmcall_limited): never pass 0 for
-    /// untrusted code.
+    /// Both 0 and `u64::MAX` disable the limit, as with
+    /// [`vmcall_limited`](Self::vmcall_limited). Do not pass 0 for untrusted code.
     pub fn try_vmcall(
         &mut self,
         max_instructions: u64,
@@ -361,17 +354,14 @@ impl Machine {
         Ok(pc)
     }
 
-    /// Port of `Machine::preempt` (`StoreRegs = true`): call a guest
-    /// function like an interrupt handler, on the current stack (below a
-    /// 16-byte red zone), and restore all registers, PC included, when it
-    /// returns or fails. Works from inside a system call handler, where the
-    /// interrupted code then continues as if nothing happened. Returns the
-    /// function's `a0`.
+    /// Call a guest function on the current stack below a 16-byte red zone
+    /// (C++ `Machine::preempt`, `StoreRegs = true`). Restore all registers,
+    /// including PC, after return or execution failure. Returns the function's `a0`.
+    /// Can be called from a system call handler.
     ///
-    /// The function gets at most `max_instructions` instructions on top of
-    /// the current counter, and the instructions it runs count against the
-    /// caller's limit too: repeated preemption can't extend the sandbox's
-    /// budget. Reaching the limit is a `MAX_INSTRUCTIONS_REACHED` error.
+    /// The limit is `max_instructions` beyond the current counter. Executed
+    /// instructions also consume the caller's budget. Reaching the limit returns
+    /// `MAX_INSTRUCTIONS_REACHED`.
     pub fn preempt(
         &mut self,
         max_instructions: u64,
@@ -381,12 +371,10 @@ impl Machine {
         self.preempt_impl(max_instructions, &func, &args, true, true)
     }
 
-    /// Port of `Machine::preempt<true, false>`: [`preempt`](Self::preempt)
-    /// without saving and restoring the registers, which is cheaper. The
-    /// registers (and PC) are left as the called function left them, so
-    /// the interrupted code can't simply continue. In a system call handler
-    /// that means execution continues 4 bytes after the new PC (as for any
-    /// handler that changes PC), so save and restore what's needed yourself.
+    /// Preempt without saving or restoring registers (C++ `preempt<true, false>`).
+    /// Registers and PC retain the called function's final state. From a system
+    /// call handler, execution resumes 4 bytes after that PC. The caller must
+    /// restore any state needed to resume interrupted code.
     pub fn preempt_clobbering(
         &mut self,
         max_instructions: u64,
@@ -396,13 +384,12 @@ impl Machine {
         self.preempt_impl(max_instructions, &func, &args, false, true)
     }
 
-    /// Port of `Machine::preempt<false, StoreRegs>`: a preemption whose
-    /// errors (faults, and reaching the limit) are discarded, restoring the
-    /// registers first if `store_regs`. Only setting up the call can fail
-    /// (pushing an argument onto the stack), and then, as with every
-    /// variant and as in C++, the registers aren't restored.
-    /// After an error it returns the restored `a0` with `store_regs`, else
-    /// `a0` as the failed call left it.
+    /// Preempt while discarding execution faults and timeouts
+    /// (C++ `preempt<false, StoreRegs>`). If `store_regs` is true, restore
+    /// registers before returning `a0`; otherwise return the failed call's `a0`.
+    ///
+    /// Argument setup can still fail. Setup errors leave partially modified
+    /// registers unrestored, matching all other call variants and C++.
     pub fn try_preempt(
         &mut self,
         max_instructions: u64,
@@ -423,7 +410,7 @@ impl Machine {
     ) -> Result<u64> {
         let pc = func.address(self)?;
         let old_regs = store_regs.then(|| self.cpu.regs.clone());
-        // We need to make some stack room.
+        // Reserve stack space for the preempted call.
         let sp = self.cpu.reg(REG_SP).wrapping_sub(16);
         self.cpu.set_reg(REG_SP, sp);
         // If pushing an argument fails, the registers keep the partial setup
@@ -442,7 +429,7 @@ impl Machine {
     ) -> Result<u64> {
         let prev_max = self.max_counter;
         // Execute by extending the max instruction counter (resuming).
-        // Don't change this: resumption is what keeps the sandbox intact.
+        // Resume the existing counter to preserve the caller's instruction budget.
         // Repeatedly invoking preemption must lead to timeouts on either
         // preempt() or the caller.
         let counter = self.counter;

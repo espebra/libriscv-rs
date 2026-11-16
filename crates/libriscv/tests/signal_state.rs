@@ -1,5 +1,5 @@
 //! Per-thread signal state lives only as long as its thread: a guest that
-//! keeps creating threads that touch it mustn't grow host memory.
+//! keeps creating threads that touch it must not grow host memory.
 
 #![allow(
     clippy::panic,

@@ -67,7 +67,7 @@ fn translating(out: &AotOutput) -> MachineOptions {
 fn compile_and_load(out: &AotOutput, test: &str) {
     assert!(!out.is_empty(), "{test}: nothing was translated");
     // Every region's control flow is laid out as structured code: the
-    // `match pc` dispatcher (`'r: loop`) is only a safety net.
+    // `match pc` dispatcher (`'r: loop`) is a fallback.
     let source = out.source();
     assert!(
         !source.contains("'r: loop"),
@@ -580,7 +580,7 @@ fn dyncalls_match_the_interpreter() {
 /// window's start, the end of read-only data where the write window starts
 /// with a program loaded, and the end of the arena), with accesses on both
 /// sides of each. Past the arena, the page table holds a pattern that the
-/// arena's padding doesn't, so an access wrongly made natively there reads
+/// arena's padding does not, so an access wrongly made natively there reads
 /// something else. (The JIT's `merged_bounds_checks_match_the_interpreter`.)
 #[test]
 fn merged_bounds_checks_match_the_interpreter() {
@@ -805,7 +805,7 @@ fn unlimited_translations_neither_count_nor_stop() {
     assert!(!m.cpu.current_execute_segment().is_aot());
 }
 
-/// A missing file, or a shared object that isn't a translation, is an
+/// A missing file, or a shared object that is not a translation, is an
 /// error.
 #[test]
 fn loading_a_bad_file_fails() {

@@ -1,24 +1,14 @@
-//! Port of `native_heap.hpp`: the native heap's allocator, a separate
-//! address-space allocator for guest memory whose metadata lives on the
-//! host.
+//! Port of `native_heap.hpp`: guest address-space allocator with host metadata.
 //!
-//! The algorithm is C++'s, step for step, so the same sequence of calls
-//! hands out the same addresses (guests and tests depend on it): a TLSF
-//! style allocator with 32 first-level and 16 second-level size classes
-//! (free lists with bitmaps), chunks kept in a slab and linked in address
-//! order, and an open-addressing hash table (linear probing, backward-shift
-//! deletion) from allocation address to chunk. Coalescing keeps the tail
-//! chunk free, so the high watermark is O(1).
+//! Preserves C++ allocation addresses for identical call sequences. Uses
+//! 32 first-level and 16 second-level size classes with bitmap-indexed free
+//! lists, address-ordered slab chunks, and a linear-probing address index
+//! with backward-shift deletion. Coalescing keeps the tail free, allowing
+//! constant-time high-watermark queries.
 //!
-//! Differences from C++:
-//!
-//! * Errors C++ throws (`MachineException(INVALID_PROGRAM, ...)`) are
-//!   returned, with the same kind, message and data.
-//! * Sizes are `u64` (C++ `size_t`), so results don't depend on the host.
-//! * The search statistics (`search_steps`, `max_probe`,
-//!   `sequential_fallbacks`) are always kept; C++ only keeps them with
-//!   `RISCV_ARENA_DEBUG`, which its unit tests enable.
-//! * The callbacks for unknown frees and reallocs are boxed closures.
+//! Errors retain C++ kinds, messages, and data. Sizes use `u64` for host
+//! independence. Search statistics are always tracked; C++ enables them with
+//! `RISCV_ARENA_DEBUG`. Unknown-free and reallocation callbacks are boxed closures.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -189,11 +179,11 @@ impl Default for UsedSlot {
 }
 
 /// Called with the pointer (and its chunk, if it is a freed one) when
-/// [`Arena::free`] gets a pointer that isn't a live allocation; returns
+/// [`Arena::free`] gets a pointer that is not a live allocation; returns
 /// what `free` returns (C++ `unknown_free_func_t`).
 pub type UnknownFree = Box<dyn FnMut(PointerType, Option<&ArenaChunk>) -> i32 + Send + Sync>;
 /// Called with the pointer and the new size when [`Arena::realloc`] gets a
-/// pointer that isn't a live allocation; returns what `realloc` returns
+/// pointer that is not a live allocation; returns what `realloc` returns
 /// (C++ `unknown_realloc_func_t`).
 pub type UnknownRealloc = Box<dyn FnMut(PointerType, u64) -> (PointerType, u64) + Send + Sync>;
 
@@ -1054,7 +1044,7 @@ impl Arena {
         }
     }
 
-    /// Allocate `size` bytes (at most a page) that don't cross a page
+    /// Allocate `size` bytes (at most a page) that do not cross a page
     /// boundary, so that they are sequential on the host as well (C++
     /// `seq_alloc_aligned`). With `arena_is_flat` (C++'s default when it
     /// has a flat read-write arena, as the reference emulator does), this
@@ -1148,7 +1138,7 @@ impl Arena {
         Ok((0, 0))
     }
 
-    /// The size of the allocation at `ptr`, or 0 if it isn't one.
+    /// The size of the allocation at `ptr`, or 0 if it is not one.
     pub fn size(&self, ptr: PointerType) -> u64 {
         self.size_with(ptr, false)
     }

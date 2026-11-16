@@ -22,8 +22,8 @@ if [ "${1:-}" = "--" ]; then shift; fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
 
-# libFuzzer shells out to llvm-symbolizer, whose debuginfod client can hang
-# forever on distros with a default debuginfod URL (Ubuntu). See README.md.
+# Disable debuginfod to prevent llvm-symbolizer hangs on distributions
+# that configure a default server, including Ubuntu. See README.md.
 export DEBUGINFOD_URLS=
 
 CORPUS=()

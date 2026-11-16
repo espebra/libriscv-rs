@@ -11,7 +11,7 @@ use super::classify::{JOp, operands};
 use super::region::{Analysis, RegionId};
 use crate::decoder_cache::{COMPRESSED, DecodedSegment};
 
-/// The most nested native calls; deeper calls are tail calls (which don't
+/// The most nested native calls; deeper calls are tail calls (which do not
 /// grow the stack) and return through the entry table.
 pub(crate) const DEPTH: u32 = 32;
 

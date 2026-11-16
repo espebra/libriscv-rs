@@ -41,7 +41,7 @@ pub fn hash_bytes(data: &[u8], seed: u64) -> u64 {
 /// and `std::equal_to<K>`.
 pub trait GuestHashKey: GuestType {
     /// libstdc++ stores the hash code in every node when `std::hash<K>`
-    /// isn't considered fast (`__is_fast_hash`), which changes the node
+    /// is not considered fast (`__is_fast_hash`), which changes the node
     /// layout. True for `std::string`.
     const CACHE_HASH_CODE: bool;
     /// `std::hash<K>` of the key `self` (in guest memory, or a host copy
@@ -114,7 +114,7 @@ macro_rules! float_keys {
 }
 float_keys!(f32, f64);
 
-/// `std::hash<std::string>` isn't a "fast" hash, so libstdc++ stores the
+/// `std::hash<std::string>` is not a "fast" hash, so libstdc++ stores the
 /// hash code of every key in its node.
 impl GuestHashKey for GuestStdString {
     const CACHE_HASH_CODE: bool = true;

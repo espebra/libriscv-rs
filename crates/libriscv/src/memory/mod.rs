@@ -1,21 +1,16 @@
-//! Port of `memory.hpp`, `memory.cpp`, `memory_inline.hpp` and
-//! `memory_rw.cpp`, configured like the reference emulator: a flat
-//! read-write arena (`RISCV_FLAT_RW_ARENA`) with virtual paging behind it
-//! (`RISCV_VIRTUAL_PAGING`).
+//! Port of `memory.hpp`, `memory.cpp`, `memory_inline.hpp`, and `memory_rw.cpp`.
+//! Uses the reference configuration: `RISCV_FLAT_RW_ARENA` plus
+//! `RISCV_VIRTUAL_PAGING`.
 //!
-//! Guest memory starts with one flat arena at guest address 0. Guest loads
-//! and stores try it first with two range checks, exactly like
-//! `memory_inline.hpp`:
+//! Guest loads and stores first check the flat arena:
 //!
-//! * reads in `[RWREAD_BEGIN, arena_size)`;
-//! * writes in `[initial_rodata_end, arena_size)`, so the ELF's read-only
-//!   segments (including code) are left to the slow path.
+//! * Reads: `[RWREAD_BEGIN, arena_size)`.
+//! * Writes: `[initial_rodata_end, arena_size)`.
 //!
-//! Everything else goes through the page table (`paging.rs`), which holds
-//! the page attributes, the guard page at 0, the host code page and pages
-//! outside the arena. Like C++, the arena is over-allocated by one page at
-//! the end so an access starting at the last valid address never needs a
-//! size check.
+//! Other accesses use the page table in `paging.rs`, including page zero,
+//! read-only program stores, host code, and memory outside the arena.
+//! One padding page allows wide accesses starting at the last valid arena
+//! address without a separate size check.
 
 mod helpers;
 mod loader;
@@ -476,7 +471,7 @@ impl Memory {
     #[inline(always)]
     pub(crate) fn arena_read<const N: usize>(&self, addr: u64) -> Option<[u8; N]> {
         if addr.wrapping_sub(RWREAD_BEGIN) < self.read_boundary {
-            // In bounds thanks to the padding page; `get` can't fail.
+            // In bounds thanks to the padding page; `get` cannot fail.
             let a = usize::try_from(addr).ok()?;
             return self.arena.get(a..a.wrapping_add(N))?.first_chunk().copied();
         }
@@ -645,9 +640,8 @@ impl Memory {
         });
     }
 
-    /// True if `code`, a segment at `vaddr`, is exactly what lies there in
-    /// a pinned host file mapped over it: then its bytes came from a file
-    /// the host chose, whatever the guest did since. Reads the file.
+    /// True if `code` at `vaddr` matches the currently mapped pinned host file.
+    /// Re-reads the file and compares bytes to detect guest modifications.
     #[cfg(feature = "jit")]
     pub(crate) fn came_from_pinned_file(&self, vaddr: u64, code: &[u8]) -> bool {
         let len = code.len() as u64;
@@ -901,7 +895,7 @@ impl Memory {
                 None => None,
             };
             // A rebuild of a stale segment from the same code reuses its
-            // JIT code. One from changed code is compiled once it's hot:
+            // JIT code. One from changed code is compiled once it is hot:
             // code rewritten in a loop (a FENCE.I each time) would otherwise
             // cost a compilation (milliseconds) every iteration.
             #[cfg(feature = "jit")]
@@ -935,11 +929,11 @@ impl Memory {
             }
             Ok(segment)
         };
-        // Breakpoints aren't part of the key: segments with them aren't
+        // Breakpoints are not part of the key: segments with them are not
         // shared. (C++ shares them anyway.)
         // A machine saving code compiles (or translates) its own segments:
         // a shared one may have been compiled before saving started.
-        // (Saving to the cache directory doesn't count: a shared segment is
+        // (Saving to the cache directory does not count: a shared segment is
         // as good as one built here.)
         #[cfg(feature = "jit")]
         let share = save.as_ref().is_none_or(|s| s.output.is_none());
@@ -973,7 +967,7 @@ impl Memory {
         };
         // The first segment becomes the main one. (C++ takes the slot before
         // decoding, and leaves a half-decoded segment registered if decoding
-        // throws. Here a segment is only registered once it's complete.)
+        // throws. Here a segment is only registered once it is complete.)
         if self.main_exec.is_none() {
             self.main_exec = Some(Arc::clone(&segment));
         } else {
@@ -1014,7 +1008,7 @@ impl Memory {
 
     /// True while one of the execute segments is being compiled in the
     /// background (by this or any other machine sharing it), or has native
-    /// code this memory hasn't switched to yet.
+    /// code this memory has not switched to yet.
     #[cfg(feature = "jit")]
     pub(crate) fn jit_pending(&self) -> bool {
         #[cfg(test)]
@@ -1675,7 +1669,7 @@ mod tests {
             (MIB, u64::MAX, 0x5000, 3 * P, None, None),
             (MIB, u64::MAX, 0, 3 * P, None, None),
             // Into the arena across the end of its read-only data (mid-page,
-            // see `setup`): stores below it don't take the arena's path.
+            // see `setup`): stores below it do not take the arena's path.
             (MIB, 0x2000, far + 8, 3 * P, None, None),
             (MIB, 0x2000, far + 0x40_0000, 2 * P, None, None),
             (MIB, 0x2000, far + 8, 3 * P, None, Some(0x2000)),

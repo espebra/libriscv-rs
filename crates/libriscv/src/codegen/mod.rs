@@ -1,9 +1,6 @@
-//! Port of `asmjit/aj_decode.hpp` and `asmjit/aj_translate.cpp`: what the
-//! native-code backends share. Instruction selection ([`classify`]) and
-//! region formation ([`region`]) decide which instructions run natively
-//! and how they are grouped into functions; the Cranelift JIT (`jit`)
-//! turns each region into machine code, the ahead-of-time translator
-//! (`aot`) into a Rust function.
+//! Port of `asmjit/aj_decode.hpp` and `asmjit/aj_translate.cpp`: shared
+//! instruction selection ([`classify`]) and region formation ([`region`])
+//! for the Cranelift JIT and AOT Rust translator.
 
 pub(crate) mod calls;
 pub(crate) mod classify;
@@ -11,9 +8,8 @@ pub(crate) mod region;
 
 use crate::native_code::MemoryLayout;
 
-/// 64-bit FNV-1a, a word at a time. Not cryptographic: it tells segments
-/// apart, it doesn't defend against crafted collisions (native code
-/// from a file is trusted anyway).
+/// 64-bit FNV-1a processed a word at a time.
+/// Distinguishes segments but provides no protection against crafted collisions.
 pub(crate) fn hash64(bytes: &[u8]) -> u64 {
     const PRIME: u64 = 0x0000_0100_0000_01B3;
     let mut h: u64 = 0xCBF2_9CE4_8422_2325;
@@ -27,10 +23,8 @@ pub(crate) fn hash64(bytes: &[u8]) -> u64 {
     (h ^ bytes.len() as u64).wrapping_mul(PRIME)
 }
 
-/// What the native code built for a segment depends on: the backend's
-/// build (`build`, a fingerprint of its version and source), the segment
-/// and the guest memory layout baked into the code. The key of the JIT
-/// cache (`jit::cache::CacheKey`) and of translations (`aot::AotKey`).
+/// Native-code key shared by the JIT cache and AOT translations.
+/// Includes backend build fingerprint, segment identity, and compiled memory layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct NativeKey {
     pub build: u64,
@@ -99,7 +93,7 @@ impl NativeKey {
         ]
     }
 
-    /// The key of [`words`](Self::words), or `None` if they aren't one.
+    /// The key of [`words`](Self::words), or `None` if they are not one.
     pub(crate) fn from_words(w: [u64; Self::WORDS]) -> Option<Self> {
         let [build, vaddr, len, crc, hash, flags, mask, rb, rl, wb, wl] = w;
         Some(Self {

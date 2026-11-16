@@ -65,7 +65,7 @@ const fn stype(opcode: u32, f3: u32, rs1: u32, rs2: u32, imm: u32) -> u32 {
         | opcode
 }
 
-/// One random 32-bit instruction that doesn't change control flow.
+/// One random 32-bit instruction that does not change control flow.
 fn long_instruction(r: &mut Rng) -> u32 {
     let (rd, rs1, rs2) = (r.reg(), r.reg(), r.reg());
     let imm = r.next() as u32;
@@ -125,7 +125,7 @@ fn long_instruction(r: &mut Rng) -> u32 {
     }
 }
 
-/// One random 16-bit instruction that doesn't change control flow.
+/// One random 16-bit instruction that does not change control flow.
 fn short_instruction(r: &mut Rng) -> u16 {
     loop {
         let c = r.next() as u16;

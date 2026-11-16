@@ -38,9 +38,7 @@ impl Cpu {
         }
     }
 
-    /// Port of the forking `CPU(Machine&, const Machine&, MachineOptions)`
-    /// constructor: the same registers and execute segment. (Vector
-    /// registers, and with them `preserve_vector_registers`, are Phase 5.)
+    /// Copy registers and the current execute segment for a fork.
     pub(crate) fn fork(&self) -> Self {
         Self {
             regs: self.regs.clone(),
@@ -105,7 +103,7 @@ impl Machine {
     pub fn reset_cpu(&mut self) -> Result<()> {
         self.cpu.regs = Registers::default();
         self.cpu.regs.set(REG_SP, self.memory.stack_initial());
-        // We can't jump if there's been no ELF loader.
+        // Resetting an unloaded machine must not jump to an ELF entry point.
         if !self.cpu.exec.is_empty() {
             let initial_pc = self.memory.start_address();
             // Check that the initial PC is executable.
@@ -158,15 +156,13 @@ impl Machine {
         Ok(&self.cpu.exec)
     }
 
-    /// Port of `CPU::next_execute_segment`: switch to the execute segment
-    /// containing `pc`. If there is none (or only a stale one, which is
-    /// evicted), a new segment is decoded from the executable pages around
-    /// `pc`, the way code mapped at runtime (by a dynamic linker, a JIT or
-    /// FENCE.I-style self-modification) becomes executable. Anything else
-    /// is an execute fault. Returns the PC to continue at and the
-    /// instructions to charge for decoding a segment (not C++, see
-    /// [`MachineOptions::free_decode_bytes`](crate::MachineOptions::free_decode_bytes));
-    /// the caller adds them to its counter and checks the limit.
+    /// Select the execute segment containing `pc` (C++ `CPU::next_execute_segment`).
+    /// Missing or stale segments are decoded from adjacent executable pages;
+    /// non-executable targets fault. Supports runtime mappings and self-modifying code.
+    ///
+    /// Returns the continuation PC and runtime decoding charge; see
+    /// [`MachineOptions::free_decode_bytes`](crate::MachineOptions::free_decode_bytes).
+    /// The caller adds the charge and checks its instruction limit.
     pub(crate) fn next_execute_segment(&mut self, pc: u64) -> Result<(u64, u64)> {
         if let Some(segment) = self.memory.exec_segment_ref(pc)
             && !segment.is_stale()
@@ -185,7 +181,7 @@ impl Machine {
             .clone()
             .unwrap_or_else(|| Arc::new(DecodedSegment::empty()));
 
-        // Look at the page first, to verify that it's executable. (The
+        // Look at the page first, to verify that it is executable. (The
         // default execute fault handler raises the fault; custom handlers
         // and page traps are not ported yet.)
         let pageno = pc / PAGE_SIZE;
@@ -204,7 +200,7 @@ impl Machine {
         let rebuilt_from: Option<Arc<DecodedSegment>> = None;
         // Evict stale execute segments.
         if let Some(segment) = found {
-            // If we already rebuilt for this exact PC and it's stale again,
+            // If this PC was rebuilt already and the segment is stale again,
             // trap instead of spinning forever.
             if pc == self.cpu.stale_restart_pc {
                 return Err(MachineError::trigger(
@@ -239,13 +235,10 @@ impl Machine {
         Ok((pc, (bytes - free) / 4))
     }
 
-    /// A jump out of the current segment to a STOP that begins a block of
-    /// another usable segment (a VM call returning to the exit function):
-    /// the result of switching to that segment and running the STOP
-    /// (`BEGIN_BLOCK`, then [`dispatch::stop`]), without switching. Each switch
-    /// clones and drops a segment `Arc` (atomic operations), and the next
-    /// VM call would switch back. `None` where the switch or the block
-    /// does anything else.
+    /// Handle a jump to a block-start STOP in another usable segment without
+    /// switching segments. Returns the same result as `BEGIN_BLOCK` followed by
+    /// [`dispatch::stop`], avoiding `Arc` updates on VM call returns.
+    /// Returns `None` if switching or executing the block requires other work.
     pub(crate) fn stop_in_other_segment(&mut self, pc: u64, c: Counter) -> Option<(Counter, u64)> {
         let exec = self.memory.exec_segment_ref(pc)?;
         if exec.is_stale() {
@@ -277,7 +270,7 @@ impl Machine {
         while self.counter < self.max_counter {
             let mut pc = self.cpu.regs.pc;
             if !self.cpu.exec.is_within(pc, 2) || self.cpu.exec.is_stale() {
-                // Faults if the new location isn't executable.
+                // Faults if the new location is not executable.
                 let charge;
                 (pc, charge) = self.next_execute_segment(pc)?;
                 if charge > 0 {
@@ -323,7 +316,7 @@ impl Machine {
             .map_or(0, |b| u16::from_le_bytes(*b));
         let mut instr = Instr(u32::from(lo));
         // A 32-bit instruction at a page border: the upper half is on the
-        // next page (which C++ doesn't check for execute permission).
+        // next page (which C++ does not check for execute permission).
         if instr.is_long() {
             let (_, next) = self.memory.get_exec_pageno(pageno.wrapping_add(1))?;
             let hi = next

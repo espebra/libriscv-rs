@@ -4,14 +4,14 @@
 //! `jit` feature the arena is a mapping and large discards hand its pages
 //! back to the kernel (`GuestArena::zero_pages`); a discard that zeroes too
 //! much, too little or the wrong pages shows up here as a mismatch, which
-//! the other harnesses (they only look for panics) wouldn't notice.
+//! the other harnesses (they only look for panics) would not notice.
 
 use libriscv::{Machine, MachineOptions};
 
 /// The arena: big enough for discards well above the size where pages are
 /// dropped (256 KiB), small enough to compare after every input quickly.
 const ARENA: u64 = 8 << 20;
-/// Below this the arena isn't writable without a program.
+/// Below this the arena is not writable without a program.
 const LOW: u64 = 0x10_000;
 
 struct Input<'a>(&'a [u8]);
@@ -87,7 +87,7 @@ pub fn fuzz_arena_discard(data: &[u8]) {
         match op % 4 {
             0 | 1 => {
                 // Fill (the guest writing): only where the arena is
-                // writable, so that a failed write can't desync the shadow.
+                // writable, so that a failed write cannot desync the shadow.
                 let (Some(addr), Some(len), Some(value)) =
                     (input.addr(), input.len(), input.byte())
                 else {

@@ -3,7 +3,7 @@
 //! C++ forwards `ppoll` to the host with the translated descriptors. The
 //! guest's descriptors are standard streams and regular files here, which
 //! never block, so readiness is answered without asking the host:
-//! descriptors that aren't open get `POLLNVAL`, the others are ready for
+//! descriptors that are not open get `POLLNVAL`, the others are ready for
 //! what was asked (stdin only for input, stdout and stderr only for
 //! output). Nothing ever waits, so the timeout is not used.
 

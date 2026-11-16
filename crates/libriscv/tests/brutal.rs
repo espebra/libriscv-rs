@@ -1,10 +1,7 @@
-//! Port of `tests/unit/brutal.cpp`: forks, stepping through programs a few
-//! instructions at a time, and copy-on-write pages of machines without an
-//! arena (all memory in pages). The fork tests that are new here check
-//! what Rust forks promise beyond C++ (the master may change or go away,
-//! forks of forks, forking from several threads) and the page accounting.
-//!
-//! Not ported: "Trapping a cached page" (memory traps, Phase 5).
+//! Port of `tests/unit/brutal.cpp`: forks, incremental execution, and
+//! copy-on-write paging without an arena. Additional tests cover independent
+//! fork snapshots, forks of forks, concurrent forking, and page accounting.
+//! Memory-trap tests remain unimplemented.
 
 #![allow(
     clippy::panic,
@@ -122,16 +119,14 @@ fn calculate_fib_50_slowly() {
     assert_ne!(addr, 0);
 
     // Create a manual VM call in order to avoid exercising the C-runtime.
-    // The goal is to see if the basic start/stop/resume functionality works.
+    // Verify start, stop, and resume behavior.
     machine.cpu.jump(addr).unwrap();
     machine.cpu.set_reg(REG_ARG0, 50);
     machine.cpu.set_reg(REG_RA, machine.memory.exit_address());
 
     let mut fork = machine.fork().unwrap();
     loop {
-        // No matter how many (or few) instructions we execute before
-        // exiting simulation, we should be able to resume and complete the
-        // program normally.
+        // Execution must resume and complete after any slice size.
         for step in 5..105 {
             *fork.cpu.registers_mut() = machine.cpu.registers().clone();
             run_in_steps(&mut fork, step);
@@ -155,9 +150,7 @@ fn execute_libc_start_main_slowly() {
     };
     let mut machine = booted(&binary, &["brutal", "50"]);
     loop {
-        // No matter how many (or few) instructions we execute before
-        // exiting simulation, we should be able to resume and complete the
-        // program normally.
+        // Execution must resume and complete after any slice size.
         // The forks are independent, so they run on all cores. Besides
         // speed (this was the slowest test in a debug build), that forks
         // one shared machine from many threads at once and runs forks that
@@ -213,9 +206,7 @@ fn threads_test_suite_slowly() {
         100_000
     };
     loop {
-        // No matter how many (or few) instructions we execute before
-        // exiting simulation, we should be able to resume and complete the
-        // program normally.
+        // Execution must resume and complete after any slice size.
         let mut fork = machine.fork().unwrap();
         fork.set_printer(|_, _| {});
         run_in_steps(&mut fork, step);

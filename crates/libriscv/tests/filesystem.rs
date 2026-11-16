@@ -73,7 +73,7 @@ fn syscall(m: &mut Machine, number: u64, args: &[u64]) -> i64 {
 
 /// Scratch guest memory: a bump allocator over the (writable) arena of
 /// an empty machine, per thread. Machines are short-lived and only hold
-/// strings and buffers, so reuse across machines doesn't matter.
+/// strings and buffers, so reuse across machines does not matter.
 fn alloc(len: u64) -> u64 {
     thread_local!(static NEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(0x40000) });
     NEXT.with(|next| {
@@ -149,7 +149,7 @@ fn filter_sees_normalised_absolute_paths() {
         }));
     });
 
-    // `..` can't climb out of the admitted prefix.
+    // `..` cannot climb out of the admitted prefix.
     let escape = dir.path("allowed/../secret");
     assert_eq!(open(&mut m, &escape), -EPERM);
     assert_eq!(open(&mut m, &dir.path("allowed/x/../../secret")), -EPERM);
@@ -179,7 +179,7 @@ fn filter_sees_normalised_absolute_paths() {
     assert_eq!(openat(&mut m, dfd as u64, "../secret"), -EPERM);
     assert_eq!(seen.lock().unwrap().last().unwrap(), &dir.path("secret"));
 
-    // Relative to AT_FDCWD there's no host directory; empty is ENOENT.
+    // Relative to AT_FDCWD there is no host directory; empty is ENOENT.
     assert_eq!(open(&mut m, "x"), -EBADF);
     assert_eq!(open(&mut m, ""), -ENOENT);
 }
@@ -245,7 +245,7 @@ fn special_files_are_refused_without_blocking() {
             let _ = std::fs::OpenOptions::new().write(true).open(release);
         },
     );
-    // The FIFO, and a link to it, are refused; faccessat doesn't probe it.
+    // The FIFO, and a link to it, are refused; faccessat does not probe it.
     assert_eq!(results, [-EACCES, -EACCES, -EACCES]);
 
     // A link to a regular file is followed.

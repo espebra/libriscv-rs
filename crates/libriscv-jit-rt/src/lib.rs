@@ -1,85 +1,60 @@
-//! Executable memory and entry into JIT-compiled code for `libriscv`.
+//! Executable memory and native entry for `libriscv`.
 //!
-//! This is the only crate in the workspace that contains `unsafe` code, and it
-//! is only built with `libriscv`'s optional `jit` (or `aot-dylib`) feature. `libriscv` itself
-//! stays `#![forbid(unsafe_code)]`: it generates machine code with Cranelift
-//! (whose API is safe), and hands the finished bytes to [`CodeMemory`], which
-//! maps them executable and enters them.
+//! This is the workspace's only crate containing unsafe code, built with `jit`
+//! or `aot-dylib`. `libriscv` enforces `#![forbid(unsafe_code)]` and passes
+//! Cranelift output to [`CodeMemory`] for mapping and execution.
 //!
 //! # Trust boundary
 //!
-//! Entering generated code can't be checked by the compiler. What this crate
-//! does guarantee:
+//! The runtime validates:
 //!
-//! * Code is only ever entered through the trampoline, at a function start
-//!   the code generator registered in the entry table (checked at
-//!   construction), never at an arbitrary address.
-//! * Every pointer the code receives comes from a Rust borrow that outlives
-//!   the call (the [`HostParts`] of the [`Host`] it is entered with), and
-//!   the guest-memory windows it may access are validated against the
-//!   arena's real length, including the widest (8-byte) access.
-//! * The code calls back into the host only through the host-call
-//!   trampoline in the state block ([`Host::call`]), which gives the host
-//!   back all of itself. Afterwards the trampoline takes the host's parts
-//!   again and validates them as on entry, and tells the code to leave if
-//!   they no longer fit, or if the arena moved (the code keeps its arena
-//!   pointer in registers, in its callers too). The register files can't
-//!   move: they are inside the host, which stays borrowed; the process
-//!   aborts if a host breaks that.
+//! * Entry occurs through the trampoline at a registered function start.
+//!   Entry-table offsets are checked during construction.
+//! * Register and arena pointers come from [`HostParts`] borrows that outlive
+//!   the call. Memory windows fit the arena, including the widest 8-byte access.
+//! * Host callbacks use the state block's trampoline ([`Host::call`]), which
+//!   temporarily restores access to the complete host. Afterwards it reacquires
+//!   host parts and validates changed layouts. A moved arena or invalid layout
+//!   forces a native exit. Register files must remain at their borrowed
+//!   addresses; moving them aborts the process.
 //!
-//! What it relies on, and `libriscv`'s code generator must uphold (see its
-//! `jit` module):
+//! The code generator must uphold these requirements:
 //!
-//! * Guest memory is accessed only as `arena[addr]` for accesses of at most
-//!   8 bytes where `addr - read_base < read_len` (loads) or
-//!   `addr - write_base < write_len` (stores), unsigned and wrapping, with
-//!   the windows the code was built for ([`MemoryLayout`]): they are
-//!   constants in the code, and [`CodeMemory::enter`] refuses to run it
-//!   unless they lie inside the windows of the host's [`HostParts`]. Or, in code
-//!   built with an address mask `m`, as `arena[addr & m]`, unchecked:
-//!   [`CodeMemory::enter`] refuses to run such code unless `m` plus the
-//!   widest access fits in the arena.
-//! * Only the 32 integer registers behind `regs`, the 32 floating-point
-//!   registers behind `fregs` and the fields of [`JitState`] are accessed
-//!   besides guest memory.
-//! * After a host call, the counter is read from the state block, and if
-//!   the call returned non-zero, the code (and every native caller) leaves
-//!   without touching guest memory, with [`JitState`]'s exit as the host
-//!   call left it.
-//! * Control only moves between functions of the same [`CodeMemory`], by
-//!   tail calls and calls, direct or through the entry table, and every
-//!   function returns to its caller (another function of the same
-//!   [`CodeMemory`], or the trampoline). The one other call is the host
-//!   call, through the state block's `host_call`, with the state block as
-//!   its first argument.
+//! * Arena accesses are at most 8 bytes and use unsigned, wrapping checks:
+//!   `addr - read_base < read_len` for loads or
+//!   `addr - write_base < write_len` for stores. Compiled windows must fit
+//!   the host's windows. Alternatively, masked code uses `arena[addr & m]`,
+//!   with `m` plus the widest access fitting the arena. [`CodeMemory::enter`]
+//!   validates both layouts.
+//! * Other memory accesses are limited to 32 integer registers, 32 FP registers,
+//!   and [`JitState`] fields.
+//! * After host callbacks, code reloads the counter. A nonzero callback result
+//!   makes the code and all native callers exit without touching guest memory,
+//!   preserving the callback's [`JitState`] exit fields.
+//! * Control transfers remain within one [`CodeMemory`] through direct or
+//!   entry-table calls and tail calls. Functions return to another function
+//!   in the same image or its trampoline. Host callbacks use `host_call` with
+//!   the state block as the first argument.
 //!
 //! # Cached code
 //!
-//! Besides code fresh from Cranelift, [`CodeMemory`] can run code that
-//! `libriscv` compiled in an earlier run and saved as an object file (see
-//! its `jit_cache` module): linked into the host program ([`embedded_units`])
-//! or into a shared object loaded at run time ([`load_shared_object`]). Such
-//! code is trusted exactly like any other native code of the process: it is
-//! not, and cannot be, verified. `libriscv` only uses it for the segment
-//! (whose exact guest code each unit stores), memory layout and build it
-//! was compiled for, which keeps a stale or mismatched file from being run,
-//! but not a malicious one from running its own native code: only load
-//! files you trust. [`effective_uid`] is for `libriscv`'s checks that
-//! cache files and directories belong to the user running it.
+//! [`CodeMemory`] also runs prior JIT output linked into the host
+//! ([`embedded_units`]) or loaded from shared objects ([`load_shared_object`]).
+//! Native code is trusted and cannot be verified here. `libriscv` checks exact
+//! guest bytes, layout, and build to reject mismatched cache entries; these
+//! checks do not validate malicious native objects. Load only trusted files.
+//! [`effective_uid`] supports cache file and directory ownership checks.
 //!
 //! # Translations
 //!
-//! The [`aot`] module loads `libriscv`'s ahead-of-time translations (safe
-//! Rust, compiled into a shared object) for the `aot-dylib` feature: the
-//! `dlopen` and the call across the C boundary.
+//! The [`aot`] module loads AOT Rust shared objects for `aot-dylib` and handles
+//! the `dlopen` and C-call boundaries. Translated bodies remain safe Rust.
 //!
 //! # Guest arenas
 //!
-//! [`GuestArena`] is `libriscv`'s flat guest memory when built with `jit`:
-//! an anonymous mapping that derefs to `[u8]`, over whose low pages a
-//! sealed [`RodataImage`] of the program can be mapped copy-on-write, so
-//! that machines loaded from the same program share its text and rodata
-//! (see the `arena` module).
+//! With `jit`, [`GuestArena`] provides flat memory as an anonymous mapping
+//! exposed as `[u8]`. A sealed [`RodataImage`] can be mapped copy-on-write over
+//! its initial pages to share program text and read-only data; see `arena`.
 
 use std::any::Any;
 use std::io;
@@ -115,22 +90,17 @@ pub fn effective_uid() -> u32 {
 /// The largest guest memory access generated code makes, in bytes.
 pub const MAX_ACCESS: u64 = 8;
 
-/// The guest memory layout generated code is built for, see the crate
-/// documentation: a non-zero `mask` (masked accesses, no windows), or the
-/// `(base, len)` windows of the arena that loads and stores check against.
-/// Also whether the code ignores the instruction limit (`unlimited`: it
-/// neither counts instructions nor checks the limit), which is baked into
-/// the code the same way.
+/// Native memory layout: a nonzero address mask, or checked `(base, len)`
+/// arena windows. `unlimited` disables native counting and limit checks.
+/// These settings are constants in generated code; see the crate documentation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MemoryLayout {
     pub mask: u64,
     pub read: (u64, u64),
     pub write: (u64, u64),
     pub unlimited: bool,
-    /// The code doesn't guard checked accesses and entry table lookups
-    /// against speculation past their bounds checks (Spectre v1), which is
-    /// faster; for guests that are trusted. Baked into the code like the
-    /// rest.
+    /// Disable Spectre v1 guards on checked accesses and entry-table lookups.
+    /// Intended for trusted guests. This setting is compiled into the code.
     pub unguarded: bool,
 }
 
@@ -146,18 +116,16 @@ fn window_within(inner: (u64, u64), outer: (u64, u64)) -> bool {
                 .is_some_and(|(i, o)| i <= o))
 }
 
-/// What generated code runs on: the parts of it the code accesses
-/// directly, and the host calls it makes (`libriscv`'s machine).
+/// Host interface for borrowed native state and host callbacks.
 pub trait Host {
     /// Borrow the register files and guest memory for generated code, with
     /// the windows of `arena` that loads and stores may touch.
     fn parts(&mut self) -> HostParts<'_>;
 
-    /// A host call from generated code. The host may change anything but
-    /// where its register files are (the process aborts then);
-    /// `call` carries the counter and limit in and out. Returns true if
-    /// the code may go on; otherwise it leaves with `call`'s exit, as it
-    /// does if the arena moved or the code's windows no longer fit.
+    /// Handle a native callback. Register files must retain their addresses;
+    /// violations abort the process. `call` carries counters and limits in and out.
+    /// Return true to continue, or false to exit with `call`'s outcome. Arena moves
+    /// or incompatible windows also force an exit.
     fn call(&mut self, call: &mut HostCall) -> bool;
 }
 
@@ -185,7 +153,7 @@ pub struct HostCall {
     pub counter: u64,
     /// In and out: the instruction limit.
     pub max: u64,
-    /// The exit to leave with if the code can't go on.
+    /// The exit to leave with if the code cannot go on.
     pub exit_kind: u64,
     pub exit_pc: u64,
 }
@@ -282,8 +250,8 @@ impl JitState {
     }
 
     /// Take the pointers and windows from `parts`. Returns false (leaving
-    /// the windows empty) if a window plus the widest access doesn't fit
-    /// in the arena, or the code's layout doesn't fit the windows (see
+    /// the windows empty) if a window plus the widest access does not fit
+    /// in the arena, or the code's layout does not fit the windows (see
     /// [`CodeMemory::enter`]).
     fn take(&mut self, parts: HostParts<'_>) -> bool {
         self.regs = parts.regs.as_mut_ptr();
@@ -333,7 +301,7 @@ extern "C" fn host_trampoline<H: Host>(
 ) -> u64 {
     // SAFETY: generated code passes the state block it was entered with
     // (the crate's contract), which `CodeMemory::enter` keeps alive and
-    // doesn't touch while the code runs.
+    // does not touch while the code runs.
     #[allow(unsafe_code)]
     let state = unsafe { &mut *state };
     // SAFETY: `host` is the `&mut H` that `CodeMemory::enter` was called
@@ -380,7 +348,7 @@ enum Backing {
     /// Copied into an anonymous executable mapping.
     Mapped { _map: Mmap },
     /// Linked into the program or a loaded shared object; kept loaded by
-    /// the `Arc` if it's the latter.
+    /// the `Arc` if it is the latter.
     Linked { _owner: Option<Arc<SharedObject>> },
 }
 
@@ -524,9 +492,9 @@ impl CodeMemory {
     /// Run the function in table slot `slot` on `host` with `pc` and
     /// `counter` as its arguments and `max` as the instruction limit, until
     /// it returns. Returns `None` (without running anything) if the slot is
-    /// empty, if the host's windows don't fit its arena, if the code's
-    /// address mask doesn't fit in the arena, or if the code's windows
-    /// aren't inside the host's. A panic in a host call resumes here, once
+    /// empty, if the host's windows do not fit its arena, if the code's
+    /// address mask does not fit in the arena, or if the code's windows
+    /// are not inside the host's. A panic in a host call resumes here, once
     /// the code has returned.
     #[allow(unsafe_code)]
     pub fn enter<H: Host>(

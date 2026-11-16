@@ -420,7 +420,7 @@ fn guest_full_path(
 }
 
 /// Run `filter_open` on a normalised guest path: the host path to use, or
-/// `None` when it's denied. With no filter only proxy mode admits paths.
+/// `None` when it is denied. With no filter only proxy mode admits paths.
 fn admit_path(fds: &mut FileDescriptors, guest: &str) -> Option<String> {
     let mut host = guest.to_owned();
     let allowed = match fds.filter_open.as_mut() {
@@ -911,14 +911,14 @@ fn syscall_clock_gettime(m: &mut Machine) -> Result<()> {
 }
 
 /// Port of `nanosleep_clamp_and_penalize`: a guest must not block the host
-/// for long, and sleeping doesn't advance the instruction counter. Clamp
+/// for long, and sleeping does not advance the instruction counter. Clamp
 /// the duration, and charge one instruction per microsecond requested.
 /// Returns the clamped request (seconds clamped, as C++ writes it back;
 /// [`host_sleep`] clamps the whole duration).
 ///
 /// The charge saturates: C++ computes it in an `int64_t` and overflows
 /// (undefined) for requests of 292 years and more, and wrapping it made
-/// `tv_sec = 2^55` free while the host still slept. Below that it's the
+/// `tv_sec = 2^55` free while the host still slept. Below that it is the
 /// same as in C++. Both values are non-negative ([`sleep_request`]).
 fn clamp_and_penalize(m: &mut Machine, sec: i64, nsec: i64) -> (i64, i64) {
     let requested_ns = (sec as u64)
@@ -1172,7 +1172,7 @@ fn syscall_sigaltstack(m: &mut Machine) -> Result<()> {
     let ss = m.sysarg(0);
     let old_ss = m.sysarg(1);
     let tid = m.gettid();
-    // Reading doesn't create per-thread state.
+    // Reading does not create per-thread state.
     let current = m
         .signals()
         .thread_state(tid)
@@ -1303,7 +1303,7 @@ impl Machine {
 
     /// Install the Linux system call set (C++ `setup_linux_syscalls`).
     /// With `filesystem` or `sockets`, the machine gets a file descriptor
-    /// table; the guest still can't open anything until
+    /// table; the guest still cannot open anything until
     /// `fds_mut().permit_filesystem` is set. Sockets are not ported yet.
     /// Combine with [`setup_linux`](Self::setup_linux) for the initial
     /// stack, and [`setup_posix_threads`](Self::setup_posix_threads) for

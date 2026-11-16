@@ -1,21 +1,16 @@
-//! Port of the `dlopen`/`dlsym` loading of translations in `tr_compiler.cpp`
-//! and `tr_translate.cpp`.
+//! Port of translation loading in `tr_compiler.cpp` and `tr_translate.cpp`.
 //!
-//! Loading `libriscv`'s ahead-of-time translations from shared objects.
+//! Loads AOT Rust translations compiled as shared objects with two exports:
 //!
-//! `libriscv`'s `aot` module translates execute segments to safe Rust and
-//! compiles the translation into a `cdylib` that exports two functions:
+//! * [`META_SYMBOL`]: `extern "C" fn() -> RawMeta`, returning metadata words
+//!   for libriscv to parse.
+//! * [`ENTER_SYMBOL`]: `unsafe extern "C" fn(*mut RawCall) -> u8`, entering a
+//!   segment at a decoder entry with borrowed register files and arena.
+//!   See [`AotLibrary::enter`].
 //!
-//! * [`META_SYMBOL`] `extern "C" fn() -> RawMeta`: the translation's
-//!   metadata, `u64` words that `libriscv` parses (its keys and entries);
-//! * [`ENTER_SYMBOL`] `unsafe extern "C" fn(*mut RawCall) -> u8`: run the
-//!   translated code of a segment from a decoder entry, with the guest's
-//!   registers and arena (see [`AotLibrary::enter`]).
-//!
-//! Unlike JIT code, the translated code itself is safe Rust: it can only
-//! touch the registers and the arena it is given, through bounds-checked
-//! slices. What can't be checked is that the shared object really is such
-//! a translation: like any native library, loading it runs its code.
+//! Translated bodies use safe Rust with bounds-checked slices. The loader
+//! cannot verify that a native object contains a valid translation; loading
+//! executes native code and requires a trusted object.
 
 use std::ffi::c_void;
 use std::io;
@@ -125,7 +120,7 @@ impl AotLibrary {
 
     /// Run the translated code of segment `seg` from decoder entry `index`
     /// (see `libriscv::aot::AotEnter` for `io`). Returns false if the code
-    /// couldn't be entered there.
+    /// could not be entered there.
     pub fn enter(
         &self,
         seg: usize,
@@ -147,9 +142,9 @@ impl AotLibrary {
         #[allow(unsafe_code)]
         // SAFETY: the entry function's contract: `call` is valid, its
         // pointers come from the borrows above (32 registers each, and
-        // `arena_len` bytes), which outlive the call and aren't used
+        // `arena_len` bytes), which outlive the call and are not used
         // otherwise until it returns. The translated code behind it is safe
-        // Rust, which can't access anything else.
+        // Rust, which cannot access anything else.
         let entered = unsafe { (self.enter)(&raw mut call) } != 0;
         *io = call.io;
         entered

@@ -85,7 +85,7 @@ fn an_automatic_nbit_address_space_masks_arena_accesses() {
         run(&binary, true, false),
         Err(ExceptionKind::ProtectionFault)
     );
-    // ...and so does the interpreter, which the option doesn't affect.
+    // ...and so does the interpreter, which the option does not affect.
     assert_eq!(
         run(&binary, false, true),
         Err(ExceptionKind::ProtectionFault)

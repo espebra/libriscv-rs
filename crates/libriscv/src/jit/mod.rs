@@ -1,21 +1,14 @@
-//! Port of `asmjit/aj_api.cpp` and the driver of `aj_translate.cpp`, on
-//! Cranelift instead of asmjit: the JIT. Built with the `jit` feature and
-//! enabled per machine with [`MachineOptions::jit`](crate::MachineOptions::jit).
+//! Port of `asmjit/aj_api.cpp` and the `aj_translate.cpp` driver using Cranelift.
+//! Requires `jit`; enable compilation with
+//! [`MachineOptions::jit`](crate::MachineOptions::jit).
 //!
-//! When an execute segment is created, its compilable instructions are
-//! grouped into regions (`codegen::region`) and compiled ([`emit`]).
-//! Decoder entries at block starts that a region can be entered at get the
-//! [`native_enter`] handler, so the interpreter enters native code the
-//! first time it begins such a block, and native code runs until it hits something it doesn't
-//! compile, a fault or the instruction limit. Then the interpreter resumes
-//! with exactly the PC, registers and instruction count it would have had.
+//! New execute segments are analyzed into `codegen::region` regions and compiled
+//! by [`emit`]. Eligible decoder block starts use [`native_enter`]. Native code
+//! returns on unsupported instructions, faults, or instruction limits, preserving
+//! interpreter PC, registers, and counts. [`cache`] saves output for embedding
+//! or loading in later runs.
 //!
-//! The code compiled for a segment can be saved and used again by later
-//! runs, linked into the program or loaded from a shared object; see
-//! [`cache`].
-//!
-//! This module has no `unsafe` code: placing the code in executable memory
-//! and entering it is done by `libriscv-jit-rt`.
+//! This module enforces safe Rust. `libriscv-jit-rt` maps and enters native code.
 //!
 //! [`native_enter`]: crate::dispatch::native_enter
 
@@ -35,21 +28,17 @@ use crate::error::{ExceptionKind, MachineError};
 use crate::machine::Machine;
 use crate::native_code::{EXIT_HOST, NativeCode, NativeExit, NativeSegment};
 
-/// Compile `segment` (for the guest memory layout `layout`, see
-/// [`compile`]) on a new thread (`MachineOptions::jit_background`,
-/// C++ `asmjit_background_callback`), which publishes the result in the
-/// segment ([`DecodedSegment::finish_background_jit`]). Every machine
-/// holding the segment (forks, and machines sharing it through the
-/// process-wide cache) keeps interpreting it meanwhile, and switches to the
-/// compiled copy at its next slice. If no thread can be started, compiles
-/// synchronously instead.
+/// Compile `segment` for `layout` on a worker and publish the result through
+/// [`DecodedSegment::finish_background_jit`]. Machines sharing the segment
+/// continue interpreting until they install the result at a slice boundary.
+/// If thread creation fails, compile synchronously. See `MachineOptions::jit_background`.
 pub(crate) fn spawn_background(
     segment: &Arc<DecodedSegment>,
     layout: MemoryLayout,
     save: Option<Save>,
 ) {
-    /// Publishes "nothing compiled" if the compilation panics, so that
-    /// nobody waits for it forever. (No effect after a real result.)
+    /// Publish an empty result on panic to release compilation waiters.
+    /// Has no effect after a result is published.
     struct Finish(Arc<DecodedSegment>);
     impl Drop for Finish {
         fn drop(&mut self) {
@@ -135,7 +124,7 @@ pub(crate) fn install(exec: &mut DecodedSegment, compiled: Compiled) {
 /// it did; then there is nothing to compile.
 ///
 /// FENCE.I marks every execute segment stale, and the next instruction
-/// fetch rebuilds the segment from memory (as in C++). Code that hasn't
+/// fetch rebuilds the segment from memory (as in C++). Code that has not
 /// changed would compile to the same thing again, which takes the JIT
 /// milliseconds per page: a loop around a FENCE.I would cost that every
 /// iteration, so that a guest's instruction limit no longer bounds the host
@@ -181,8 +170,8 @@ fn compile_and_load(
 /// two minus one), guest addresses are masked instead of bounds-checked
 /// (`MachineOptions::jit_automatic_nbit_address_space`). Otherwise the
 /// code checks them against `layout`'s windows, which are constants in
-/// it (C++ `aj_machine_info`'s baked arena bounds); machines whose
-/// windows don't contain them interpret the segment instead.
+/// it (C++ `aj_machine_info`'s constant arena bounds); machines whose
+/// windows do not contain them interpret the segment instead.
 fn compile(exec: &DecodedSegment, layout: MemoryLayout) -> Option<Image> {
     #[cfg(test)]
     tests::COMPILES.with(|c| c.set(c.get() + 1));
@@ -494,7 +483,7 @@ pub(crate) mod tests {
     #[test]
     fn a_rebuilt_segment_that_stays_valid_is_compiled_once_hot() {
         const J_BACK_4: u32 = 0xFFDF_F06F; // jal x0, -4
-        // Change the page once (t1 isn't 0, so its bytes do change), then
+        // Change the page once (t1 is not 0, so its bytes do change), then
         // loop.
         let page = [
             addi(6, 0, 0x55),
@@ -840,7 +829,7 @@ pub(crate) mod tests {
     /// the one a single thread compiles.
     /// Guest accesses and entry table lookups take their address through a
     /// conditional move (`select_spectre_guard`), so that a mispredicted
-    /// bounds check can't reach outside the arena or the table, even
+    /// bounds check cannot reach outside the arena or the table, even
     /// speculatively.
     #[test]
     fn accesses_and_table_lookups_are_guarded_against_speculation() {
@@ -887,7 +876,7 @@ pub(crate) mod tests {
     #[test]
     fn compiling_on_several_threads_gives_the_same_image() {
         // Many regions: compiled ADDIs separated by system calls (which
-        // aren't compiled), with forward branches between them.
+        // are not compiled), with forward branches between them.
         let mut words = Vec::new();
         for k in 0..400u32 {
             words.push(0x0015_0513 | ((k % 7) << 20)); // addi a0, a0, 1 + k % 7
@@ -919,7 +908,7 @@ pub(crate) mod tests {
     }
 
     /// A loop head inside a decoder block (straight-line code runs into
-    /// it) is a native entry, but its decoder entry isn't patched, since the
+    /// it) is a native entry, but its decoder entry is not patched, since the
     /// interpreter falls through it. A block beginning there must still
     /// enter native code: resuming after a halt at the back-edge, and after
     /// a background compilation arrives mid-loop (the slice ends at the

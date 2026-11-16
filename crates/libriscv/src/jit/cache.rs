@@ -1,9 +1,5 @@
-//! Saving and reusing the Cranelift JIT's code across runs: the JIT
-//! counterpart of C++'s translation cache (`.so` files `dlopen`ed by hash)
-//! and embedded translations (self-registering code linked into the host),
-//! in `tr_translate.cpp`. Unlike C++, nothing is translated to C: the
-//! saved code is exactly what the JIT compiled, so it behaves exactly like
-//! the JIT.
+//! Cache Cranelift JIT output across runs. Corresponds to C++'s translation
+//! cache and embedded translations in `tr_translate.cpp`.
 //!
 //! A machine with a [`JitCacheOutput`] records the [`Image`] of every
 //! segment it compiles. [`JitCacheOutput::write_object`] writes them as one
@@ -17,7 +13,7 @@
 //! object per segment. When a machine creates an execute segment, it first looks for
 //! code for it there (`MachineOptions::jit_cache`); only otherwise does the
 //! JIT compile it. Code is keyed on the segment (address, length, contents,
-//! execute-only, libc fast path), the memory layout baked into the code
+//! execute-only, libc fast path), the memory layout compiled into the code
 //! and a fingerprint of the build ([`build_fingerprint`](super::emit::build_fingerprint)),
 //! so a file from another build, host CPU or memory layout is ignored, not
 //! run.
@@ -36,15 +32,12 @@
 //!
 //! # Trust
 //!
-//! The key's hashes tell segments apart; they are not cryptographic and a
-//! guest can forge segments that collide with any other. So cached code is
-//! only installed for a segment whose bytes are exactly the ones it was
-//! compiled from, which every unit stores: whatever wrote it, its code then
-//! does what the JIT would have compiled for the segment. A [`CacheDir`]
-//! only saves segments whose bytes come from files the host chose (see
-//! there), at most [`MAX_SAVES`] files and [`MAX_SAVE_BYTES`] per process,
-//! and only uses directories and files the process's user owns and nobody
-//! else can write to.
+//! Key hashes are not cryptographic. Each unit stores its original guest code,
+//! and installation requires an exact byte match to prevent collision-based
+//! substitution. A [`CacheDir`] saves only code verified against host-selected
+//! files, subject to [`MAX_SAVES`] and [`MAX_SAVE_BYTES`] per process. Cache
+//! paths must be owned by the effective user and not writable by other users.
+//! Loading native objects still requires trusting their code.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{DirBuilder, OpenOptions, Permissions};
@@ -73,7 +66,7 @@ const META_MAGIC: u64 = u64::from_le_bytes(*b"RVJITM02");
 pub(crate) type CacheKey = NativeKey;
 
 /// The cache key of the segment `segment` describes, or `None` where the
-/// JIT isn't supported.
+/// JIT is not supported.
 pub(crate) fn cache_key(segment: NativeKey) -> Option<CacheKey> {
     Some(segment.with_build(build_fingerprint()?))
 }
@@ -279,15 +272,12 @@ pub(crate) fn lookup(key: &CacheKey, code: &[u8], cache_len: usize) -> Option<Co
     })
 }
 
-/// Load cached JIT code from the shared object at `path` (written by
-/// [`JitCacheOutput::write_shared_object`]) into the process-wide
-/// registry, where every machine with `MachineOptions::jit_cache` finds it.
-/// Returns the number of segments added; segments already registered keep
-/// their code. Code from another build, host CPU or memory layout is never
-/// used, but the object is loaded anyway (it stays loaded for good).
+/// Load a shared object produced by [`JitCacheOutput::write_shared_object`]
+/// into the process-wide cache registry. Returns the number of added segments;
+/// existing entries retain their code. Machines use only matching builds,
+/// CPUs, and layouts, but the object remains loaded even if no entry matches.
 ///
-/// Loading a shared object runs native code from it: only load files you
-/// would also run.
+/// Loading executes native code. Only load trusted objects.
 pub fn load_shared_object(path: impl AsRef<Path>) -> io::Result<usize> {
     let units = libriscv_jit_rt::load_shared_object(path.as_ref())?;
     let mut guard = registry();
@@ -303,35 +293,24 @@ pub fn registered_segments() -> usize {
         .map_or(0, |r| r.units.values().map(Vec::len).sum())
 }
 
-/// A directory of cached JIT code that machines use and fill by
-/// themselves (`MachineOptions::jit_cache_dir`): the counterpart of C++'s
-/// translation cache (`translation_cache`, one `dlopen`ed `.so` per
-/// segment hash). Only the segments it [covers](Self::covers) take part.
-/// For each, a machine with `jit` loads the segment's shared object from
-/// the directory if there is one, and otherwise compiles the segment and
-/// writes it there (linking with `$CC` or `cc`), so later runs find it.
+/// Directory cache for selected execute segments (`MachineOptions::jit_cache_dir`).
+/// With `jit`, a matching object is loaded if present; otherwise the segment is
+/// compiled and saved through `$CC` or `cc`. Files are grouped by JIT build
+/// fingerprint and retained indefinitely. Stable code at fixed addresses,
+/// such as the dynamic linker and system libraries, benefits most.
 ///
-/// Meant for code that stays the same from run to run, like a system's
-/// dynamic linker and libraries mapped at fixed addresses (code is keyed
-/// by address): a cached program that is rebuilt often leaves a stale
-/// file for every build. Files are kept per build of the JIT (a
-/// subdirectory named after its fingerprint); nothing is ever removed.
+/// Saving requires exact bytes from a host-selected file: the initial ELF
+/// when [`initial_segment`](Self::initial_segment) is enabled, or a segment
+/// inside [`ranges`](Self::ranges) verified against a pinned host-file mapping.
+/// Files are re-read for comparison. Rebuilt segments are excluded.
 ///
-/// Guest code can't be trusted to pick what is saved, so a segment is
-/// only saved if its bytes came from a file the host chose: the initial
-/// segment with [`initial_segment`](Self::initial_segment), or a segment
-/// in [`ranges`](Self::ranges) whose bytes are those of one of
-/// `FileDescriptors::pinned_mappings`' files, mapped there by `mmap`
-/// (the file is read again to compare). Never a segment rebuilt from
-/// changed code. A process saves at most [`MAX_SAVES`] files
-/// ([`MAX_SAVE_BYTES`] in all), and none to a build subdirectory that
-/// already has [`MAX_DIR_FILES`] entries. Cached code is only used for a
-/// segment with the very bytes it was compiled from.
+/// Per-process limits are [`MAX_SAVES`] files and [`MAX_SAVE_BYTES`] bytes.
+/// Build directories with [`MAX_DIR_FILES`] entries receive no new files.
+/// Loading also requires an exact match with the stored original guest bytes.
 ///
-/// Loading a shared object runs native code from it: the directory, its
-/// build subdirectory and the file must belong to the process's
-/// (effective) user and not be writable by group or others, or nothing is
-/// loaded from or saved to them. Directories it creates get mode 0700.
+/// Cache directories and files must belong to the effective user and must not
+/// be writable by group or others. Created directories use mode 0700.
+/// Loading objects executes native code; cache paths must remain trusted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheDir {
     pub path: PathBuf,
@@ -518,7 +497,7 @@ fn write_new(path: &Path, data: &[u8]) -> io::Result<()> {
 static LOADED_FILES: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
 
 /// Load the cache file `file` into the registry, if it exists, this
-/// process hasn't tried before, and it and its directories are private to
+/// process has not tried before, and it and its directories are private to
 /// this process's user.
 pub(crate) fn load_file(file: &Path, verbose: bool) {
     if !file.exists() {
@@ -628,7 +607,7 @@ pub fn pending_saves() -> usize {
 }
 
 /// Wait until every background compilation that writes to a [`CacheDir`]
-/// has written its file. Background compilations don't keep the process
+/// has written its file. Background compilations do not keep the process
 /// alive: call this before exiting so that their code is saved.
 pub fn wait_for_saves() {
     let mut n = PENDING_SAVES.lock().unwrap_or_else(PoisonError::into_inner);

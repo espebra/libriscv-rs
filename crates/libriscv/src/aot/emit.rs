@@ -1,38 +1,23 @@
-//! Port of `tr_emit.cpp` (the binary translator's emitter, which writes C),
-//! writing safe Rust instead, for the regions of one execute segment. The
-//! instruction selection, region formation and counting are the JIT's
-//! (`codegen`, `jit/emit.rs`), so translated code runs exactly the
-//! instructions the JIT compiles, with the same results and counts.
+//! Port of `tr_emit.cpp`, generating safe Rust for each execute segment.
+//! Instruction selection, regions, and counting are shared with the JIT through
+//! `codegen`.
 //!
-//! Each segment becomes a module, each region a function
-//!
-//! ```text
-//! extern "rust-preserve-none" fn r<N>(s: &mut S, xs: &mut [u64; 32], fr: &mut [u64; 32], m: &mut [u8; N],
-//!     pc: u64, c: u64, d: u32) -> (u64, u64)
-//! ```
-//!
-//! that keeps the guest registers it uses in locals (C++ `use_register_caching`),
-//! dispatches on `pc` in a `loop { match pc { .. } }` whose arms are the
-//! region's entry points (the counterpart of C++'s `_jumptbl` switch: LLVM
-//! threads the constant `pc` of direct transfers into plain branches), and
-//! leaves through one shared exit, which stores the registers the region
-//! wrote and then either returns to the host with an `EXIT_*` kind, or
-//! tail-calls the next region with `become`: directly for direct transfers,
-//! through the segment's entry table for indirect jumps. C++'s translated
-//! functions can't call each other that way (C has no guaranteed tail
-//! calls) and return to the dispatcher instead.
+//! Each region becomes an `extern "rust-preserve-none"` function taking state,
+//! integer and FP register files, the arena, PC, counter, and call depth.
+//! Guest registers are cached in locals and written back on exit.
+//! `structure.rs` emits labeled blocks and loops, with a PC dispatcher as
+//! fallback. Region transfers use `become`, directly or through the entry
+//! table. Guest calls with a return label in the caller's region use native
+//! calls; guest returns propagate their targets to native callers.
 //!
 //! # Memory safety
 //!
-//! The generated code is safe Rust (`forbid(unsafe_code)`): it can't touch
-//! anything but the registers, the arena and its own state, whatever it
-//! does. The arena is a `&mut [u8; N]`, where `N` covers the windows of the
-//! layout the code is built for plus the widest access, so after the
-//! window check every index is provably in bounds and the compiler emits
-//! no second check: one compare per access, as in C++. An access outside
-//! the windows leaves at that instruction (`EXIT_SLOW`), like the JIT's.
-//! With an N-bit address space the address is masked instead, and there is
-//! no check at all.
+//! Generated code enforces `forbid(unsafe_code)` and accesses only its state,
+//! register files, and arena. The arena is `&mut [u8; N]`, covering the layout's
+//! windows plus the widest access. Window checks let the compiler eliminate
+//! redundant slice bounds checks. Out-of-window accesses return `EXIT_SLOW` at
+//! the faulting instruction for interpretation. N-bit layouts mask addresses
+//! instead of checking windows.
 
 use std::fmt::Write as _;
 
@@ -69,23 +54,14 @@ const INLINE_MAX: usize = 256;
 const INLINE_BUDGET: usize = 1024;
 const INLINE_ALWAYS: usize = 16;
 
-/// Which regions are inlined into their native callers
-/// (`#[inline(always)]`). A native call costs about as much as a small
-/// callee's body: the stores of the registers it may read and the reloads
-/// of those it may write, the callee's loads and stores of its own, and
-/// the caller's spills around the call (`rust-preserve-none` keeps nothing
-/// in registers across it). Inlined, with the call's constant entry, LLVM
-/// folds the callee's entry dispatch, and the registers are plain values
-/// again (given the `noalias` register files, see `F`): with
-/// [`address_taken`], CoreMark went from 597k host instructions and 168k
-/// cycles per iteration to 457k and 135k, native code's speed.
+/// Select regions for `#[inline(always)]` in native callers.
+/// Inlining removes register synchronization and dispatch overhead when LLVM
+/// can resolve the entry and preserve register values through `noalias` borrows.
 ///
-/// A region is inlined only if it never tail-calls (see
-/// [`self_contained`]): LLVM turns a `become` in an inlined body into a
-/// plain call, which would let guest code grow the host stack without
-/// bound. Its native calls past `DEPTH` leave for the host instead of
-/// tail-calling. Inlined callees count towards their callers' size, so
-/// copies don't multiply; a cycle of calls is not inlined.
+/// Only self-contained regions qualify; see [`self_contained`]. LLVM can turn
+/// an inlined `become` into a regular call, so such regions exit to the host
+/// past `DEPTH` instead of tail-calling. Recursive call cycles are excluded,
+/// and inlined callees count toward the caller's size budget.
 fn inlined(exec: &DecodedSegment, a: &Analysis, devirt: &[(u64, RegionId)]) -> Option<Vec<bool>> {
     let n = a.regions.len();
     // Each region's native callees (with repeats), and its call sites.
@@ -106,7 +82,7 @@ fn inlined(exec: &DecodedSegment, a: &Analysis, devirt: &[(u64, RegionId)]) -> O
     }
     // Sizes with the inlined callees, in post-order (iteratively: guest
     // call chains may be long); a callee still on the stack is a cycle,
-    // which isn't inlined.
+    // which is not inlined.
     #[derive(Clone, Copy, PartialEq)]
     enum State {
         New,
@@ -804,12 +780,12 @@ impl<'a> RegionWriter<'a> {
             (pc, k)
         };
         let all: Vec<(u64, u64)> = r.entries.iter().map(count).collect();
-        // Every label an entry, if that doesn't grow the code much: an
+        // Every label an entry, if that does not grow the code much: an
         // entry inside a loop needs a copy of the loop (see `structure`),
         // and the return address of every call in a loop is one.
         // Otherwise no entries inside loops (but at their headers): what
         // arrives there from the host or the entry table (a return whose
-        // caller isn't waiting natively) goes on in the interpreter, which
+        // caller is not waiting natively) goes on in the interpreter, which
         // enters native code again at the next entry. The dispatcher is
         // the last resort.
         let (control, kept) = structure(&w.arms, &all, ALL_ENTRIES_GROWTH, true)
@@ -976,7 +952,7 @@ impl<'a> RegionWriter<'a> {
                 }
                 self.branch(target);
             }
-            // Every in-region target is an entry; be safe anyway.
+            // Validate the target even though region analysis guarantees an entry.
             Some(r) if r == self.region => self.leave(EXIT_JUMP, target),
             Some(r) => {
                 self.calls.insert(r);
@@ -1315,7 +1291,7 @@ impl<'a> RegionWriter<'a> {
 
     /// The offset spans `(lo, hi)` of the loads and of the stores through
     /// `rs1` from the instruction at `self.pos` to the end of its
-    /// straight-line run (the next label, or an instruction that doesn't
+    /// straight-line run (the next label, or an instruction that does not
     /// fall through), up to and including the first instruction that writes
     /// `rs1`: what a check made there can cover. (The JIT's `check_spans`.)
     fn check_spans(&self, rs1: u32) -> (Option<Span>, Option<Span>) {
@@ -1675,7 +1651,7 @@ impl<'a> RegionWriter<'a> {
                     FInt::Lu => "lu",
                 };
                 let sfx = if dbl { "d" } else { "s" };
-                // DYN: FCSR.frm, which native code can't change (CSR
+                // DYN: FCSR.frm, which native code cannot change (CSR
                 // instructions are interpreted).
                 let mode = if rm == 7 {
                     "frm".to_owned()
@@ -1753,7 +1729,7 @@ fn memory_access(op: JOp) -> Option<(u32, i64, bool)> {
     }
 }
 
-/// True if the window `inner` lies inside `outer` and isn't empty.
+/// True if the window `inner` lies inside `outer` and is not empty.
 fn window_within(inner: (u64, u64), outer: (u64, u64)) -> bool {
     inner.1 != 0
         && inner.0 >= outer.0

@@ -193,7 +193,7 @@ fn rust_vec_within_the_host_copy_budget_copies() {
 }
 
 /// Nested containers share one budget: the inner vector fits on its own,
-/// but the outer one, holding the same inner vector twice, doesn't.
+/// but the outer one, holding the same inner vector twice, does not.
 #[test]
 fn nested_rust_vecs_share_the_host_copy_budget() {
     let mut m = machine();

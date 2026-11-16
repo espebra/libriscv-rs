@@ -90,7 +90,7 @@ fn f32_of(m: &Machine, r: u32) -> f32 {
 fn f64_of(m: &Machine, r: u32) -> f64 {
     f64::from_bits(bits(m, r))
 }
-/// True if the upper half isn't all ones (C++ `i32[1] != 0xFFFFFFFF`).
+/// True if the upper half is not all ones (C++ `i32[1] != 0xFFFFFFFF`).
 #[inline(always)]
 fn unboxed(m: &Machine, r: u32) -> bool {
     (bits(m, r) >> 32) as u32 != u32::MAX

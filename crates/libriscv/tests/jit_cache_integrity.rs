@@ -1,7 +1,7 @@
-//! Cached JIT code can't stand in for other code: a unit is only used for
+//! Cached JIT code cannot stand in for other code: a unit is only used for
 //! a segment with exactly the bytes it was compiled from, even when its
 //! key (whose CRC32-C and hash a guest can forge) says otherwise, and a
-//! cache directory doesn't save code that didn't come from a file the host
+//! cache directory does not save code that did not come from a file the host
 //! chose. In its own test binary, since the registry is process-wide.
 //! Runs native code: meaningful on x86-64 Linux only (skipped elsewhere).
 
@@ -68,7 +68,7 @@ fn hash64(bytes: &[u8]) -> u64 {
     (h ^ bytes.len() as u64).wrapping_mul(PRIME)
 }
 
-/// Machines that don't share segments: each looks its own up.
+/// Machines that do not share segments: each looks its own up.
 fn options() -> MachineOptions {
     MachineOptions {
         memory_max: 1 << 20,
@@ -204,7 +204,7 @@ fn a_forged_key_does_not_select_other_code() {
     assert_eq!(state(&mut m), expected);
 }
 
-/// A cache directory saves no segment the host didn't map from a file:
+/// A cache directory saves no segment the host did not map from a file:
 /// not code given to `init_execute_area` in its ranges (where a guest's
 /// own code would be), only the initial segment it is told to.
 #[test]

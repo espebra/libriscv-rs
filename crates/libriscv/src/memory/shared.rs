@@ -1,26 +1,17 @@
-//! Port of `shared_rodata.hpp`/`shared_rodata.cpp` and of
-//! `Memory::prepare_shared_rodata`/`publish_shared_rodata` (`memory.cpp`):
-//! machines loaded from the same program map one sealed image of its
-//! read-only memory over the low part of their arenas, so that its text and
-//! rodata exist in host memory once.
+//! Port of `shared_rodata.hpp`, `shared_rodata.cpp`, and
+//! `Memory::prepare_shared_rodata`/`publish_shared_rodata`.
 //!
-//! The image covers guest memory `[0, end)`, where `end` is the page-aligned
-//! end of the read-only ELF segments (and at most the start of the first
-//! writable one), zeroes below the program included. It is published by the
-//! first machine once it has loaded the program (relocations and all), and
-//! later machines with the same layout and contents attach it *before*
-//! loading, and skip copying the segments it covers.
+//! Machines with identical program bytes and layouts share a sealed image of
+//! `[0, end)`, including zero-filled space below the program. `end` is the
+//! host-page-aligned end of read-only ELF segments, bounded by the first
+//! writable segment. The first machine publishes the relocated image; later
+//! machines attach it before loading and skip covered copies.
 //!
-//! The unsafe half (the arena mapping and the memfd) is
-//! `libriscv_jit_rt::{GuestArena, RodataImage}`; the image is mapped
-//! copy-on-write there, see its documentation. This module is safe. The
-//! feature lives under `jit` because that crate does; without it the arena
-//! is a `Vec<u8>` and nothing is shared.
-//!
-//! Differences from C++: sharing also works with virtual paging and N-bit
-//! arenas (C++ turns it off there, as a store into its read-only mapping
-//! would crash; here it makes a private copy of the page). The image is a
-//! whole number of *host* pages (C++: guest pages).
+//! `libriscv_jit_rt::{GuestArena, RodataImage}` implements mappings and memfds.
+//! Images use copy-on-write, preserving paging and N-bit store semantics.
+//! Requires `jit`; without it, arenas use unshared `Vec<u8>` storage.
+//! Unlike C++, image sizes use host pages and sharing supports virtual paging
+//! and N-bit arenas.
 
 #[cfg(feature = "jit")]
 pub(crate) use enabled::*;
@@ -45,7 +36,7 @@ mod disabled {
         Vec::new()
     }
 
-    /// A vector can't hand pages back: the caller zeroes the bytes.
+    /// A vector cannot hand pages back: the caller zeroes the bytes.
     pub(crate) const fn zero_arena_pages(_: &mut Arena, _: usize, _: usize) -> bool {
         false
     }
@@ -149,7 +140,7 @@ mod enabled {
     static IMAGES: LazyLock<Mutex<Registry>> = LazyLock::new(Mutex::default);
 
     fn images() -> std::sync::MutexGuard<'static, Registry> {
-        // The map stays consistent whatever panicked while holding it.
+        // A panic while holding the lock preserves map consistency.
         IMAGES.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -252,7 +243,7 @@ mod enabled {
         /// program can share its read-only memory, and attach an existing
         /// image of it if there is one, which `binary_load_ph` then skips.
         /// Called before any segment is loaded. Never fails the load: a
-        /// program that can't share just loads normally.
+        /// program that cannot share just loads normally.
         pub(crate) fn prepare_shared_rodata(
             &mut self,
             options: &MachineOptions,
@@ -315,7 +306,7 @@ mod enabled {
                 return;
             }
 
-            // Sorted by address, so that the layout doesn't depend on the
+            // Sorted by address, so that the layout does not depend on the
             // order of the program headers, and verify can walk it once.
             segments.sort_by_key(|s| s.vaddr);
             let shared: Vec<RoSeg> = segments

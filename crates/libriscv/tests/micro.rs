@@ -217,7 +217,7 @@ fn run_code_payload(code: &[u8]) -> libriscv::MachineError {
 
 #[test]
 fn crashing_payload_1() {
-    // The C++ test only requires that this doesn't crash.
+    // The C++ test only requires that this does not crash.
     let _ = run_elf_payload(payloads::PAYLOAD_1_ELF64, false);
     let _ = run_elf_payload(payloads::PAYLOAD_1_ELF64, true);
 }

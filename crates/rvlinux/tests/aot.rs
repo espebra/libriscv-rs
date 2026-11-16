@@ -73,7 +73,7 @@ fn check(elf: &Path, test: &str) {
     let so = scratch(test, "translation.so");
     let rs = scratch(test, "translation.rs");
     let (so_s, rs_s) = (so.to_str().unwrap(), rs.to_str().unwrap());
-    // Translating doesn't change the run.
+    // Translating does not change the run.
     let saved = run(elf, &["--aot-save-shared", so_s, "--aot-save", rs_s]);
     assert_eq!(saved, expected);
     assert!(so.exists() && rs.exists());
@@ -91,7 +91,7 @@ fn check(elf: &Path, test: &str) {
     let none = messages(elf, &["--aot-load", so_s, "--no-aot"]);
     assert!(none.is_empty(), "{none}");
     // Not used for another memory layout (a smaller arena), which the
-    // code has baked in.
+    // compiled code requires.
     let flags = ["--aot-load", so_s, "--memory", "256"];
     assert_eq!(run(elf, &flags), expected);
     let found = messages(elf, &flags);
@@ -174,7 +174,7 @@ fn loading_a_bad_file_fails() {
 /// A translation compiled into `rvlinux` is registered at startup. Builds
 /// a second `rvlinux` with only the `aot` feature (no unsafe code in any
 /// crate of the build), in its own target directory, `target/aot-embed`,
-/// so that it doesn't rebuild or block this one.
+/// so that it does not rebuild or block this one.
 #[test]
 #[ignore = "builds rvlinux again, in target/aot-embed"]
 fn embedded_translation() {
@@ -207,6 +207,6 @@ fn embedded_translation() {
     assert_eq!(out, expected);
     let out = testutil::run_rust_with(&embedded, &elf, &["-a", "-v"], &["arg"]).unwrap();
     assert!(out.stderr.contains("Found translation"), "{}", out.stderr);
-    // Without RVLINUX_AOT_EMBED there's no `aot_embed` module.
+    // Without RVLINUX_AOT_EMBED there is no `aot_embed` module.
     assert!(!out.stderr.contains("No translation"), "{}", out.stderr);
 }

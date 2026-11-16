@@ -7,7 +7,7 @@
 //! native function: a region grows from an entry point along fall-through,
 //! direct branches (so loops stay inside it) and over calls to their return
 //! address, and stops at the entries of called functions, indirect jumps,
-//! instructions it can't compile and instructions an earlier region already
+//! instructions it cannot compile and instructions an earlier region already
 //! claimed. Control moves between regions with native calls (a guest call
 //! whose return address is in the caller's region, see [`super::calls`]) and tail
 //! calls, never through the interpreter. The target of an `auipc`+`jalr`
@@ -41,7 +41,7 @@ pub(crate) struct Insn {
     pub len: u64,
     pub op: JOp,
     /// A FUNCBLOCK entry (C++ `RV32I_BC_FUNCBLOCK`): the last instruction
-    /// of an over-long block, which isn't control flow. The next
+    /// of an over-long block, which is not control flow. The next
     /// instruction begins a new block, after an instruction-limit check.
     pub funcblock: bool,
 }
@@ -91,13 +91,13 @@ impl Analysis {
             .and_then(|i| self.region_of.get(i).copied())
     }
 
-    /// The target of the `jalr` at `insns[i]` when it's a constant: the
+    /// The target of the `jalr` at `insns[i]` when it is a constant: the
     /// instruction before it sets its base register to a constant
     /// (`auipc`, `lui`, `li`) and nothing else reaches the `jalr` (it
-    /// doesn't begin a block and isn't a branch target or the target of a
+    /// does not begin a block and is not a branch target or the target of a
     /// constant `jalr`). Such a `jalr` is never a region entry: native code
     /// jumps to its target without reading the base register, which is
-    /// only right right after the instruction before it.
+    /// only immediately after the instruction before it.
     pub(crate) fn jalr_target(&self, i: usize) -> Option<u64> {
         self.jalr_targets
             .binary_search_by_key(&i, |&(j, _)| j)
@@ -166,7 +166,7 @@ pub(crate) fn analyse(exec: &DecodedSegment) -> Analysis {
         let ends_block = entry.block_bytes() == 0;
         // The entry holds the rewriter's bits; classify the original.
         let instr = exec.read_instruction(pc, end);
-        // SYSTEM entries aren't compiled. Besides the real ones, that
+        // SYSTEM entries are not compiled. Besides the real ones, that
         // keeps native code away from the breakpoints and hot-patched libc
         // functions (`native::libc`) that replace an entry's instruction.
         let op = if entry.invalid || entry.is_system() {
@@ -174,7 +174,7 @@ pub(crate) fn analyse(exec: &DecodedSegment) -> Analysis {
         } else {
             classify(instr, pc)
         };
-        // Block-ending entries that aren't control flow are FUNCBLOCK
+        // Block-ending entries that are not control flow are FUNCBLOCK
         // entries (over-long blocks). They run the precise handler, which
         // for everything `classify` accepts does what the fast one does
         // (the fast handlers defer to it for their quirks), apart from the
@@ -264,8 +264,8 @@ fn form_regions(exec: &DecodedSegment, a: &mut Analysis) {
         }
     }
     // Function entries: what calls go to. A call's return address that is
-    // one (after a call that doesn't return) begins another function, and
-    // doesn't join the caller's region.
+    // one (after a call that does not return) begins another function, and
+    // does not join the caller's region.
     let mut functions = BTreeSet::new();
     seeds.extend(a.jalr_targets.iter().map(|&(_, t)| t));
     for (i, ins) in a.insns.iter().enumerate() {
@@ -432,7 +432,7 @@ mod tests {
         assert_eq!(a.jalr_target(1), Some(V + 8));
     }
 
-    /// The size limit doesn't separate a constant `jalr` from the constant
+    /// The size limit does not separate a constant `jalr` from the constant
     /// before it: as the first instruction of a region, it would be an
     /// entry, reached with any base value.
     #[test]
@@ -472,7 +472,7 @@ mod tests {
         for i in before..before + 8 {
             assert_eq!(region(i), first, "loop instruction {i}");
         }
-        // The code after the loop isn't: a region doesn't grow any further.
+        // The code after the loop is not: a region does not grow any further.
         assert_ne!(region(before + 8), first);
         assert!(
             a.regions

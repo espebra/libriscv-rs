@@ -138,7 +138,7 @@ impl Signals {
     }
 
     /// Per-thread state, created on first use. For reading, use
-    /// [`thread_state`](Self::thread_state), which doesn't create it.
+    /// [`thread_state`](Self::thread_state), which does not create it.
     pub fn per_thread(&mut self, tid: i32) -> &mut SignalPerThread {
         self.per_thread.entry(tid).or_default()
     }
@@ -150,9 +150,8 @@ impl Signals {
         self.per_thread.get(&tid)
     }
 
-    /// Forget the state of a thread that exited. C++ keeps it in its map
-    /// forever, and TIDs aren't reused, so a guest could grow host memory
-    /// (outside `memory_max`) by a kilobyte per thread it creates.
+    /// Remove per-thread signal state after exit, bounding storage by live threads.
+    /// C++ retains exited thread state despite never reusing TIDs.
     pub(crate) fn erase_thread(&mut self, tid: i32) {
         self.per_thread.remove(&tid);
     }
@@ -212,7 +211,7 @@ impl Machine {
             frame::SI_UNION,
             &(crate::threads::MAIN_THREAD_TID as u32).to_le_bytes(),
         );
-        // ucontext: no flags, no linked context, the stack we are running on
+        // ucontext: no flags or linked context; record the current stack
         let uc = frame::SIGINFO_SIZE;
         put(&mut f, uc + frame::UC_STACK, &stack.ss_sp.to_le_bytes());
         put(
@@ -230,7 +229,7 @@ impl Machine {
             uc + frame::UC_SIGMASK,
             &u64::from(sigact.mask).to_le_bytes(),
         );
-        // mcontext: the PC we would have resumed at, then x1 to x31. The FP
+        // mcontext: resume PC followed by x1 through x31. The FP
         // state is left zeroed.
         put(
             &mut f,
@@ -255,7 +254,7 @@ impl Machine {
         if trampoline != 0 {
             self.cpu.set_reg(REG_RA, trampoline);
         }
-        // We are mid-instruction: the dispatcher adds 4.
+        // Compensate for the dispatcher's 4-byte instruction advance.
         self.cpu.jump(sigact.handler.wrapping_sub(4))
     }
 
@@ -277,7 +276,7 @@ impl Machine {
             .copy_from_guest(&mut gregs, uctx_addr.wrapping_add(frame::MCONTEXT as u64))
             .is_err()
         {
-            // A handler that lost its stack can't be resumed from the
+            // A handler that lost its stack cannot be resumed from the
             // ucontext: fall back to the state saved on entry.
             self.cpu.regs = saved;
             return Ok(());
@@ -295,7 +294,7 @@ impl Machine {
         for i in 1..32u32 {
             self.cpu.set_reg(i, word(i as usize));
         }
-        // We are mid-instruction: the dispatcher adds 4.
+        // Compensate for the dispatcher's 4-byte instruction advance.
         self.cpu.jump(word(0).wrapping_sub(4))
     }
 }

@@ -24,7 +24,7 @@ libfuzzer-sys = "0.4"
 libriscv = { path = "../crates/libriscv", default-features = false, features = ["ext-a", "ext-f", "ext-v"] }
 
 # Not part of the main workspace: cargo-fuzz needs nightly sanitizer flags
-# and libFuzzer, which `cargo test` shouldn't build.
+# and libFuzzer, which `cargo test` should not build.
 [workspace]
 members = ["."]
 

@@ -1,19 +1,12 @@
-//! Port of `fuzz/fuzz.cpp`: the libFuzzer harnesses, one function per
-//! C++ fuzzing mode. The `fuzz_targets/` binaries are one-line wrappers, so
-//! a crashing input can also be replayed from a plain test.
+//! Port of `fuzz/fuzz.cpp`: one libFuzzer harness per C++ fuzzing mode.
+//! `fuzz_targets/` provides wrappers; ordinary tests can replay inputs directly.
+//! Machine errors are expected. Host panics, aborts, and hangs are bugs.
+//! `FUZZ_NAT` excludes unimplemented native thread system calls.
 //!
-//! Errors are expected and ignored (C++ catches every exception); any panic,
-//! abort or hang is a bug, as guest input must never take down the host.
-//!
-//! `FUZZ_NAT` (`fuzz_native_syscalls`) runs without the native thread
-//! system calls, which aren't ported.
-//!
-//! The other harnesses have no C++ counterpart: the Linux personality and
-//! the libc fast path, forks ([`linux`]), the guest C++ containers
-//! ([`guest`]), the Rust guest collections of the scripting API
-//! ([`rust_guest`]), VM calls and dyncalls ([`vmcall`]), the JIT against the
-//! interpreter ([`jitdiff`]) and the arena's contents through discards
-//! ([`arena`]).
+//! Additional targets cover Linux system calls and forks ([`linux`]), the libc
+//! fast path, C++ containers ([`guest`]), Rust collections ([`rust_guest`]),
+//! VM calls and dyncalls ([`vmcall`]), JIT differential testing ([`jitdiff`]),
+//! and arena discards ([`arena`]).
 
 pub mod arena;
 pub mod elf;
@@ -195,7 +188,7 @@ pub fn fuzz_syscall_helpers(data: &[u8]) {
 /// C++ `fuzz_native_syscalls`: run `data[1..]` as code that can call the
 /// native heap (system calls 200-204) and memory (100-114) functions, then
 /// call system call `data[0]` once more with whatever the registers hold.
-/// (C++ also installs the native thread system calls, which aren't ported.)
+/// (C++ also installs the native thread system calls, which are not ported.)
 pub fn fuzz_native_syscalls(data: &[u8]) {
     const MAX_CYCLES: u64 = 10_000;
     let Some((&syscall_id, code)) = data.split_first() else {

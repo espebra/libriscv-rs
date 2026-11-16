@@ -40,7 +40,7 @@ for mode in "${MODES[@]}"; do
 		threaded) flags+=(-DRISCV_THREADED=ON -DRISCV_TAILCALL_DISPATCH=OFF); expect="Threaded dispatch enabled" ;;
 		tailcall)
 			# Needs clang >= 19 for preserve_none; CMake silently falls back
-			# to threaded dispatch otherwise, so we verify below.
+			# to threaded dispatch otherwise; verify the selected mode below.
 			flags+=(-DRISCV_TAILCALL_DISPATCH=ON -DCMAKE_CXX_COMPILER="$(find_clang)")
 			expect="Tail-call dispatch enabled" ;;
 		switch) flags+=(-DRISCV_THREADED=OFF -DRISCV_TAILCALL_DISPATCH=OFF); expect="Switch-based dispatch enabled" ;;

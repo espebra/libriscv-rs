@@ -1,14 +1,11 @@
-//! Rust guest collections, from both sides: port of
-//! `tests/unit/native_rust.cpp` (with `tests/unit/rustbuilder.cpp` as
-//! `testutil::build_rust`).
+//! Rust guest collection interoperability tests, ported from
+//! `tests/unit/native_rust.cpp`. `testutil::build_rust` replaces
+//! `tests/unit/rustbuilder.cpp`.
 //!
-//! The "example_" tests come first: each shows one way a Rust value crosses
-//! the boundary. The tests below them keep the host mirrors honest: field
-//! order, `RawVec` growth, UTF-8 validation and allocation balance.
-//!
-//! What makes all of it work is at the top of the guest program: the guest
-//! installs a `#[global_allocator]` that forwards to the native heap, so
-//! both sides allocate out of the same heap.
+//! The `example_` tests demonstrate ownership and borrowing across VM calls.
+//! Remaining tests verify layout, `RawVec` growth, UTF-8 validation, and
+//! allocation balance. The guest global allocator forwards to the native heap,
+//! allowing either side to allocate and free exchanged collections.
 
 #![cfg(all(feature = "ext-a", feature = "ext-c", feature = "ext-f"))]
 #![allow(
@@ -228,8 +225,7 @@ pub unsafe extern "C" fn __wrap_bcmp(s1: *const u8, s2: *const u8, n: usize) -> 
 	__wrap_memcmp(s1, s2, n)
 }
 
-/// The same FNV-1a that the host computes, so both sides can prove they are
-/// looking at the same bytes.
+/// Compute FNV-1a over the same bytes as the host.
 fn fnv1a(bytes: &[u8]) -> u64 {
 	let mut hash: u64 = 0xcbf29ce484222325;
 	for b in bytes {
@@ -256,8 +252,8 @@ pub extern "C" fn rust_make_greeting() -> String {
 	String::from("A String returned by value from the guest")
 }
 
-/// The same, but with an argument: the hidden pointer takes the first register,
-/// so `count` arrives in the second one.
+/// Return a string with an additional argument. The hidden result pointer
+/// occupies the first register; `count` occupies the second.
 #[no_mangle]
 pub extern "C" fn rust_make_squares(count: usize) -> Vec<u32> {
 	(0..count as u32).map(|i| i * i).collect()
@@ -273,8 +269,7 @@ pub extern "C" fn rust_lends_str() {
 	// Still owned here, and dropped at the end of the function
 }
 
-/// The guest lends the host a whole collection, which is one register holding
-/// the address of its three words.
+/// Borrow a collection through the address of its three-word representation.
 #[no_mangle]
 pub extern "C" fn rust_lends_vec() {
 	let names: Vec<String> = vec![
@@ -284,8 +279,7 @@ pub extern "C" fn rust_lends_vec() {
 	}
 }
 
-/// Collections nest: every element of the outer Vec is itself the three words
-/// of a Vec, which is exactly what the host pushes into it.
+/// Return nested vectors using the same three-word layout for every element.
 #[no_mangle]
 pub extern "C" fn rust_nested_sum(vec: *const Vec<Vec<u32>>) -> u64 {
 	let vec: &Vec<Vec<u32>> = unsafe { &*vec };
@@ -325,9 +319,7 @@ pub extern "C" fn rust_probe_layout(out: *mut usize) {
 	}
 }
 
-/// Forces the allocations that the runtime makes lazily on its first use of
-/// each collection, so that the host can take an allocation baseline which
-/// does not move underneath it afterwards.
+/// Initialize lazy runtime allocations before measuring allocation balance.
 #[no_mangle]
 pub extern "C" fn rust_warmup() {
 	let mut string = String::from("warm");
@@ -339,8 +331,7 @@ pub extern "C" fn rust_warmup() {
 	core::hint::black_box((&string, &vec, &strings, &joined));
 }
 
-/// The capacity that Rust's RawVec ends up with after pushing one element at
-/// a time. The host's reserve() has to arrive at the same number.
+/// Capacity after incremental pushes, used to verify host `reserve` growth.
 #[no_mangle]
 pub extern "C" fn rust_vec_capacity_after(pushes: usize) -> usize {
 	let mut vec: Vec<u32> = Vec::new();
@@ -685,9 +676,7 @@ impl Attributes {
 	}
 }
 
-/// The checksum the host computes over the same tree, with the same operations
-/// in the same (sorted) order, so that both sides can prove they are looking at
-/// the same thing.
+/// Compute the host-equivalent checksum in sorted key order.
 fn checksum_value(value: &Value) -> u64 {
 	match value {
 		Value::Nil => 1,
@@ -712,26 +701,22 @@ fn checksum_attrs(attrs: &Attributes) -> u64 {
 	hash
 }
 
-/// The host built a tree on the guest heap and handed over the pointer. The
-/// guest takes the whole thing with one from_raw, and drops it on the way out:
-/// no rebuilding, and no host-side teardown function either, because the drop
-/// glue walks the tree.
+/// Take ownership of a host-built tree with `from_raw` and free it through
+/// guest drop glue, including nested allocations.
 #[no_mangle]
 pub extern "C" fn rust_attrs_take(ptr: *mut Attributes) -> u64 {
 	let attrs: Box<Attributes> = unsafe { Box::from_raw(ptr) };
 	checksum_attrs(&attrs)
 }
 
-/// The host owns the tree and only lends it out for the duration of the call,
-/// which is the shape an engine handing attributes to a script every frame
-/// wants: nothing is allocated, nothing is freed.
+/// Borrow a host-owned tree for one call without allocation or freeing.
 #[no_mangle]
 pub extern "C" fn rust_attrs_borrow(ptr: *const Attributes) -> u64 {
 	checksum_attrs(unsafe { &*ptr })
 }
 
-/// The guest builds a tree of its own and lends it to the host, which walks it
-/// in place. Seven instructions of guest work, whatever the size of the tree.
+/// Borrow a guest-owned tree from the host. Traversal occurs on the host;
+/// guest work is seven instructions regardless of tree size.
 #[no_mangle]
 pub extern "C" fn rust_attrs_build() -> u64 {
 	let mut attrs = Attributes::new();
@@ -757,8 +742,8 @@ pub extern "C" fn rust_attrs_build() -> u64 {
 	// The guest still owns it, and drops the whole tree here
 }
 
-/// The host fills in a tree the guest owns, through a system call, and the
-/// guest then uses it as its own - including growing it.
+/// Populate a guest-owned tree through a host system call, then mutate it
+/// in the guest.
 #[no_mangle]
 pub extern "C" fn rust_attrs_host_fills() -> u64 {
 	let mut attrs = Attributes::new();
@@ -773,8 +758,8 @@ pub extern "C" fn rust_attrs_host_fills() -> u64 {
 	hash
 }
 
-/// A guest that would rather have a real HashMap gets one for the price of a
-/// collect(). The tree is the interchange shape, not a cage.
+/// Take ownership of host-built attributes and move entries into a guest
+/// `HashMap`, retaining the keys' and values' allocations.
 #[no_mangle]
 pub extern "C" fn rust_attrs_into_hashmap(ptr: *mut Attributes) -> u64 {
 	let attrs: Box<Attributes> = unsafe { Box::from_raw(ptr) };
@@ -792,8 +777,8 @@ pub extern "C" fn rust_attrs_into_hashmap(ptr: *mut Attributes) -> u64 {
 
 // ---------------------------------------------------------------------------
 // Layout probe for the enum and the entry struct, so that a rustc release
-// which lays out #[repr(C, u64)] differently fails here instead of silently
-// reading garbage everywhere else.
+// with a different #[repr(C, u64)] layout fails here instead of
+// incorrectly decoding guest values.
 // ---------------------------------------------------------------------------
 
 /// The offset of the payload of a variant, measured against the enum itself
@@ -1100,7 +1085,7 @@ impl MemoryOpCounter {
 }
 
 /// A block of raw bytes on the native heap. A VM call string argument is
-/// zero-terminated, which a Rust &str isn't, so the tests hand the guest an
+/// zero-terminated, which a Rust &str is not, so the tests hand the guest an
 /// address and a length instead.
 struct GuestBytes {
     addr: u64,
@@ -1263,7 +1248,7 @@ impl RustGuest {
         ]);
 
         machine.simulate(MAX_INSTRUCTIONS).unwrap();
-        // main() doesn't return: it stops the machine from the pause
+        // main() does not return: it stops the machine from the pause
         // dyncall, with everything initialized and ready to be called into
         assert!(!machine.instruction_limit_reached());
         assert!(machine.stopped());
@@ -1280,7 +1265,7 @@ impl RustGuest {
     }
 
     /// Run through every collection once, so that the runtime's lazy
-    /// allocations aren't counted against a test.
+    /// allocations are not counted against a test.
     fn warmup(&mut self) {
         self.call("rust_warmup", ());
     }
@@ -1523,9 +1508,8 @@ fn example_the_guest_takes_ownership_of_a_host_buffer() {
 // Verification of the host mirrors
 // ===========================================================================
 
-/// Rust doesn't stabilize the layout of its collections, so the guest is
-/// asked: a release that moves a field fails here instead of silently
-/// reading garbage everywhere else.
+/// Verify guest collection layouts against the host mirrors so compiler
+/// layout changes produce a test failure.
 #[test]
 fn rust_collection_layout_matches_the_host_mirrors() {
     let Some(mut guest) = RustGuest::boot() else {
@@ -2087,7 +2071,7 @@ fn rust_rawvec_minimum_capacity_per_element_size() {
 }
 
 /// The remaining GuestRustVec operations, checked against the guest where
-/// it can see them and against the heap where it can't.
+/// it can see them and against the heap where it cannot.
 #[test]
 fn rust_vec_host_api_surface() {
     let Some(mut guest) = RustGuest::boot() else {
@@ -2176,7 +2160,7 @@ fn rust_vec_host_api_surface() {
 }
 
 /// The remaining GuestRustString operations. The capacity says whether an
-/// allocation is reused or replaced, which the length can't.
+/// allocation is reused or replaced, which the length cannot.
 #[test]
 fn rust_string_host_api_surface() {
     let Some(mut guest) = RustGuest::boot() else {
@@ -2245,7 +2229,7 @@ fn rust_string_host_api_surface() {
 }
 
 /// Every element of a Vec<String> owns an allocation, so every operation
-/// that removes one has to release it (a Vec<u32> can't catch that).
+/// that removes one has to release it (a Vec<u32> cannot catch that).
 #[test]
 fn rust_vec_of_strings_releases_the_elements_it_drops() {
     let Some(mut guest) = RustGuest::boot() else {
@@ -2672,7 +2656,7 @@ fn rust_attributes_free_the_whole_tree_recursively() {
     assert_eq!(guest.live_allocations(), allocs_before);
     assert!(attrs.is_empty());
 
-    // A freed map is a valid empty one, so freeing twice isn't a double free
+    // A freed map is a valid empty one, so freeing twice is not a double free
     attrs.free(&mut guest.machine).unwrap();
     assert_eq!(guest.live_allocations(), allocs_before);
 }
@@ -2760,7 +2744,7 @@ fn rust_attributes_reject_a_malformed_guest_map() {
     assert!(attrs.validate(m, 1).is_err());
     attrs.validate(m, 2).unwrap();
 
-    // Keys out of order can't corrupt anything (a binary search that misses
+    // Keys out of order cannot corrupt anything (a binary search that misses
     // only fails to find), but is_sorted() reports it
     let first = attrs.entries.get(0).unwrap();
     let second = attrs.entries.get(1).unwrap();
@@ -2788,7 +2772,7 @@ type FlatAttrs = GuestRustAttributes<FlatRustValue>;
 const _: () = assert!(FlatRustValue::SIZE == 8 + RustString::SIZE, "tag + String");
 
 /// A map whose values are all plain values or strings can be copied to the
-/// host in one call. A tree with nested groups can't (its enum has no host
+/// host in one call. A tree with nested groups cannot (its enum has no host
 /// copy: `guest_rust_enum!` without `=> Host`), so iter() is the only
 /// way in, which keeps a nested read from returning a pointer as a number.
 #[test]
@@ -2946,7 +2930,7 @@ fn rust_memcmp_runs_on_the_host() {
         (0, 0xFF, -1),       // right is larger at the very first byte
         (0, 0x00, 0),        // pattern[0] is already 0
         (LEN - 1, 0xFF, -1), // and at the very last one
-        (LEN - 1, 0x00, 1),  // pattern[LEN-1] isn't 0, so left wins
+        (LEN - 1, 0x00, 1),  // pattern[LEN-1] is not 0, so left wins
         (LEN / 2, 0xFF, -1),
     ];
     for (index, value, expected) in cases {
@@ -2961,7 +2945,7 @@ fn rust_memcmp_runs_on_the_host() {
     assert_eq!(guest.live_allocations(), allocs_before);
 }
 
-/// `a == b` doesn't compile to memcmp: LLVM emits the equality-only entry
+/// `a == b` does not compile to memcmp: LLVM emits the equality-only entry
 /// point, __memcmpeq, which has to be wrapped separately.
 #[test]
 fn rust_slice_equality_runs_on_the_host() {

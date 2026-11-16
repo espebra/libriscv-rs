@@ -12,7 +12,7 @@
 //!
 //! Like C++, the handlers have no error paths of their own. The only
 //! fallible bytecodes are the loads and stores, and their fast path, the flat
-//! arena, can't fail. Anything else (the page table, faults) is a separate
+//! arena, cannot fail. Anything else (the page table, faults) is a separate
 //! cold handler that the fast one tail-calls, so the fast handlers carry
 //! no `Result` and need no stack frame.
 
@@ -665,7 +665,7 @@ fp_arith! {
 
 /// Conditional branches (C++ `RV32I_BC_B*`): `PERFORM_BRANCH`, or for the
 /// forward variants `PERFORM_FORWARD_BRANCH`, which skips the counter check
-/// (forward branches can't loop).
+/// (forward branches cannot loop).
 macro_rules! branches {
     ($($(#[$attr:meta])* $name:ident, forward: $fw:expr, |$a:ident, $b:ident| $cond:expr;)*) => {$(
         $(#[$attr])*

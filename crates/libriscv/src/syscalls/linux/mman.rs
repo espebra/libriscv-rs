@@ -364,11 +364,11 @@ mod tests {
         m.memory.saves_to_cache_dir(dir, vaddr, &code, false, false)
     }
 
-    /// A guest can't get code of its own saved to a JIT cache directory
+    /// A guest cannot get code of its own saved to a JIT cache directory
     /// (where later runs would use it in place of a library: the key's
     /// hashes can be forged): only segments whose bytes are a pinned
     /// file's, mapped there, are saved. Its own code in the pinned range
-    /// isn't, nor a library's code it changed.
+    /// is not, nor a library's code it changed.
     #[test]
     fn only_code_from_pinned_files_is_saved_to_the_cache_dir() {
         let dir =

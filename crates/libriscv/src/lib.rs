@@ -1,9 +1,7 @@
-//! Safe-Rust port of [libriscv](https://github.com/libriscv/libriscv), a fast
-//! RISC-V userspace emulator intended for sandboxing and embedded scripting.
-//!
-//! This crate is a work in progress. See `PORTING.md` at the repository root
-//! for the phased plan and the file-by-file mapping from the C++ sources.
-//! Only RV64 is supported.
+//! Rust port of [libriscv](https://github.com/libriscv/libriscv), a sandboxed
+//! RISC-V userspace emulator for embedding and scripting. Supports RV64 only.
+//! See `PORTING.md` at the repository root for architecture, implementation
+//! status, and C++ source mappings.
 //!
 //! # Example
 //!
@@ -12,7 +10,7 @@
 //!
 //! # fn main() -> libriscv::Result<()> {
 //! let binary = std::fs::read("program.elf").unwrap();
-//! // An `Arc<[u8]>`: machines created from clones of it share one copy.
+//! // Machines created from the same `Arc<[u8]>` share the ELF bytes.
 //! let mut machine = Machine::new(binary.into(), MachineOptions::default())?;
 //! machine.setup_minimal_syscalls();
 //! machine.simulate(1_000_000)?;
@@ -21,8 +19,8 @@
 //! # }
 //! ```
 //!
-//! A regular (static) Linux executable, with the Linux system calls, the
-//! initial stack and threads, and read access to one file:
+//! Run a static Linux executable with a Linux stack, system calls, threads,
+//! and read access to `/etc/hostname`:
 //!
 //! ```no_run
 //! use libriscv::{Machine, MachineOptions};
@@ -44,26 +42,23 @@
 //!
 //! # Guarantees
 //!
-//! * No `unsafe` code (`#![forbid(unsafe_code)]`). The optional `jit`
-//!   feature generates code here without `unsafe`; mapping it executable and
-//!   entering it is done by the separate `libriscv-jit-rt` crate.
-//! * Guest-controlled input must never panic the host: every guest fault is
-//!   reported as a [`MachineError`].
+//! * This crate enforces `#![forbid(unsafe_code)]`. The optional `jit` feature
+//!   generates code here; `libriscv-jit-rt` maps and executes it.
+//! * Guest-controlled input must not panic the host. Guest faults are
+//!   reported as [`MachineError`].
 //!
 //! # Toolchain
 //!
-//! Requires the nightly pinned in `rust-toolchain.toml`: instruction dispatch
-//! uses `become` (guaranteed tail calls), mirroring C++ libriscv's
-//! `tailcall_dispatch.cpp`.
+//! Requires the nightly pinned in `rust-toolchain.toml`. Instruction dispatch
+//! uses `become` for guaranteed tail calls, following C++ `tailcall_dispatch.cpp`.
 
 #![forbid(unsafe_code)]
 // Guaranteed tail calls for threaded dispatch (see PORTING.md, "Dispatch").
-// Still marked incomplete upstream; the difftests are our safety net.
+// Differential tests check this incomplete compiler feature.
 #![feature(explicit_tail_calls)]
 #![feature(rust_preserve_none_cc)]
-// Handler entry points aligned to cache lines (`#[rustc_align(64)]`): the
-// threaded interpreter's speed otherwise varies by a few percent with
-// where unrelated code changes happen to place them.
+// Align handler entry points to 64-byte cache lines to reduce
+// layout-dependent interpreter performance variation.
 #![feature(fn_align)]
 #![allow(incomplete_features)]
 
@@ -84,11 +79,10 @@ pub mod instruction;
 mod isa;
 #[cfg(feature = "jit")]
 mod jit;
-/// Saving the Cranelift JIT's code and using it again in later runs: a
-/// cache of compiled code, not a separate compiler. Code saved as an
-/// object file and linked into the program is found automatically; shared
-/// objects are loaded with [`load_shared_object`](jit_cache::load_shared_object).
-/// See [`MachineOptions::jit_cache`], [`MachineOptions::jit_cache_output`]
+/// Save and reuse Cranelift JIT output across runs.
+/// Linked object files are discovered automatically; shared objects are loaded
+/// with [`load_shared_object`](jit_cache::load_shared_object).
+/// See [`MachineOptions::jit_cache`], [`MachineOptions::jit_cache_output`],
 /// and [`MachineOptions::jit_cache_dir`].
 #[cfg(feature = "jit")]
 pub mod jit_cache {
@@ -135,9 +129,9 @@ pub use syscalls::fds::{FileDescriptors, IoctlFilter, OpenFile, PathFilter, Stat
 pub use threads::{MAIN_THREAD_TID, MultiThreading, Thread};
 pub use vmcall::{ArgRegs, CallTarget, OnStack, VmCallArg, VmCallArgs};
 
-/// The default [`MachineOptions::free_decode_bytes`]: 16 MiB, several
-/// times the code a dynamic glibc program maps (`ld.so`, `libc`,
-/// `libstdc++`, `libm` and `libgcc_s` have about 4 MiB of text on riscv64).
+/// Default runtime decoding allowance: 16 MiB.
+/// See [`MachineOptions::free_decode_bytes`]. Dynamic glibc programs typically
+/// map about 4 MiB of text across `ld.so`, `libc`, `libstdc++`, `libm`, and `libgcc_s`.
 pub const FREE_DECODE_BYTES: u64 = 16 << 20;
 
 /// The default [`MachineOptions::jit_background_slice`].

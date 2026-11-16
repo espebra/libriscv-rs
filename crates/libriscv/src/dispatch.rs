@@ -1,32 +1,22 @@
-//! Port of `tailcall_dispatch.cpp` and the slow-path and system handlers of
-//! `bytecode_impl.cpp` (`RV32I_BC_FUNCTION`, `FUNCBLOCK`, `SYSCALL`, ...).
-//! The fast-path bytecodes are in `bytecode.rs`.
+//! Port of `tailcall_dispatch.cpp` and the slow-path and system handlers in
+//! `bytecode_impl.cpp`. Fast bytecodes are defined in `bytecode.rs`.
 //!
-//! Every decoder cache entry stores a handler with the [`Handler`]
-//! signature. A handler executes its instruction and then tail-calls the
-//! handler of the next entry with `become`, so each instruction gets its own
-//! indirect branch and the chain never grows the stack. The chain ends by
-//! returning an [`Exit`] when the instruction counter overflows, the machine
-//! stops, execution leaves the current execute segment, or a fault occurs.
+//! Each decoder entry stores a [`Handler`] function pointer. Handlers execute
+//! one instruction and use `become` to tail-call the next handler, providing
+//! one indirect branch per instruction without stack growth. A chain returns
+//! an [`Exit`] on timeout, stop, segment change, or fault.
 //!
-//! Handlers use the `preserve_none` calling convention (as in C++), so they
-//! save no registers, and get their entry's instruction bits as an argument
-//! (C++ reads `d->instr`), so they don't look up their own entry. Exits are
-//! tail calls too (`halt_exit` etc.): a handler that makes no calls needs no
-//! stack frame.
+//! Handlers use `preserve_none` and receive instruction bits as an argument.
+//! Exits also use tail calls, allowing handlers without other calls to omit
+//! stack frames.
 //!
-//! As in C++, `pc` is not tracked per instruction. On entering a block
-//! (`BEGIN_BLOCK`) `pc` is advanced to the block's last instruction and the
-//! block's instruction count is added to the counter. Only block-ending
-//! instructions (branches, jumps, system instructions) look at `pc`; AUIPC
-//! reconstructs its own address from the entry's distance to the block end.
+//! On block entry, `BEGIN_BLOCK` adds the block's instruction count and sets
+//! `pc` to its last instruction. Only block-ending instructions inspect `pc`;
+//! AUIPC reconstructs its address from the decoder entry's distance to the end.
 //!
-//! The structure follows `tailcall_dispatch.cpp`, but where its observable
-//! behaviour differs from `cpu_dispatch.cpp` (the threaded and switch
-//! dispatch of the default C++ build, which is the test oracle), this
-//! follows `cpu_dispatch.cpp`: the counter is recorded before an
-//! illegal-opcode fault, system calls that stop or change PC resume after
-//! PC, and other SYSTEM instructions retrieve both counters.
+//! Observable behavior follows `cpu_dispatch.cpp`, the default C++ reference:
+//! illegal-opcode faults publish the counter; system calls that stop or change
+//! PC resume after PC; other SYSTEM instructions retrieve both counters.
 
 use std::sync::Arc;
 
@@ -38,19 +28,15 @@ use crate::isa::Op;
 use crate::machine::Machine;
 use crate::registers::REG_ECALL;
 
-/// The signature shared by all handlers: the current execute segment, its
-/// decoder cache (in registers, which saves two loads per instruction), the
-/// index of this handler's decoder entry, the machine, the counters, the
-/// entry's instruction bits (re-encoded by the rewriter for fast bytecodes,
-/// the original instruction otherwise), and the dispatcher's `pc` (the last
-/// instruction of the current block).
+/// Shared handler signature: execute segment, decoder cache, entry index,
+/// machine, counters, instruction bits, and block-ending PC.
+/// Fast bytecodes use re-encoded bits; slow paths retain the original instruction.
+/// Keeping the cache in registers avoids two loads per instruction.
 ///
-/// The order decides the registers (`preserve_none` on x86-64: r12, r13,
-/// r14, r15, rdi, rsi, rdx, rcx, r8, ...). It puts the instruction bits in
-/// rcx: a variable shift takes its count in cl, and the shift immediates
-/// are the low bits of the re-encoded instruction, so the shift handlers
-/// use them in place instead of saving and restoring a live rcx (CoreMark
-/// rv64imafdc: 4.5% fewer cycles than with the counters in rdx/rcx).
+/// Argument order places instruction bits in rcx under x86-64 `preserve_none`.
+/// Shift immediates occupy the low bits, so variable shifts can use cl without
+/// saving another live value. This reduced CoreMark rv64imafdc cycles by 4.5%
+/// compared with counters in rdx/rcx.
 pub(crate) type Handler = extern "rust-preserve-none" fn(
     &DecodedSegment,
     &[DecoderEntry],
@@ -110,8 +96,8 @@ struct Slice {
     end: u64,
     max: u64,
     /// Instructions charged for segment decodes during the slice: they
-    /// don't make deferred compilations hot (a decode of a large area
-    /// mustn't get itself compiled by its own charge).
+    /// do not make deferred compilations hot (a decode of a large area
+    /// must not get itself compiled by its own charge).
     charged: u64,
 }
 
@@ -124,7 +110,7 @@ impl DispatchState {
     }
 
     /// The limit host code (system calls) sees for the chain's limit `max`:
-    /// the real one while running a slice, so slicing isn't observable.
+    /// the real one while running a slice, so slicing is not observable.
     #[inline]
     fn visible_max(&self, max: u64) -> u64 {
         match self.slice {
@@ -206,8 +192,8 @@ pub(crate) fn fault(m: &mut Machine, error: MachineError) -> Exit {
     Exit::Fault
 }
 
-/// A decoder cache index outside the cache. The decoder guarantees this
-/// can't happen; it is handled anyway rather than trusted.
+/// Report an out-of-range decoder index, even though decoder invariants
+/// normally prevent it.
 #[cold]
 #[inline(never)]
 pub(crate) fn bad_entry(m: &mut Machine, pc: u64) -> Exit {
@@ -368,7 +354,7 @@ pub(crate) extern "rust-preserve-none" fn seq<O: Op>(
 
 /// C++ `RV32C_BC_FUNCTION`: a compressed instruction executed through its
 /// precise handler, continuing with the next entry. Unlike
-/// `RV32I_BC_FUNCTION` it doesn't check for a stale segment afterwards.
+/// `RV32I_BC_FUNCTION` it does not check for a stale segment afterwards.
 #[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn cseq<O: Op>(
     exec: &DecodedSegment,
@@ -484,7 +470,7 @@ pub(crate) struct DyncallDone {
 /// published as for an ECALL. The handler can stop or penalize the machine,
 /// but not change PC (a dyncall is never clone-like or an exit), so its
 /// block goes on after it. Shared by the [`dyncall`] bytecode and the JIT's
-/// dyncall exit; `counts` is false for native code that doesn't count.
+/// dyncall exit; `counts` is false for native code that does not count.
 pub(crate) fn run_dyncall(
     exec: &DecodedSegment,
     m: &mut Machine,
@@ -535,7 +521,7 @@ pub(crate) fn dyncall_done(
         .get(exec.index(pc))
         .is_none_or(|e| e.block_bytes() == 0);
     // The block is counted to its end: its instructions after the dyncall
-    // aren't retired yet.
+    // are not retired yet.
     let retired = if ends_block || !counts {
         c.value
     } else {
@@ -553,14 +539,11 @@ pub(crate) fn dyncall_done(
     }
 }
 
-/// A [`Dyncall`](crate::Dyncall) word: the system call numbered by its
-/// immediate, in the middle of its block (not in C++, where a dyncall is a
-/// custom instruction that runs without the counter). A stop, or a penalty
-/// that takes the retired count to the limit, halts right after it with the
-/// exact count; otherwise
-/// the block goes on, and a limit merely crossed by the block's count is
-/// checked at its end, as for any instruction. The JIT's dyncall exit does
-/// the same.
+/// Execute the system call encoded by a [`Dyncall`](crate::Dyncall) immediate.
+/// A stop or penalty reaching the retired-instruction limit halts immediately
+/// after the call with the exact count. Otherwise execution continues, checking
+/// a limit crossed by block counting at the block end. JIT dyncalls use the
+/// same rules. C++ instead treats dyncalls as custom instructions.
 #[rustc_align(64)]
 pub(crate) extern "rust-preserve-none" fn dyncall(
     exec: &DecodedSegment,
@@ -657,7 +640,7 @@ pub(crate) extern "rust-preserve-none" fn system(
     next_block!(exec, cache, i, m, pc, c, 4, true)
 }
 
-/// C++ `execute_invalid`: an entry that can't be executed from the cache.
+/// C++ `execute_invalid`: an entry that cannot be executed from the cache.
 /// Entries without instruction bits (the middle of a 4-byte instruction)
 /// are executed precisely from the segment's code instead.
 #[rustc_align(64)]
@@ -707,7 +690,7 @@ pub(crate) extern "rust-preserve-none" fn execute_invalid(
 ///
 /// The dispatcher loop also calls it directly for unpatched entries that
 /// native code can be entered at (`dispatch_chain`): native entries inside
-/// a decoder block, such as a loop head, which can't be patched because the
+/// a decoder block, such as a loop head, which cannot be patched because the
 /// interpreter falls through them. Then the entry's own handler is the
 /// interpreter's.
 #[rustc_align(64)]
@@ -728,14 +711,14 @@ pub(crate) extern "rust-preserve-none" fn native_enter(
         return bad_entry(m, start);
     };
     // A stale segment is left at the next slow-path instruction, which
-    // native code doesn't check for: interpret it instead. (Nothing native
+    // native code does not check for: interpret it instead. (Nothing native
     // code runs can make the segment stale, so checking once is enough.)
     if exec.is_stale() {
         let handler = jit.original_handler(i).unwrap_or(e.handler);
         become handler(exec, cache, i, m, c, ins, pc)
     }
     let (mut slot, mut entry_pc) = (i, start);
-    // Native code counts the block it begins at, so it's entered with the
+    // Native code counts the block it begins at, so it is entered with the
     // counter from before the block. Code ignoring the limit counts
     // nothing: the block stays counted, and the counter never goes down.
     let counts = !jit.unlimited();
@@ -811,7 +794,7 @@ pub(crate) extern "rust-preserve-none" fn native_enter(
                     Err(exit) => return exit,
                 }
             }
-            // The JIT ran it, and couldn't go on after it.
+            // The JIT ran it, and could not go on after it.
             NativeExit::Dyncalled { pc, done } => (pc, done),
             NativeExit::Fault(err) => return fault(m, err),
             NativeExit::Unavailable if slot == i => {
@@ -944,7 +927,7 @@ impl Machine {
     /// installing finished native code in between. A slice ends at an
     /// instruction-limit check, exactly where a run with that limit would
     /// halt, and the next one begins the block there, as the uninterrupted
-    /// run would have: results and counts don't depend on where the slices
+    /// run would have: results and counts do not depend on where the slices
     /// fall. A compilation that starts during an unsliced run (a segment
     /// created at runtime) begins a slice there (`begin_slice`). Segments
     /// whose compilation is deferred until they are hot also run in slices,
@@ -994,7 +977,7 @@ impl Machine {
                     });
                 }
                 // Continue without publishing the PC: an uninterrupted run
-                // wouldn't have stored it (it's observable after a fault).
+                // would not have stored it (it is observable after a fault).
                 pc = halt_pc;
                 counter = c.value;
                 continue;
@@ -1019,7 +1002,7 @@ impl Machine {
             max,
         };
         let mut pc = pc;
-        // We need an execute segment matching the current PC.
+        // Select the execute segment containing the current PC.
         if !(pc >= self.cpu.exec.exec_begin() && pc < self.cpu.exec.exec_end()) {
             let charge;
             (pc, charge) = self.next_execute_segment(pc)?;

@@ -259,7 +259,7 @@ impl DecodedSegment {
     }
 
     /// True while this segment's compilation is deferred: not started yet,
-    /// and the segment isn't stale (then it never is).
+    /// and the segment is not stale (then it never is).
     #[cfg(feature = "jit")]
     pub(crate) fn jit_deferred(&self) -> bool {
         self.deferred.is_some()
@@ -311,7 +311,7 @@ impl DecodedSegment {
     }
 
     /// True while a background compilation of this segment is running, or
-    /// has finished with native code the holder hasn't switched to yet.
+    /// has finished with native code the holder has not switched to yet.
     #[cfg(feature = "jit")]
     pub(crate) fn jit_outstanding(&self) -> bool {
         self.jit_started.load(Ordering::Acquire) && !matches!(self.jit_done.get(), Some(None))
@@ -499,7 +499,7 @@ impl DecodedSegment {
         data.extend_from_slice(&[0; 4]);
         data.extend_from_slice(code);
         data.extend_from_slice(&[0; 4]);
-        // One extra entry: jumps and branches don't re-check PC after not
+        // One extra entry: jumps and branches do not re-check PC after not
         // branching, so the entry after the last instruction must be invalid.
         let n_entries = (exlen + 8) / DIVISOR;
         let n_entries = usize::try_from(n_entries)
@@ -560,11 +560,9 @@ impl DecodedSegment {
         Ok(())
     }
 
-    /// Port of `CPU::create_block_ending_entry_at`: make the instruction at
-    /// `addr` the last one of its block, by ending the entries before it
-    /// in the same block there. Returns its decoder index; the caller
-    /// replaces the entry. Like C++, the instruction counts of the entries
-    /// before it become 0 with the C extension (a C++ TODO).
+    /// Make `addr` the last instruction of its decoder block
+    /// (C++ `CPU::create_block_ending_entry_at`). Update preceding entries in the
+    /// block and return the patched entry's decoder index for replacement.
     pub(crate) fn create_block_ending_entry_at(&mut self, addr: u64) -> Result<usize> {
         if !self.is_within(addr, 2) {
             return Err(MachineError::new(
@@ -612,7 +610,7 @@ impl DecodedSegment {
             ));
         }
         // The instructions of the block before `addr` (with the C
-        // extension, where an entry's instruction count isn't its distance).
+        // extension, where an entry's instruction count is not its distance).
         let mut starts: Vec<u64> = Vec::new();
         if COMPRESSED {
             let mut a = block_begin_addr;
@@ -630,7 +628,7 @@ impl DecodedSegment {
                 // including the new last one, as without the C extension
                 // (`idxend + 1`). C++ sets 0 here ("TODO: C-extension icount
                 // for breakpoints"), and then a loop falling through into a
-                // breakpoint or a libc fast-path function wasn't counted at
+                // breakpoint or a libc fast-path function was not counted at
                 // all, so it ran past any instruction limit (found by
                 // libcfuzzer). Counting them differs from C++ only where
                 // code reaches the entry by falling through into it.
@@ -721,7 +719,7 @@ impl DecodedSegment {
             }
         }
         // The entry after the last instruction is invalid: jumps and
-        // branches don't re-check PC after not branching.
+        // branches do not re-check PC after not branching.
         cache.resize(n_entries.max(cache.len()), DecoderEntry::invalid(0));
         (cache, dst)
     }
@@ -749,7 +747,7 @@ impl DecodedSegment {
     fn force_funcblock(&mut self, i: usize, instr: Instr) {
         if let Some(e) = self.cache.get_mut(i) {
             // The dyncall bytecode ends a block like FUNCBLOCK does, and
-            // publishes the counter to the handler, which FUNCBLOCK doesn't.
+            // publishes the counter to the handler, which FUNCBLOCK does not.
             e.handler = if Dyncall::valid(instr.whole()) {
                 dispatch::dyncall
             } else {
@@ -803,7 +801,7 @@ impl DecodedSegment {
                     "PC overflow during execute segment decoding",
                     0,
                 ))?;
-                // Crossing the end: likely garbage, force-end the block.
+                // An instruction crossing the segment end must force an invalid block end.
                 if pc > last_pc {
                     self.force_invalid(entry);
                     break;
@@ -820,7 +818,7 @@ impl DecodedSegment {
                     break;
                 }
                 // The last instruction should have ended the block. Since it
-                // didn't, force-end the block here.
+                // did not, force-end the block here.
                 if pc >= last_pc {
                     self.force_invalid(entry);
                     break;
@@ -928,27 +926,25 @@ fn is_regular_compressed(instr: u16) -> bool {
     }
 }
 
-/// What a shared execute segment is keyed on (C++ `SegmentKey`). C++ also
-/// keys on the arena boundaries, which its JIT bakes into the code; the
-/// Cranelift JIT reads them at run time, apart from the N-bit address mask,
-/// which is part of `jit`. Unlike C++, a lookup also compares the code
-/// itself, so a CRC collision never hands a machine someone else's code.
+/// Shared execute-segment cache key (C++ `SegmentKey`).
+/// Includes the native memory layout, libc patches, and backend settings.
+/// Lookups also compare code bytes to reject CRC collisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct SegmentKey {
     pub vaddr: u64,
     pub len: u64,
     pub crc32c: u32,
     pub execute_only: bool,
-    /// The libc fast path patched the segment. (C++ doesn't key on it, so
+    /// The libc fast path patched the segment. (C++ does not key on it, so
     /// a machine without the fast path can get a patched segment there.)
     pub libc_fastpath: bool,
     /// `None` without the JIT, else the guest memory layout its code is
     /// built for (the address mask, or the windows it checks against).
-    /// Machines that don't JIT never get native code this way.
+    /// Machines that do not JIT never get native code this way.
     #[cfg(feature = "jit")]
     pub jit: Option<libriscv_jit_rt::MemoryLayout>,
     /// `None` without translations, else the layout the machine looks
-    /// them up for (`MachineOptions::aot`). Machines that don't use
+    /// them up for (`MachineOptions::aot`). Machines that do not use
     /// translations never get them this way.
     #[cfg(feature = "aot")]
     pub aot: Option<crate::native_code::MemoryLayout>,
@@ -956,7 +952,7 @@ pub(crate) struct SegmentKey {
 
 /// One entry of the process-wide segment cache (C++
 /// `SharedExecuteSegments::Segment`). It refers to the segment weakly: the
-/// machines holding a segment keep it alive, the cache doesn't.
+/// machines holding a segment keep it alive, the cache does not.
 #[derive(Debug, Default)]
 pub(crate) struct SharedEntry {
     segment: Mutex<Weak<DecodedSegment>>,
@@ -979,12 +975,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The sharing part of `Memory::create_execute_segment`
-/// (`use_shared_execute_segments`): the live segment for `key` if one
-/// exists with exactly this `code` and isn't stale, else a new one from
-/// `build`, which gets the cache entry to store in the segment. As in C++,
-/// the entry stays locked while building, so machines decoding the same
-/// code at the same time decode (and compile) it once.
+/// Find a live, non-stale segment with matching `key` and code bytes, or
+/// create one with `build`. The builder receives its cache entry.
+/// The entry remains locked while building so concurrent lookups decode and
+/// compile identical code once (C++ `use_shared_execute_segments`).
 pub(crate) fn shared_segment(
     key: SegmentKey,
     code: &[u8],
@@ -1007,7 +1001,7 @@ pub(crate) fn shared_segment(
         if segment.exec_bytes(segment.begin, segment.end) == Some(code) {
             return Ok(segment);
         }
-        // A collision: keep the registered segment, don't share this one.
+        // A collision: keep the registered segment, do not share this one.
         drop(registered);
         return build(None);
     }
@@ -1174,7 +1168,7 @@ exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.";
         assert!(!std::ptr::eq(segment(&m1), segment(&collider)));
         let (begin, end) = (segment(&collider).begin, segment(&collider).end);
         assert_eq!(segment(&collider).exec_bytes(begin, end), Some(&b[..]));
-        // The collision didn't displace the registered segment.
+        // The collision did not displace the registered segment.
         assert!(std::ptr::eq(segment(&m1), segment(&machine(&a))));
 
         segment(&m1).set_stale(true);

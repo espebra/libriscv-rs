@@ -1,26 +1,17 @@
-//! Port of `threads.hpp` and `posix/threads.cpp`: cooperative guest
-//! threads (green threads) for Linux guests, and the system calls that
-//! drive them (`clone`, `clone3`, `futex`, `sched_yield`, `exit`, ...).
+//! Port of `threads.hpp` and `posix/threads.cpp`: cooperative Linux guest
+//! threads and their system calls (`clone`, `clone3`, `futex`, `sched_yield`,
+//! and `exit`).
 //!
-//! All guest threads run on the machine's one CPU. A thread runs until it
-//! yields, blocks on a futex or exits; switching threads swaps the whole
-//! register file (PC included) inside a system call handler, and the
-//! dispatcher continues after the ECALL of the thread it switched to.
+//! Threads share one CPU and run until yielding, blocking, or exiting.
+//! Switching replaces the register file, including PC, inside a system call
+//! handler. The dispatcher resumes after the selected thread's ECALL.
 //!
-//! Differences from C++, which keeps raw `Thread*` pointers in its
-//! suspended and blocked lists:
-//!
-//! * The lists hold thread IDs. A thread that exits is also removed from
-//!   them; in C++ a thread killed while suspended (`tgkill` on another
-//!   thread) leaves a dangling pointer behind.
-//! * If a listed thread has gone anyway, waking it is skipped.
-//! * A thread is in at most one list, and never while it runs. When the
-//!   running thread exits and nothing is suspended, C++ resumes the main
-//!   thread although it is blocked, and leaves it in the blocked list: it
-//!   gains another entry each time it blocks again (host work growing
-//!   without bound), and a later wakeup can queue it while it runs. Here
-//!   resuming a thread takes it off both lists, and queueing a thread that
-//!   is already listed is an error.
+//! Scheduler lists store thread IDs. Exiting or resuming a thread removes it
+//! from both lists; missing IDs are skipped during wakeup. A running thread
+//! is never listed, and a thread may appear in at most one list. Duplicate
+//! queueing returns an error. These constraints prevent dangling pointers,
+//! unbounded duplicate entries, and multiple runnable instances possible
+//! with C++'s pointer-based lists.
 
 use std::collections::BTreeMap;
 
@@ -133,7 +124,7 @@ impl MultiThreading {
         &self.blocked
     }
 
-    /// Port of `MultiThreading::create`: a new thread that isn't running
+    /// Port of `MultiThreading::create`: a new thread that is not running
     /// yet. Writes the TID where `flags` ask for it.
     fn create(
         &mut self,
@@ -278,10 +269,9 @@ impl Machine {
         }
     }
 
-    /// Port of `MultiThreading::wakeup_next`: resume the first suspended
-    /// thread, or the main thread if none is (which C++ calls an error, but
-    /// does anyway). The main thread is then blocked: it leaves the blocked
-    /// list, as if woken up.
+    /// Resume the first suspended thread, or the main thread if none is suspended
+    /// (C++ `MultiThreading::wakeup_next`). Remove the resumed thread from the
+    /// blocked list, including when the main thread was blocked.
     fn thread_wakeup_next(&mut self) {
         let Some(mt) = self.mt.as_deref_mut() else {
             return;

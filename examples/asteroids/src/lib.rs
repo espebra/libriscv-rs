@@ -1,14 +1,11 @@
-//! Asteroid Dodge's engine: a terminal renderer and frame loop in Rust,
-//! with the game logic in a Rust script that runs inside a sandboxed
-//! RISC-V machine (`guest/`).
+//! Asteroid Dodge host engine: terminal rendering and a frame loop with
+//! sandboxed Rust RISC-V game logic in `guest/`.
 //!
-//! The engine owns the screen, the input, the clock and the score. The
-//! script gets them through host functions, which are system calls (see
-//! [`api`]): the guest calls each with one dyncall, and the engine's
-//! handler reads the arguments with [`Machine::sysargs`], works on
-//! [`HostState`] (the machine's userdata) and stores the result with
-//! [`Machine::set_result`]. Every frame the engine calls the script's
-//! `game_update` with a VM call, under an instruction limit.
+//! The engine owns screen, input, clock, and score state. Guest dyncalls invoke
+//! host system call handlers defined by [`api`]. Handlers decode arguments
+//! with [`Machine::sysargs`], update [`HostState`] userdata, and return values
+//! with [`Machine::set_result`]. Each frame calls `game_update` with an
+//! instruction limit.
 
 pub mod api;
 
@@ -22,7 +19,7 @@ pub const SCREEN_HEIGHT: usize = 24;
 
 /// The native heap the script allocates from.
 const HEAP_SIZE: u64 = 4 << 20;
-/// Instructions the script may run before it's ready (`main()`).
+/// Instructions the script may run before it is ready (`main()`).
 const BOOT_INSTRUCTIONS: u64 = 100_000_000;
 /// Instructions a call into the script may run.
 pub const MAX_INSTRUCTIONS: u64 = 32_000_000;
@@ -61,7 +58,7 @@ impl Screen {
     }
 
     /// Draw a character; positions off the screen are ignored. Only
-    /// printable ASCII is drawn, so a script can't send escape codes to
+    /// printable ASCII is drawn, so a script cannot send escape codes to
     /// the terminal.
     pub fn put(&mut self, x: i32, y: i32, c: u8) {
         let (Ok(x), Ok(y)) = (usize::try_from(x), usize::try_from(y)) else {
@@ -100,8 +97,7 @@ impl Screen {
     }
 }
 
-/// A small deterministic generator (xorshift64*), so that a seed replays a
-/// game exactly.
+/// Deterministic xorshift64* generator for reproducible games.
 #[derive(Debug, Clone)]
 struct Rng(u64);
 
@@ -234,7 +230,7 @@ fn cos_f32(m: &mut Machine) -> Result<()> {
 const MAX_LOG_LINES: usize = 1000;
 /// Bytes a script may keep in the log before the engine takes them. Each
 /// `&str` may be as long as guest memory allows (and every call may pass
-/// the same one), so the line count alone doesn't bound what the host
+/// the same one), so the line count alone does not bound what the host
 /// holds.
 const MAX_LOG_BYTES: usize = 64 << 10;
 
@@ -358,7 +354,7 @@ impl Game {
     }
 
     /// Run one frame: clear the screen, let the script update and draw.
-    /// `input` replaces a key the script hasn't read yet.
+    /// `input` replaces a key the script has not read yet.
     pub fn frame(&mut self, delta_time: f32, input: Option<u8>) -> Result<FrameStats> {
         let s = self.state_mut();
         s.delta_time = delta_time;

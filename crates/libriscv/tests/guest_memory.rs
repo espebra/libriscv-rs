@@ -1,11 +1,7 @@
-//! Host-side guest memory helpers: `Buffer`/`membuffer`, `strlen`,
-//! `memstring_view`, typed `memarray`/`memspan`, `try_memmove`, `memcmp`,
-//! machine-to-machine `memcpy`, `stack_push`, and typed `sysargs` /
-//! `set_result`.
-//!
-//! Ports of `tests/unit/rvbuffer.cpp` and of "Take custom system
-//! arguments" from `tests/unit/custom.cpp` ("Custom instruction" needs
-//! custom instruction handlers and userdata, which aren't ported).
+//! Host guest-memory helper tests: buffers, strings, typed views, copies,
+//! comparisons, stack operations, and system call arguments/results.
+//! Ports `tests/unit/rvbuffer.cpp` and "Take custom system arguments" from
+//! `tests/unit/custom.cpp`. Custom instructions are tested in `custom.rs`.
 
 #![allow(
     clippy::panic,
@@ -81,7 +77,7 @@ fn sequential_buffer() {
     assert_eq!(err.kind, FAULT);
 }
 
-/// rvbuffer.cpp "Boundary buffer": pages past the arena aren't contiguous.
+/// rvbuffer.cpp "Boundary buffer": pages past the arena are not contiguous.
 #[test]
 #[cfg_attr(
     not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),

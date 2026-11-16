@@ -84,7 +84,7 @@ impl GuestStdString {
             return Ok(&[]);
         }
         if self.ptr == 0 {
-            // A size above SSO with a null pointer can't be inline.
+            // A size above SSO with a null pointer cannot be inline.
             return self
                 .data
                 .get(..self.size as usize)
@@ -145,7 +145,7 @@ impl GuestStdString {
 
     /// Release the heap block (C++ `free`). Same caveat as
     /// [`relocate`](Self::relocate): a guest string shrunk below SSO owns a
-    /// heap block this doesn't release.
+    /// heap block this does not release.
     pub fn free(&mut self, m: &mut Machine) -> Result<()> {
         if self.size > Self::SSO {
             guest_free(m, self.ptr)?;

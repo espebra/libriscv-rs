@@ -1,12 +1,7 @@
-//! Harness for the Rust guest collections (`guest/rust_*.rs`, the
-//! scripting API's `GuestRust*` types): host code reading, changing and
-//! freeing Rust `String`s, `Vec`s, `Box`es, enums and attribute maps whose
-//! bytes (pointers, lengths, capacities, tags) the guest controls,
-//! including the recursive attribute tree of the examples, whose boxes can
-//! point anywhere, back up the tree too.
-//!
-//! The collections allocate from the native heap, so this needs no Rust
-//! guest (unlike `crates/libriscv/tests/native_rust.rs`).
+//! Fuzz host access to Rust guest strings, vectors, boxes, enums, and attribute
+//! maps. Input controls pointers, lengths, capacities, and tags, including cyclic
+//! and nested attribute trees. Allocations use the native heap; no compiled
+//! Rust guest is required.
 
 use libriscv::guest::{
     GuestPtr, GuestRustAttributes, GuestRustBox, GuestRustBoxedSlice, GuestRustBoxedStr,

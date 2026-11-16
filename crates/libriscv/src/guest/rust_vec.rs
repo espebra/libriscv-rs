@@ -231,7 +231,7 @@ impl<T> GuestPod for GuestRustVec<T> {
 }
 
 impl<T: GuestPod> GuestRustVec<T> {
-    /// The pointer of a vector that hasn't allocated anything.
+    /// The pointer of a vector that has not allocated anything.
     pub const DANGLING: u64 = rust_dangling::<T>();
     /// The smallest allocation `RawVec` makes for `T`.
     pub const MIN_CAPACITY: u64 = rust_min_capacity::<T>();
@@ -319,8 +319,7 @@ impl<T: GuestType> GuestRustVec<T> {
         Ok(())
     }
 
-    /// Remove the last element and hand it over: the caller owns what it
-    /// owns from here on.
+    /// Remove the last element and transfer ownership to the caller.
     pub fn pop(&mut self, m: &Machine) -> Result<Option<T>> {
         let Some(last) = self.len.checked_sub(1) else {
             return Ok(None);
@@ -377,16 +376,15 @@ impl<T: GuestType> GuestRustVec<T> {
         Ok(())
     }
 
-    /// Make room for at least `additional` more elements, growing the way
-    /// Rust's `RawVec` does. The elements move bytewise, which is all a
-    /// Rust move is.
+    /// Reserve at least `additional` elements using Rust `RawVec` growth rules.
+    /// Elements move bytewise without relocation.
     pub fn reserve(&mut self, m: &mut Machine, additional: usize) -> Result<()> {
         let total = grown_len(self.len, additional, "Guest Rust Vec too large")?;
         self.reserve_total(m, total)
     }
 
-    /// Make room for exactly `additional` more elements, if there isn't
-    /// room already (`Vec::reserve_exact`).
+    /// Reserve exactly `additional` elements if capacity is insufficient
+    /// (`Vec::reserve_exact`).
     pub fn reserve_exact(&mut self, m: &mut Machine, additional: usize) -> Result<()> {
         let total = grown_len(self.len, additional, "Guest Rust Vec too large")?;
         if total <= self.cap {
@@ -426,8 +424,7 @@ impl<T: GuestType> GuestRustVec<T> {
         Ok(())
     }
 
-    /// Drop every element and release the allocation, leaving `Vec::new()`:
-    /// what dropping the vector does in the guest.
+    /// Free all elements and the allocation, then reset to `Vec::new()`.
     pub fn free(&mut self, m: &mut Machine) -> Result<()> {
         self.clear(m)?;
         if self.cap != 0 && T::SIZE != 0 {
@@ -507,7 +504,7 @@ impl<T: GuestType> GuestPtr<GuestRustVec<T>> {
     pub fn extend_from_slice<A: GuestInit<T>>(&self, m: &mut Machine, values: &[A]) -> Result<()> {
         self.modify(m, |v, m| v.extend_from_slice(m, values))
     }
-    /// Remove the last element and hand it over.
+    /// Remove the last element and transfer ownership to the caller.
     pub fn pop(&self, m: &mut Machine) -> Result<Option<T>> {
         self.modify(m, |v, m| v.pop(m))
     }

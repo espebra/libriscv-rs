@@ -1,12 +1,13 @@
 # libriscv-rs
 
-A port of [libriscv](https://github.com/libriscv/libriscv), a fast, sandboxed
-RISC-V userspace emulator for embedding and scripting. The codebase uses
-forbid unsafe, except for the optional Cranelift JIT. The port is modelled on
-libriscv's architecture and internals, making it easy to compare the two
-codebases for differences, with exception for the JIT backend.
+A Rust port of [libriscv](https://github.com/libriscv/libriscv), a sandboxed
+RISC-V userspace emulator for embedding and scripting. The architecture follows
+the C++ implementation, with Cranelift replacing its JIT backend. The library
+uses `#![forbid(unsafe_code)]`. Executable memory and native library loading
+are isolated in `libriscv-jit-rt`.
 
-Currently RV64GCB only.
+Supports RV64 only. See [PORTING.md](PORTING.md) for extension coverage and
+implementation status.
 
 ## Benchmarks
 
@@ -20,7 +21,9 @@ Currently RV64GCB only.
 | coremark.rv64gb.gcc14.2.elf | 2809 | 2863 | 2596 | 17893 | 19131 |
 | coremark-rv64g_zba_zbb | 2655 | 2779 | 2496 | 19559 | 19445 |
 
-Note that this is with instruction counting and bounds-checked memory (~50% native with JIT).
+CoreMark iterations per second with instruction counting and bounds-checked
+memory. JIT execution reaches approximately 2/3 of native performance. See
+[PORTING.md](PORTING.md#coremark-10) for measurement conditions.
 
 ## Building and testing
 
@@ -38,37 +41,33 @@ override with `LIBRISCV_CPP` or `LIBRISCV_CPP_EMULATOR`).
 
 ## JIT code cache
 
-With the `jit` feature (the default), the code Cranelift compiles can be saved and reused
-by later runs: a cache of the JIT's output, not a separate compiler.
+The default `jit` feature supports saving Cranelift output for reuse across runs.
 
 ```sh
-rvlinux --jit-save-shared prog.so prog.elf   # run once, save the compiled code
-rvlinux --jit-load prog.so prog.elf          # later runs skip compiling
-rvlinux -Q --jit-save-object prog.o prog.elf # or save it to link into rvlinux:
+rvlinux --jit-save-shared prog.so prog.elf   # run and save compiled code
+rvlinux --jit-load prog.so prog.elf          # reuse compiled code
+rvlinux -Q --jit-save-object prog.o prog.elf # save an object for linking into rvlinux
 RVLINUX_JIT_EMBED=prog.o cargo build -p rvlinux --features jit
 ```
 
 Saved code is only used with the same build, host CPU and memory layout it
-was compiled for. Shared objects are linked with the system `cc`. In the
-library, see `libriscv::jit_cache` and `MachineOptions::jit_cache_output`.
+was compiled for. Shared objects are linked with the system `cc`. See `libriscv::jit_cache` and `MachineOptions::jit_cache_output`.
 
 ## Ahead-of-time translation to Rust
 
-With the `aot` feature, a program's code can be translated to safe Rust
-ahead of time (the counterpart of C++ libriscv's binary translation to C),
-then compiled into the host program or into a shared object:
+The `aot` feature translates execute segments to safe Rust for compilation
+into the host program or a shared object:
 
 ```sh
 rvlinux -Q --aot-save prog.rs prog.elf          # translate to Rust source
-RVLINUX_AOT_EMBED=prog.rs cargo build -p rvlinux --no-default-features --features aot   # compile it in: no unsafe anywhere
-rvlinux -Q --aot-save-shared prog.so prog.elf   # or compile it with rustc into a shared object
-rvlinux --aot-load prog.so prog.elf             # (feature aot-dylib)
+RVLINUX_AOT_EMBED=prog.rs cargo build -p rvlinux --no-default-features --features aot   # embed the translation
+rvlinux -Q --aot-save-shared prog.so prog.elf   # compile a shared object with rustc
+rvlinux --aot-load prog.so prog.elf             # requires aot-dylib
 ```
 
-Translated code has the interpreter's results and instruction counts, and
-is only used for the segments and memory layout it was made for. Compiling
-needs a nightly `rustc` (`become`), like the rest of the port. In the
-library, see `libriscv::aot` and `MachineOptions::aot_output`.
+Translations preserve interpreter results and instruction counts and require
+matching segments and memory layouts. Compilation requires the pinned nightly
+`rustc` for `become`. See `libriscv::aot` and `MachineOptions::aot_output`.
 
 ## License
 

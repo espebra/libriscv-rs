@@ -59,7 +59,7 @@ fn custom_instruction_handler(m: &mut Machine, instr: Instr) -> libriscv::Result
     Ok(())
 }
 
-/// The handler for unimplemented instructions, selecting our custom
+/// Unimplemented-instruction handler selecting the custom
 /// instruction for a reserved opcode.
 fn on_unimplemented(instr: Instr) -> Option<libriscv::CustomInstruction> {
     (instr.opcode() == 0b101_1011).then_some(custom_instruction_handler)
@@ -86,8 +86,7 @@ fn custom_machine(binary: &[u8]) -> Machine {
     machine.set_on_unimplemented_instruction(on_unimplemented);
     machine.install_syscall_handler(500, syscall_500);
     machine.set_userdata(InstructionState::default());
-    // We need to install Linux system calls for maximum gucciness, and a
-    // Linux environment for runtimes to work well.
+    // Configure Linux system calls and the initial runtime environment.
     machine.setup_linux_syscalls(false, false);
     machine.setup_linux(&["custom_instruction"], &ENV).unwrap();
     machine
@@ -162,7 +161,7 @@ fn userdata() {
 
     machine.set_userdata(5u32);
     assert_eq!(machine.userdata::<u32>(), Some(&5));
-    // The type is checked (C++ casts whatever pointer it has).
+    // The type is checked (C++ casts its stored pointer without a type check).
     assert!(machine.userdata::<u64>().is_none());
     *machine.userdata_mut::<u32>().unwrap() += 1;
     assert!(machine.take_userdata::<u64>().is_none());
@@ -179,7 +178,7 @@ fn userdata() {
     machine.print(b"Hello");
     assert_eq!(shared.load(Ordering::Relaxed), 5);
 
-    // Forks don't get the userdata, as in C++ (nor the printer).
+    // Forks do not get the userdata, as in C++ (nor the printer).
     let fork = machine.fork().unwrap();
     assert!(!fork.has_userdata());
 }
@@ -190,7 +189,7 @@ fn userdata() {
 fn with_userdata() {
     const LOG: usize = 400;
     let mut machine = Machine::new([].into(), MachineOptions::default()).unwrap();
-    // No userdata, or of another type: f isn't called.
+    // No userdata, or of another type: f is not called.
     assert_eq!(machine.with_userdata(|_: &mut Vec<String>, _| 1), None);
     machine.set_userdata(5u32);
     assert_eq!(machine.with_userdata(|_: &mut Vec<String>, _| 1), None);

@@ -14,11 +14,10 @@
 //! | [`ByPointer<T>`] | other standard-layout types | pointer, value copied out |
 //!
 //!
-//! The borrowed arguments (`&[u8]`, `&str`, [`Buffer`], [`GuestSlice`])
-//! don't copy, so each is bounded only by guest memory; a handler that
-//! copies them (`.to_vec()`, `.to_owned()`) and keeps the copies across
-//! calls must bound the total it keeps itself, as the per-call limits
-//! (and the per-copy budget of [`MAX_HOST_COPY`]) don't.
+//! Borrowed arguments (`&[u8]`, `&str`, [`Buffer`], [`GuestSlice`]) allocate
+//! nothing and are bounded by guest memory per call. Handlers retaining
+//! `.to_vec()` or `.to_owned()` copies across calls must enforce aggregate
+//! limits; [`MAX_HOST_COPY`] does not cover those copies.
 //!
 //! [`MAX_HOST_COPY`]: crate::guest::MAX_HOST_COPY
 //! [`Memory::memstring`]: crate::Memory::memstring
@@ -131,10 +130,8 @@ impl<'a> SysArg<'a> for &'a [u8] {
         m.memory.memview(addr, len)
     }
 }
-/// A Rust guest's `&str`: pointer and length (the ABI passes the two
-/// halves in separate registers), borrowed from guest memory and checked
-/// to be UTF-8 (Rust guarantees it, but a guest can lie): an error when it
-/// isn't. Not in C++.
+/// Decode a guest `&str` from pointer and length registers.
+/// Borrows guest memory and returns an error for invalid UTF-8.
 impl<'a> SysArg<'a> for &'a str {
     fn read(m: &'a Machine, args: &mut ArgCursor) -> Result<Self> {
         GuestRustStr::read(m, args)?.to_str(m)
@@ -290,10 +287,9 @@ impl Machine {
         result.write(self, &mut ArgCursor::new(0, 0));
     }
 
-    /// Port of `Machine::set_result_or_error`: `result` if it isn't
-    /// negative, otherwise the negated host `errno` (C++ reads `errno`
-    /// right after a failed host call; so does this, through
-    /// [`std::io::Error::last_os_error`]).
+    /// Store a nonnegative result, or the negated host `errno` on failure
+    /// (C++ `Machine::set_result_or_error`). Read the error immediately after
+    /// the failed host call using `std::io::Error::last_os_error`.
     pub fn set_result_or_error(&mut self, result: i32) {
         if result >= 0 {
             self.set_result(result);

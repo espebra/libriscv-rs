@@ -232,14 +232,9 @@ fn elf_machine(elf: &[u8], jit: bool) -> Machine {
     m
 }
 
-/// One bounds check covers the loads and stores through the same base
-/// register in a block. It must pass and fail exactly when the accesses'
-/// own checks would: sweep the base across the window edges (the read
-/// window's start, the end of read-only data where the write window starts,
-/// and the end of the arena), with accesses on both sides of each. With a
-/// program loaded, store checks cover the loads between the stores too.
-/// Past the arena, the page table holds a pattern that the arena's padding
-/// doesn't, so an access wrongly made natively there reads something else.
+/// Sweep base addresses across read/write window boundaries to verify merged
+/// bounds checks against the interpreter. Includes loads enclosed by stores.
+/// Distinct page-table and arena-padding patterns expose incorrect native access.
 #[test]
 fn merged_bounds_checks_match_the_interpreter() {
     const PTR: u32 = 6;
@@ -326,7 +321,7 @@ fn merged_bounds_checks_match_the_interpreter() {
     }
 }
 
-/// Blocks too long for the decoder end in a FUNCBLOCK entry, which isn't
+/// Blocks too long for the decoder end in a FUNCBLOCK entry, which is not
 /// control flow: native code runs it and begins the next block, with the
 /// dispatcher's instruction-limit check in between.
 #[test]
@@ -482,7 +477,7 @@ fn compare_dyncalls(code: &[u8], what: &str) -> Outcome {
     run(&mut interp, &[0; 64], 100_000)
 }
 
-/// A dyncall that leaves the counters alone doesn't stop native code: a
+/// A dyncall that leaves the counters alone does not stop native code: a
 /// block whose count crosses the limit runs to its end, where the
 /// interpreter checks it.
 #[test]
@@ -491,10 +486,10 @@ fn dyncalls_mid_block_check_the_limit_at_the_block_end() {
     assert_ne!(last.regs[11], 0, "the handler didn't run");
 }
 
-/// A handler that doesn't write a dyncall's outputs leaves them as they
-/// were: native code stores the outputs before the call, as well as the
-/// inputs, since it reloads them after (found by `jitdifffuzzer`: `slti a0,
-/// ...` then a dyncall with no inputs and one output lost the `slti`).
+/// Unwritten dyncall outputs must retain their current values. Native code
+/// stores outputs before calling the handler and reloads them afterwards.
+/// Regression: `jitdifffuzzer` found a stale reload after `slti a0, ...`
+/// followed by a dyncall with no inputs and one output.
 #[test]
 fn dyncall_outputs_the_handler_leaves_alone_keep_their_values() {
     let program = [
@@ -691,7 +686,7 @@ fn background_compilation_switches_to_native_code() {
     let mut m = background_machine(&code, 3);
     // The segment starts out interpreted.
     assert_eq!(m.cpu.current_execute_segment().jit_entry_count(), 0);
-    // Results don't depend on when the code arrives...
+    // Results do not depend on when the code arrives...
     let early = run(&mut m, &[0; 64], 150);
     m.wait_for_jit();
     assert!(!m.jit_pending());
@@ -707,8 +702,7 @@ fn background_compilation_switches_to_native_code() {
 
 #[test]
 fn background_compilation_matches_the_interpreter() {
-    // Wherever the compiled code happens to land (between which slices, at
-    // which fuel), every run must match the interpreter.
+    // Every run must match the interpreter regardless of compilation timing.
     let mut rng = Rng(0x0123_4567_89AB_CDEF);
     let fuels: Vec<u64> = (0..=48).chain([64, 100, 333, 1000, 20_000]).collect();
     for program in 0..60 {
@@ -1259,7 +1253,7 @@ fn machines_share_execute_segments() {
     let mut c = machine_with(&code, background.clone());
     let mut d = machine_with(&code, background);
     // `d` shares `c`'s segment, unless `c`'s compilation has already
-    // finished: then `d` starts on the compiled copy, which `c` hasn't
+    // finished: then `d` starts on the compiled copy, which `c` has not
     // switched to yet.
     assert!(
         same_segment(&c, &d)
@@ -1339,12 +1333,9 @@ fn native_calls_match_the_interpreter() {
     }
 }
 
-/// A segment created during a run (code mapped at runtime, like the
-/// libraries a dynamic linker maps) compiles in the background, and the
-/// run switches to its native code, also when nothing was compiling when
-/// the run began: the run has to begin slicing then. (It didn't: with
-/// `ld.so` from the JIT cache, the libraries and the program it mapped
-/// stayed interpreted for good.)
+/// A segment created during execution must trigger background slicing even
+/// when no compilation was pending at run entry. Otherwise newly mapped code
+/// can remain interpreted after compilation completes.
 #[test]
 fn segments_created_during_a_run_switch_to_native_code() {
     const AREA: u64 = V + 0x10000;

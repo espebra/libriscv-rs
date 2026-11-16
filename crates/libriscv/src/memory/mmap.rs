@@ -172,7 +172,7 @@ impl Memory {
             // If relaxation happened, invalidate intersecting cache entries.
             self.mmap_cache.invalidate(addr, size);
         } else if addr >= self.mmap_start() {
-            // If relaxation didn't happen, put in the cache for later.
+            // If relaxation did not happen, put in the cache for later.
             self.mmap_cache.insert(addr, size);
         }
         relaxed

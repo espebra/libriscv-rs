@@ -9,7 +9,7 @@
 //!   need a *writable* address (`PROTECTION_FAULT`), even though they also
 //!   read.
 //! * A misaligned LR raises `DEADLOCK_REACHED` with data 0, before reading.
-//! * A misaligned SC doesn't fault: it fails (`rd = 1`) and, unlike a
+//! * A misaligned SC does not fault: it fails (`rd = 1`) and, unlike a
 //!   failing aligned SC, leaves the reservation alone.
 
 use super::ops;

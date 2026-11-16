@@ -38,7 +38,7 @@ type StrMap = GuestPtr<GuestStdUnorderedMap<GuestStdString, GuestStdString>>;
 type FastMap = GuestPtr<GuestStdUnorderedMap<u32, i64, CustomHash>>;
 type Variant = GuestPtr<GuestStdVariant<Value>>;
 
-/// A string longer than the small-string buffer, so it's allocated.
+/// A string longer than the small-string buffer, so it is allocated.
 const LONG: &str = "a string too long for the small-string buffer";
 
 /// One operation on the object at [`OBJECT`], viewed as one of the

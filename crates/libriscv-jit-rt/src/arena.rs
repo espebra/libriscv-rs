@@ -1,40 +1,27 @@
-//! Port of the memory side of `shared_rodata.cpp` (`SharedRodataImage`, the
-//! memfd and the mapping of `create_shared_rodata_image`), for `libriscv`'s
-//! `use_shared_rodata` option (with its `jit` feature).
+//! Port of shared-memory support in `shared_rodata.cpp`: guest arena mappings,
+//! sealed memfd images, and page reclamation for `libriscv`'s `jit` feature.
 //!
-//! A [`GuestArena`] is one anonymous private mapping that `libriscv` uses
-//! as its flat arena, exactly like the `Vec<u8>` it replaces: a contiguous
-//! `[u8]` that the interpreter indexes and native code addresses from its
-//! base. [`GuestArena::attach`] maps a [`RodataImage`] over the start of it,
-//! so that machines loaded from the same program hold its text and rodata
-//! in host memory once. [`GuestArena::zero_pages`] hands pages back to the
-//! kernel (`madvise(MADV_DONTNEED)`, as C++ `memdiscard` does), which
-//! zeroes them without touching them.
+//! [`GuestArena`] is an anonymous private mapping exposed as a contiguous
+//! `[u8]`. [`GuestArena::attach`] maps a [`RodataImage`] over its initial pages,
+//! sharing program text and read-only data across machines.
+//! [`GuestArena::zero_pages`] reclaims anonymous pages with
+//! `madvise(MADV_DONTNEED)` without touching their bytes.
 //!
-//! # Differences from C++
+//! # Copy-on-write images
 //!
-//! C++ maps the image `PROT_READ | MAP_SHARED`, relying on its arena's
-//! write boundary to keep stores away, and turns sharing off whenever
-//! something could store there anyway (virtual paging, N-bit arenas). Here
-//! the image is mapped `PROT_READ | PROT_WRITE | MAP_PRIVATE`: the pages are
-//! the memfd's page cache pages, shared between every machine, until a
-//! store reaches one, which then gets a private copy from the kernel
-//! (copy-on-write). So the arena stays an ordinary writable `[u8]`, a store
-//! that does get there (a page the guest made writable with `mprotect`, an
-//! N-bit arena, the host) behaves as without sharing, and nothing in the
-//! access paths changes. The image file is sealed against writes, growing
-//! and shrinking, so the bytes behind those pages never change and never
-//! disappear (no `SIGBUS`).
+//! Images use `PROT_READ | PROT_WRITE | MAP_PRIVATE`. Reads share memfd page-cache
+//! pages; writes create private copies. This preserves ordinary arena semantics
+//! with paging, N-bit masking, and host writes. C++ uses a read-only shared
+//! mapping and disables sharing when stores can bypass the write window.
+//! Seals prohibit writes and size changes, preventing image mutation and
+//! truncation-induced `SIGBUS`.
 //!
-//! The arena itself is a `memmap2` anonymous mapping on every platform.
-//! On Linux it lies between two [`GUARD`] bytes of inaccessible pages, so
-//! that an access a little outside it faults instead of reaching other
-//! memory: defense in depth for native code, whose own bounds checks keep
-//! it inside the arena.
-//! Images need sealable memfds and a fixed-address `mmap`, which `memmap2`
-//! doesn't offer: the few Linux calls for those are declared in [`sys`] by
-//! hand (like `dlopen` in `linked.rs`), for the architectures whose `mmap`
-//! flag values they spell out.
+//! The arena uses `memmap2` on all platforms. On Linux, inaccessible regions of
+//! [`GUARD`] bytes surround it as additional protection against native access
+//! errors. Native code must still enforce its own bounds checks.
+//!
+//! Sealable memfds and fixed-address mappings require Linux calls declared in
+//! [`sys`] for architectures with supported `mmap` flag values.
 
 use std::fs::File;
 use std::io;
@@ -50,7 +37,7 @@ pub const fn shared_rodata_supported() -> bool {
 }
 
 /// The host page size, which is what an image's length must be a multiple
-/// of to be attached (4096 where images aren't supported).
+/// of to be attached (4096 where images are not supported).
 pub fn host_page_size() -> usize {
     sys::page_size()
 }
@@ -124,7 +111,7 @@ impl GuestArena {
         let base = map.as_mut_ptr();
         if GUARD != 0 {
             // SAFETY: the low guard is the first whole pages of the mapping
-            // just made, which nothing borrows yet; the arena isn't touched.
+            // just made, which nothing borrows yet; the arena is not touched.
             #[allow(unsafe_code)]
             unsafe {
                 sys::protect_none(base, GUARD)?;
@@ -160,7 +147,7 @@ impl GuestArena {
     /// same bytes. Every step that can fail for want of resources (mapping
     /// the view to restore from) comes before the arena is touched; the
     /// process aborts only if re-mapping the arena's own range fails, ie.
-    /// it couldn't access its own memory any more.
+    /// it could not access its own memory any more.
     pub fn attach(&mut self, image: &RodataImage) -> io::Result<()> {
         let len = image.len();
         if !sys::SUPPORTED
@@ -208,7 +195,7 @@ impl GuestArena {
     /// every one in.
     ///
     /// True when the range now reads as zeroes. False, with the arena
-    /// unchanged, when it can't be done this way and the caller has to
+    /// unchanged, when it cannot be done this way and the caller has to
     /// zero the bytes itself: not on Linux (elsewhere `MADV_DONTNEED` may
     /// keep the contents), `start` or `len` not a multiple of the host
     /// page size, the range not inside the arena, or overlapping an
@@ -236,7 +223,7 @@ impl GuestArena {
             // SAFETY: `[start, end)` is whole pages of our own private
             // anonymous mapping (checked above: `ptr` is `guard` bytes, a
             // whole number of pages, into it, so the offset is page-aligned
-            // and memmap2 doesn't widen the range to align it), past any
+            // and memmap2 does not widen the range to align it), past any
             // attached image, and `&mut self` means nothing borrows them. On Linux, such pages read as zeroes after
             // `MADV_DONTNEED`, which is the effect wanted; the mapping
             // itself, and so `ptr` and `len`, stay as they are.
@@ -323,7 +310,7 @@ impl RodataImage {
     /// A read-only mapping of the image's contents (C++ `inspect`), for as
     /// long as the caller keeps it.
     pub fn view(&self) -> io::Result<impl Deref<Target = [u8]> + use<>> {
-        // SAFETY: the file is sealed: its contents and length can't change
+        // SAFETY: the file is sealed: its contents and length cannot change
         // for as long as the view lives.
         #[allow(unsafe_code)]
         let view = unsafe { Mmap::map(&self.file)? };
@@ -344,7 +331,7 @@ impl RodataImage {
     }
 }
 
-/// The Linux calls `memmap2` doesn't cover, declared by hand with the
+/// The Linux calls `memmap2` does not cover, declared by hand with the
 /// generic flag values of the architectures listed (mips, powerpc and sparc
 /// spell `MAP_ANONYMOUS`/`MAP_NORESERVE` differently, so they go without).
 #[cfg(all(
@@ -515,7 +502,7 @@ mod sys {
     }
 }
 
-/// Images aren't supported here: arenas still work (they are `memmap2`
+/// Images are not supported here: arenas still work (they are `memmap2`
 /// mappings), nothing is ever attached.
 #[cfg(not(all(
     target_os = "linux",
@@ -608,7 +595,7 @@ mod tests {
     }
 
     /// On Linux the arena lies between two inaccessible guards, also with
-    /// a length that isn't a whole number of pages.
+    /// a length that is not a whole number of pages.
     #[test]
     fn arenas_have_guard_pages() {
         let len = 3 * host_page_size() + 100;

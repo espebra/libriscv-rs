@@ -1,8 +1,6 @@
-//! `rvlinux` — run a RISC-V Linux userspace ELF under libriscv.
-//!
-//! Port of `emulator/src/main.cpp`. Output format of the completion summary
-//! must stay byte-compatible with the C++ emulator (see `testutil::parse_run_output`)
-//! so the two can be diffed directly.
+//! Port of `emulator/src/main.cpp`: run RISC-V Linux userspace ELFs.
+//! Completion summaries must remain byte-compatible with C++ output for
+//! `testutil::parse_run_output` and differential tests.
 
 #![forbid(unsafe_code)]
 // Translations compiled in (`RVLINUX_AOT_EMBED`, see build.rs) use `become`
@@ -132,7 +130,7 @@ fn parse_args() -> Result<CliArgs, String> {
     let mut it = std::env::args();
     let name = it.next().unwrap_or_else(|| "rvlinux".into());
     let mut args = CliArgs {
-        // The JIT is the default when it's built in; `-n` interprets.
+        // The JIT is the default when it is built in; `-n` interprets.
         jit: cfg!(feature = "jit"),
         ..CliArgs::default()
     };
@@ -254,7 +252,7 @@ fn main() -> ExitCode {
     if let Some(interp) = libriscv::elf_interpreter(&binary) {
         // A dynamic executable: run its dynamic linker instead, which maps
         // the program and its libraries at runtime, with the program as
-        // its first argument (C++ `main`). Unlike C++, the guest doesn't
+        // its first argument (C++ `main`). Unlike C++, the guest does not
         // choose the host file: `PT_INTERP` only selects rvlinux's own
         // dynamic linker, and anything else is replaced by it, with a
         // warning. A PT_INTERP of `/dev/zero`, a FIFO or another readable
@@ -349,7 +347,7 @@ fn main() -> ExitCode {
         aot_output: aot_output.clone(),
         libc_fastpath: args.libc_fastpath,
         // One machine per process: nothing to share the program's
-        // read-only memory with, so don't pay for creating an image of it.
+        // read-only memory with; skip image creation.
         use_shared_rodata: false,
         ..Default::default()
     };
@@ -462,14 +460,10 @@ fn main() -> ExitCode {
     save()
 }
 
-/// The JIT cache directory for a dynamic executable: the code of the
-/// dynamic linker (the initial segment) and of the pinned libraries is
-/// the same in every program, so the JIT saves it the first time and uses
-/// it from then on. The program's own code is never cached, nor anything
-/// the program wrote into the pinned slots (libriscv saves only segments
-/// whose bytes are those of the pinned file mapped there). The initial
-/// segment is always `DYNAMIC_LINKER`: the program's `PT_INTERP` never
-/// chooses the host file.
+/// Cache policy for the fixed dynamic linker and pinned system libraries.
+/// Only segments verified against their mapped host files are saved; program
+/// code and guest-written replacements are excluded. `PT_INTERP` cannot select
+/// the host linker file.
 #[cfg(feature = "jit")]
 fn jit_cache_dir(args: &CliArgs, is_dynamic: bool) -> Option<libriscv::jit_cache::CacheDir> {
     if !is_dynamic || !args.jit || args.no_jit_cache {
@@ -576,7 +570,7 @@ fn save_translation(args: &CliArgs, output: Option<&libriscv::aot::AotOutput>) -
 const GUEST_ENV: [&str; 3] = ["LC_CTYPE=C", "LC_ALL=C", "RUST_BACKTRACE=full"];
 
 /// The dynamic linker of every dynamic executable (C++ `DYNAMIC_LINKER`,
-/// which C++ only uses when the program's `PT_INTERP` can't be read).
+/// which C++ only uses when the program's `PT_INTERP` cannot be read).
 const DYNAMIC_LINKER: &str = "/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1";
 /// The file name a program's `PT_INTERP` must end in to run without a
 /// warning (any directory: `/lib/` in practice).
@@ -585,7 +579,7 @@ const DYNAMIC_LINKER_NAME: &str = "ld-linux-riscv64-lp64d.so.1";
 const MAX_DYNAMIC_LINKER_SIZE: u64 = 64 << 20;
 
 /// Reads a host file rvlinux loads for the guest: it must be a regular
-/// file of at most `max` bytes, so a device or FIFO can't hang rvlinux or
+/// file of at most `max` bytes, so a device or FIFO cannot hang rvlinux or
 /// exhaust host memory.
 fn read_host_file(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
     use std::io::{Error, ErrorKind, Read};
@@ -625,12 +619,10 @@ const GUEST_LIBS: [&str; 9] = [
     "libnss_dns.so.2",
     "libnss_files.so.2",
 ];
-/// Where `ld.so` maps the libraries in `GUEST_LIBS`: each in its own
-/// slot, in the order of the list, from `LIBRARY_PIN_BASE` up. A library
-/// stays at the same address in every program, so its saved JIT code or
-/// translation is found again (both are keyed by address). With an arena
-/// too small for a slot, or a library larger than one, the library is
-/// mapped where `mmap` would have put it.
+/// Stable mapping slots for `GUEST_LIBS`, starting at `LIBRARY_PIN_BASE`
+/// in list order. Stable addresses allow native cache and AOT reuse across
+/// programs. Libraries exceeding a slot or arenas too small for it use
+/// ordinary `mmap` placement.
 const LIBRARY_PIN_BASE: u64 = 1 << 30;
 const LIBRARY_PIN_SLOT: u64 = 16 << 20;
 
@@ -679,7 +671,7 @@ fn setup_linux(
         fds.permit_filesystem = !args.sandbox;
         fds.permit_sockets = !args.sandbox;
         // The filter below is an exact allow-list (`/dev/urandom` is a
-        // device), or proxy mode, which admits everything anyway.
+        // device), or proxy mode, which permits unrestricted host paths.
         fds.permit_special_files = true;
         if is_dynamic {
             fds.pinned_mappings = pinned_libraries();
@@ -776,9 +768,8 @@ const fn signal_for_exception(kind: libriscv::ExceptionKind) -> i32 {
     }
 }
 
-/// After a fault, give the guest's signal handler (or its SIGSEGV
-/// handler) a chance to run, for at most 60k instructions, as C++
-/// `run_sighandler` does. Its errors are ignored.
+/// Run the guest fault handler, falling back to SIGSEGV, for at most 60,000
+/// instructions (C++ `run_sighandler`). Handler errors are ignored.
 fn run_sighandler(machine: &mut libriscv::Machine, signal: i32) {
     use libriscv::registers::{REG_ARG0, REG_RA};
     const SIGSEGV: i32 = 11;

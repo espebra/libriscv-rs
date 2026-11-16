@@ -1,71 +1,45 @@
-//! Port of `asmjit/aj_emit.cpp`, generating Cranelift IR instead of asmjit
-//! code for the regions of one execute segment.
+//! Port of `asmjit/aj_emit.cpp`, generating Cranelift IR for execute segments.
 //!
-//! Every region becomes one function with Cranelift's `tail` calling
-//! convention and the signature `(state, pc, counter, depth) -> (target,
-//! counter)`. It switches on `pc` to the entry point, keeps the guest
-//! registers it uses in SSA variables, and leaves in one of four ways:
+//! Each region becomes a function with Cranelift's `tail` calling convention:
+//! `(state, pc, counter, depth) -> (target, counter)`. Guest registers are cached
+//! in SSA variables. Control leaves a region through:
 //!
-//! * a native tail call (`return_call`) to the region owning the next
-//!   instruction, so loops and jumps never come back through the
-//!   interpreter; indirect jumps go through the entry table
-//!   (`return_call_indirect`);
-//! * a guest return (`jalr x0, ra` or `t0`), which returns its target to
-//!   the native caller: a guest call whose return address is in the
-//!   caller's region is a native call (C++ asmjit's `emit_direct_call`),
-//!   which continues there if the callee returned there (see
-//!   `codegen::calls`). The trampoline continues other returns through the
-//!   entry table;
-//! * a return of [`DONE`] with an exit kind in the state block (the
-//!   instruction limit, an instruction the JIT doesn't compile, a fault),
-//!   which every native caller passes on;
-//! * never by unwinding: faults are exits.
+//! * Native tail calls, directly or through the entry table.
+//! * Guest returns (`jalr x0, ra` or `t0`) to native callers. Guest calls whose
+//!   return address belongs to the caller's region use native calls; other
+//!   return targets are dispatched through the entry table.
+//! * [`DONE`] with an exit kind in the state block, propagated through callers.
+//!
+//! Faults use explicit exits rather than unwinding.
 //!
 //! # Instruction counting
 //!
-//! The JIT retires instructions exactly like the dispatcher. Entering a
-//! block at `X` (taken branch, jump, fall-through after a branch, function
-//! entry) adds the decoder's instruction count for `X`; checks happen at the
-//! same block ends. When control leaves *mid-block* (into another region or
-//! back to the interpreter), the count for the target is subtracted first,
-//! since whoever continues adds it again on entry.
+//! Block entry adds the decoder's instruction count. Limit checks occur at the
+//! same block ends as in the interpreter. Mid-block transfers subtract the
+//! target's count because the continuation adds it again.
 //!
 //! # Memory safety
 //!
-//! Generated code only touches the state block, the 32 integer and 32
-//! floating-point registers and the guest arena, and every arena access is
-//! covered by the same range check as `Memory::read_*`/`write_*`, or with
-//! an N-bit address space, masked with the arena size minus one (C++
-//! `arena_index` in `aj_emit.cpp`); `CodeMemory` checks the arena is that
-//! large. The windows are constants in the code (C++ `aj_machine_info`'s
-//! baked arena bounds), and `libriscv-jit-rt` only enters the code when
-//! they lie inside the machine's windows, which it validates against the
-//! real arena length. See its crate documentation for the full contract.
+//! Generated code accesses only its state, register files, and guest arena.
+//! Arena accesses use `Memory`'s read/write windows or an N-bit mask.
+//! `libriscv-jit-rt` validates the compiled layout against the host arena and
+//! windows before entry; see its crate documentation for the complete contract.
 //!
-//! One check can cover several accesses: the first access through a base
-//! register checks the whole span of offsets that the accesses through the
-//! same register (and of the same kind, load or store) use until the end of
-//! its straight-line run, or until the register changes. Each access's own
-//! check is on its start address, so the span check passes exactly when
-//! all of theirs would; when it fails, native code leaves at the first
-//! access and the interpreter runs the rest of the block, as it would for
-//! that access alone. (C++'s binary translator elides checks within the
-//! arena's over-allocation of the first one instead, which lets accesses
-//! near the window edges through; this keeps the interpreter's results.) Besides other region functions, it
-//! only calls the pure floating-point helpers below (Cranelift's libcalls
-//! for rounding and FMA on hosts without SSE4.1 or FMA), and the host
-//! call in the state block, for dyncalls (see `RegionEmitter::dyncall`).
+//! Within a straight-line run, accesses through an unchanged base register can
+//! share a check covering their offset span. The check passes exactly when all
+//! individual start-address checks pass. Failure exits at the first access so
+//! the interpreter completes the block with identical results and counts.
+//!
+//! External calls are limited to floating-point helpers for hosts without
+//! SSE4.1 or FMA and the state block's dyncall trampoline; see
+//! `RegionEmitter::dyncall`.
 //!
 //! # Floating point
 //!
-//! F/D arithmetic uses Cranelift's operations as they are: results for
-//! non-NaN inputs are the interpreter's (both use the host's IEEE
-//! operations in round-to-nearest), but which NaN comes out follows the
-//! host (NaN payloads are FCSR emulation's business). FMIN/FMAX with one
-//! NaN operand give the other one and with two the canonical NaN, as
-//! RISC-V defines, and FCVT to integers honours the
-//! rounding mode and saturates (NaN to the maximum), exactly like the
-//! interpreter.
+//! Cranelift F/D arithmetic uses host IEEE operations with round-to-nearest.
+//! NaN payloads depend on the host. FMIN/FMAX return the other operand for one
+//! NaN and canonical NaN for two. Integer FCVT honors the rounding mode and
+//! saturates, converting NaN to the maximum, matching the interpreter.
 
 use std::collections::HashMap;
 
@@ -105,7 +79,7 @@ pub(crate) struct Compiled {
     pub patch: Vec<usize>,
 }
 
-/// A compiled and linked segment that isn't in executable memory yet: the
+/// A compiled and linked segment that is not in executable memory yet: the
 /// code image with its calls between functions resolved, but not its
 /// libcalls. [`Image::load`] maps it for this process; the JIT cache saves
 /// it as an object file (`jit_cache`), so that the same bytes run later.
@@ -238,9 +212,9 @@ pub(crate) fn build_fingerprint() -> Option<u64> {
     })
 }
 
-/// The host ISA, or `None` where the JIT isn't supported. Only x86-64 is
+/// The host ISA, or `None` where the JIT is not supported. Only x86-64 is
 /// enabled for now: AArch64 needs an explicit instruction-cache flush after
-/// writing code, which `libriscv-jit-rt` doesn't do yet.
+/// writing code, which `libriscv-jit-rt` does not do yet.
 fn host_isa() -> Option<OwnedTargetIsa> {
     if !cfg!(target_arch = "x86_64") {
         return None;
@@ -430,12 +404,12 @@ thread_local! {
 
 /// Most threads compiling one segment's regions.
 const MAX_COMPILE_THREADS: usize = 16;
-/// Regions per thread below which more threads don't pay off.
+/// Minimum regions per worker to amortize thread overhead.
 const REGIONS_PER_THREAD: usize = 64;
 
 /// Compile every region of `a`, in region order, on up to `threads`
 /// threads (each taking the next region not yet taken). The regions are
-/// independent functions, and Cranelift's output for a function doesn't
+/// independent functions, and Cranelift's output for a function does not
 /// depend on which thread compiles it, so the image is the same. `None`
 /// if any region fails, or a thread panics.
 fn compile_regions(
@@ -479,7 +453,7 @@ fn compile_regions(
         done
     };
     let mut done = std::thread::scope(|s| {
-        // Threads that can't be started leave their share to the others.
+        // Threads that cannot be started leave their share to the others.
         let helpers: Vec<_> = (1..threads)
             .filter_map(|_| {
                 std::thread::Builder::new()
@@ -1071,7 +1045,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                     self.b.def_var(self.counter, c);
                     self.b.ins().jump(label, &[]);
                 } else {
-                    // Every in-region target is an entry; be safe anyway.
+                    // Validate the target even though region analysis guarantees an entry.
                     self.leave(EXIT_JUMP, target, c);
                 }
             }
@@ -1367,7 +1341,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
             self.exit_if(outside, EXIT_SLOW, ExitPc::Const(pc));
             // Spectre v1: the check is a branch, which the CPU may speculate
             // past. The accesses it covers use the base register through a
-            // conditional move on the same comparison, which isn't
+            // conditional move on the same comparison, which is not
             // speculated: when the check fails, the base is `win_base - lo`,
             // so that `base + k` for every covered offset k in lo..=hi lies
             // inside the window (the check only passes when the span fits
@@ -1394,7 +1368,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
 
     /// The offset spans `(lo, hi)` of the loads and of the stores through
     /// `rs1` from the instruction at `self.pos` to the end of its
-    /// straight-line run (the next label, or an instruction that doesn't
+    /// straight-line run (the next label, or an instruction that does not
     /// fall through), up to and including the first instruction that writes
     /// `rs1`: what a check made there can cover.
     fn check_spans(&self, rs1: u32) -> (Option<Span>, Option<Span>) {
@@ -1848,7 +1822,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
     /// with saturation, NaN to the maximum; 32-bit results sign-extended.
     fn fcvt_to_int(&mut self, kind: FInt, rm: u32, x: Value) -> Value {
         let rounded = if rm == 7 {
-            // DYN: FCSR.frm, which native code can't change (CSR
+            // DYN: FCSR.frm, which native code cannot change (CSR
             // instructions are interpreted).
             let frm = self
                 .b
@@ -2031,8 +2005,8 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
         }
         let (reads, writes) = calls::dyncall_regs(word);
         // The outputs too: they are reloaded after the call, and a handler
-        // that doesn't write one must leave it as it was, including a value
-        // native code computed but hasn't stored yet.
+        // that does not write one must leave it as it was, including a value
+        // native code computed but has not stored yet.
         self.store_set(self.written_set & (reads | writes));
         let st = self.state;
         let host_call = self
@@ -2509,7 +2483,7 @@ fn spectre_slot(
     b.ins().select_spectre_guard(in_table, slot, zero)
 }
 
-/// True if the window `inner` lies inside `outer` and isn't empty.
+/// True if the window `inner` lies inside `outer` and is not empty.
 fn window_within(inner: (u64, u64), outer: (u64, u64)) -> bool {
     inner.1 != 0
         && inner.0 >= outer.0

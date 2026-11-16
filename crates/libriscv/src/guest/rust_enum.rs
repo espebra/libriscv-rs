@@ -1,10 +1,9 @@
 //! Port of `guest/guest_rust_enum.hpp`: a Rust enum with fields, declared
 //! `#[repr(C, uN)]` by the guest, in guest memory.
 //!
-//! Unlike `std::variant` the layout is *requested*, not discovered:
-//! `#[repr(C, uN)]` is a tag followed by the union of the variants. A plain
-//! `#[repr(Rust)]` enum isn't mirrorable (rustc reorders it and hides the
-//! tag in a niche).
+//! `#[repr(C, uN)]` specifies a tag followed by a union of variant payloads.
+//! Default `#[repr(Rust)]` enums have compiler-dependent layouts and may
+//! encode tags in niches; they cannot be mirrored reliably.
 //!
 //! ```text
 //!   #[repr(C, u64)]            libriscv::guest_rust_enum! {
@@ -26,7 +25,7 @@
 //! offset 1 behind a `u8` tag, while rustc emits one uniformly aligned
 //! payload at offset 8; the readings only differ when the tag is narrower
 //! than the payload alignment. Use `u64` for pointer-sized variants: the
-//! padding after a `u8` tag would be there anyway.
+//! corresponding padding after a narrower tag would occupy the same space.
 
 use std::marker::PhantomData;
 
@@ -133,12 +132,10 @@ macro_rules! guest_rust_enum {
 }
 
 /// A Rust enum `#[repr(C, uN)]`: the tag, then the active variant at the
-/// payload offset. The value is `None` for an out-of-range tag, which only
-/// memory the guest never initialized (or lies about) has.
+/// payload offset. An out-of-range tag produces `None`.
 ///
-/// The usual way in is the enum itself: `match value.value()`. The
-/// generic accessors (`is::<T>`, `get::<T>`) are for code that only knows
-/// the variant's type. Copies are shallow.
+/// Use `match value.value()` to inspect variants, or `is::<T>` and `get::<T>`
+/// when the variant type is known generically. Copies are shallow.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GuestRustEnum<E, Tag = u64> {
     value: Option<E>,

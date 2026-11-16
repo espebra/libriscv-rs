@@ -53,9 +53,9 @@ fn run_in_mode(mode: Mode, scenario: impl FnOnce()) {
 }
 
 /// The Rust emulator's extra flags for this test's mode, or `None` if the
-/// mode doesn't apply to `elf`: dynamic executables skip compiling up
+/// mode does not apply to `elf`: dynamic executables skip compiling up
 /// front, which compiles all of `libc.so`'s executable mapping (1.5 MB)
-/// when it's first entered.
+/// when it is first entered.
 fn mode_flags(elf: &Path) -> Option<&'static [&'static str]> {
     match MODE.get() {
         Mode::Interp => Some(&[]),
@@ -1080,7 +1080,7 @@ fn freestanding_float() {
     }
 }
 
-/// F/D edge cases: formats that don't exist, holes in the encoding space,
+/// F/D edge cases: formats that do not exist, holes in the encoding space,
 /// `rd = x0`, and the fault data of a force-ended segment end (C++'s
 /// re-encoded bytecode operand for FLW/FLD/FSW/FSD/FADD..FDIV).
 const FLOAT_ASM_CASES: &[(&str, &str)] = &[
@@ -1928,7 +1928,7 @@ int main(int argc, char** argv) {
 /// host build prints, and an instruction-level probe of every instruction
 /// the RVA23U64 profile makes mandatory. Every run is also compared with
 /// the reference, instruction counts included. Skipped without an RVA23
-/// toolchain, which CI doesn't have.
+/// toolchain, which CI does not have.
 fn rva23_dir() -> PathBuf {
     testutil::cpp_source_dir().join("tests").join("rva23")
 }

@@ -1,12 +1,10 @@
-//! Links saved JIT code into `rvlinux`: every object file listed in
-//! `RVLINUX_JIT_EMBED` (separated like `PATH`), as written by
-//! `rvlinux --jit-save-object`. Such code is found and used automatically
-//! (with the `jit` feature).
+//! Link JIT objects listed in `RVLINUX_JIT_EMBED` into `rvlinux` (`jit`).
+//! Paths use the platform's `PATH` separator. Generate objects with
+//! `rvlinux --jit-save-object`; linked code is discovered automatically.
 //!
-//! Compiles translations into `rvlinux`: every Rust file listed in
-//! `RVLINUX_AOT_EMBED` (separated like `PATH`), as written by
-//! `rvlinux --aot-save`, like C++'s embedded translations (feature `aot`).
-//! They are safe Rust, registered at startup.
+//! Compile and register Rust translations listed in `RVLINUX_AOT_EMBED`
+//! with `aot`. Generate source with `rvlinux --aot-save`. Paths use the same
+//! separator; embedded translations contain only safe Rust.
 
 use std::fmt::Write as _;
 

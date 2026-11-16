@@ -115,7 +115,7 @@ fn check(elf: &Path, test: &str) {
     let messages = cache_messages(elf, &["--jit-load", so_s, "--no-jit-cache"]);
     assert!(messages.is_empty(), "{messages}");
     // Not used for another memory layout (a smaller arena), which the code
-    // has baked in.
+    // requires as constants.
     let other = ["--jit-load", so_s, "--memory", "256"];
     assert_eq!(run(elf, &other), expected);
     let messages = cache_messages(elf, &other);
@@ -242,7 +242,7 @@ fn cache_directory() {
 }
 
 /// A dynamic executable runs from the cache directory the second time:
-/// `ld.so` and `libc.so` come from the cache, the program doesn't (and is
+/// `ld.so` and `libc.so` come from the cache, the program does not (and is
 /// compiled in the background, switching to native code while running),
 /// with the same results. Slow (~20 s): the first run compiles `libc.so`.
 #[test]
@@ -316,7 +316,7 @@ fn loading_a_bad_file_fails() {
 }
 
 /// Code linked into `rvlinux` is found by itself. Builds a second `rvlinux`
-/// (in its own target directory, `target/jit-embed`, so that it doesn't
+/// (in its own target directory, `target/jit-embed`, so that it does not
 /// rebuild or block this one), which takes a while the first time.
 #[test]
 #[ignore = "builds rvlinux again, in target/jit-embed"]

@@ -1580,7 +1580,7 @@ fn vopi_vv(m: &mut Machine, vi: VInstr) -> Result<()> {
             }))
         }
         0b001110 => {
-            // VRGATHEREI16.VV: 16-bit indices whatever SEW is.
+            // VRGATHEREI16.VV uses 16-bit indices for every SEW.
             let vlmax = r.vlmax();
             int_sew!(r, |E, U| element_loop::<E>(r, vd, vm, |r, i| {
                 let idx = u64::from(r.get::<u16>(vs1, i));
@@ -2349,7 +2349,7 @@ fn vopf_vv(m: &mut Machine, vi: VInstr) -> Result<()> {
                 let bits = <B>::BITS;
                 match vs1 {
                     // VFCVT.XU.F.V, VFCVT.X.F.V: rounded to nearest even
-                    // whatever frm says, as in C++.
+                    // independently of frm, matching C++.
                     0b00000 => element_loop::<B>(r, vd, vm, |r, i| {
                         f2i_u(r.get::<F>(vs2, i) as f64, false, bits) as B
                     }),
@@ -2557,7 +2557,7 @@ fn vopf_vf(m: &mut Machine, vi: VInstr) -> Result<()> {
         }),
         _ => {
             // The widening arithmetic: single-precision sources, so the
-            // f32 scalar whatever SEW says.
+            // The scalar is f32 for every SEW.
             if float_widening(r, vi, false, scalar_f)? {
                 return Ok(());
             }

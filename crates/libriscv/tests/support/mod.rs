@@ -496,7 +496,7 @@ pub fn random_fp(rng: &mut Rng) -> u64 {
     }
 }
 
-/// An F/D instruction whose result doesn't depend on which NaN the host
+/// An F/D instruction whose result does not depend on which NaN the host
 /// produces: loads, stores, moves, sign injection, FCLASS, compares and
 /// conversions to and from integers.
 pub fn random_fp_move(rng: &mut Rng) -> u32 {

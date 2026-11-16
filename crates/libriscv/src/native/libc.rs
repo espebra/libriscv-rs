@@ -10,7 +10,7 @@
 //! returns to `ra`. Other `EBREAK`s go to the handler it chains to.
 //!
 //! C++ keeps the chained handler in statics, for all machines of the
-//! process. Here it's per machine (see `Machine::install_syscall_handler`).
+//! process. Here it is per machine (see `Machine::install_syscall_handler`).
 //! Like C++, the precise simulator (`simulate_precise`, `step_one`) runs
 //! the original code. The JIT never compiles a patched entry (see
 //! `jit::region`), so native code leaves to the interpreter in front of
@@ -123,7 +123,7 @@ fn fastpath_id(entry: &DecoderEntry) -> Option<u32> {
 
 /// Port of `Machine::install_libc_fastpath`: patch every known libc
 /// function of `binary` (by its ELF symbols) inside `exec`. Functions whose
-/// entry can't be made a block ending are left alone. Returns the number
+/// entry cannot be made a block ending are left alone. Returns the number
 /// of patched functions.
 pub(crate) fn install_libc_fastpath(
     exec: &mut DecodedSegment,
@@ -176,7 +176,7 @@ pub(crate) fn install_libc_fastpath(
                 }
             }
             Err(e) => {
-                // The guest simply keeps running the original code.
+                // Continue executing the original guest function.
                 if verbose {
                     println!("libriscv: libc fast-path skipped 0x{addr:x}: {}", e.message);
                 }

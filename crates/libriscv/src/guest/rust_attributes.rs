@@ -6,11 +6,9 @@
 //!   #[repr(C)] pub struct Attributes { entries: Vec<Attr> }   // sorted by key
 //! ```
 //!
-//! A sorted vector rather than a `HashMap`, on purpose: `std`'s `HashMap`
-//! is hashbrown, whose table layout is `#[repr(Rust)]` and whose default
-//! hasher is seeded per process. A sorted `Vec` is ordinary Rust, one
-//! allocation for all entries, and needs no hasher both sides agree on.
-//! Keys compare as bytes, which is what Rust's `Ord` for `str` does.
+//! A sorted vector provides one allocation and deterministic bytewise key
+//! ordering without a shared hasher. Rust's `HashMap` has an unspecified
+//! table layout and a process-seeded default hasher.
 //!
 //! Freeing a map drops each entry, its key and its value, and a value
 //! owning a nested `Box<Attributes>` drops that too, through
@@ -29,8 +27,7 @@ use crate::machine::Machine;
 use crate::memory::GuestPod;
 
 /// One entry of a guest attribute map, `#[repr(C)] struct Attr`: the key,
-/// then the value. (A tuple's layout is
-/// unspecified; a `#[repr(C)]` struct costs nothing.)
+/// followed by the value. `#[repr(C)]` fixes the field layout.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GuestRustAttr<V> {
     pub key: GuestRustString,
@@ -97,11 +94,9 @@ impl<V: GuestType + Default> GuestRustAttr<V> {
 /// [`GuestPtr<GuestRustAttributes<V>>`] changes a map in guest memory in
 /// place.
 ///
-/// A map from the guest is adversarial input: check it with
-/// [`validate`](Self::validate) (and [`is_sorted`](Self::is_sorted)) before
-/// walking it. Neither a bad length nor a scrambled order can corrupt the
-/// host: every access is bounded, and a binary search over a scrambled
-/// order only fails to find.
+/// Validate guest-supplied maps with [`validate`](Self::validate) and
+/// [`is_sorted`](Self::is_sorted) before traversal. All accesses are bounded;
+/// unsorted keys may cause lookups to miss entries.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GuestRustAttributes<V> {
     pub entries: GuestRustVec<GuestRustAttr<V>>,
@@ -231,7 +226,7 @@ impl<V: GuestType> GuestRustAttributes<V> {
     }
 
     /// The value of `key`, in place, inserting a default one in sorted
-    /// position when it isn't there (`entry(key).or_default()`).
+    /// position when it is not there (`entry(key).or_default()`).
     pub fn entry_or_default(&mut self, m: &mut Machine, key: &str) -> Result<GuestPtr<V>>
     where
         V: Default,
@@ -259,8 +254,8 @@ impl<V: GuestType> GuestRustAttributes<V> {
         Ok(self.value_ptr(i))
     }
 
-    /// Remove `key` and hand its value over (the key is dropped): the
-    /// caller owns what the value owns from here on.
+    /// Remove `key` and transfer its value to the caller. Frees the key;
+    /// the caller owns any allocations retained by the returned value.
     pub fn remove(&mut self, m: &mut Machine, key: &str) -> Result<Option<V>> {
         let Some(i) = self.position(m, key.as_bytes())? else {
             return Ok(None);
@@ -350,9 +345,8 @@ impl<V: GuestType> GuestRustAttributes<V> {
         Ok(true)
     }
 
-    /// Move `count` entries from index `src` to index `dst` inside the
-    /// array. A Rust move is a memcpy, and nothing points into an entry, so
-    /// moving the bytes is the whole operation.
+    /// Move `count` entries from `src` to `dst` by copying bytes.
+    /// Entries contain no self-pointers and require no relocation.
     fn move_entries(&self, m: &mut Machine, dst: u64, src: u64, count: u64) -> Result<()> {
         let len = array_bytes(count, GuestRustAttr::<V>::SIZE)?;
         let mut bytes = vec![0; len];
@@ -364,7 +358,7 @@ impl<V: GuestType> GuestRustAttributes<V> {
 impl<V: GuestType + ToHost> GuestRustAttributes<V> {
     /// Copy the whole map to the host. Only for value types that become
     /// host values on their own; walk a tree with [`iter`](Self::iter).
-    /// Keys that aren't UTF-8 are replaced.
+    /// Keys that are not UTF-8 are replaced.
     pub fn to_map(&self, m: &Machine) -> Result<BTreeMap<String, V::Host>> {
         super::host_copy(|| {
             let mut out = BTreeMap::new();

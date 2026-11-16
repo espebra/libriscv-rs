@@ -13,8 +13,7 @@ use libriscv::{ExceptionKind, Machine, MachineOptions};
 
 const MAX_MEMORY: u64 = 8 << 20;
 
-/// Phase 1 has no C extension, so freestanding guests are built for RV64IM.
-/// TODO(phase 2): drop once compressed instructions are supported.
+/// Build freestanding guests for RV64IM without compressed instructions.
 const RV64IM: &str = "-march=rv64im -mabi=lp64";
 
 fn options() -> MachineOptions {
@@ -34,7 +33,7 @@ fn instantiate_machine() {
         return;
     }
     // A regular glibc program (with compressed instructions): loading it
-    // doesn't require executing any of it.
+    // does not require executing any of it.
     let binary = build("int main() { return 666; }", "-O2 -static");
     if !libriscv::COMPRESSED_ENABLED {
         // An RVC executable needs the C extension.
@@ -84,8 +83,7 @@ fn execute_minimal_machine() {
     assert_eq!(machine.instruction_counter(), 3);
 }
 
-/// Machines hold the caller's ELF instead of a copy of it, hand it back
-/// for creating more machines, and outlive the caller's handle.
+/// Machines share the input ELF and retain it independently of the caller.
 #[test]
 fn machines_share_one_binary() {
     if !testutil::need_compiler() {
@@ -303,7 +301,7 @@ fn count_using_ebreak() {
         Ok(())
     });
     machine.simulate(u64::MAX).unwrap();
-    // EBREAK isn't a block end like ECALL, so in the threaded dispatcher
+    // EBREAK is not a block end like ECALL, so in the threaded dispatcher
     // (which the port follows) stopping only takes effect at the next
     // check, and fib runs to the end. C++ accepts 51 (threaded) or 25
     // (tail-call dispatch, which exits immediately).

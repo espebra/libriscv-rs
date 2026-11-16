@@ -210,5 +210,5 @@ jobs:
         run: rustup toolchain install
       - run: cargo build -p libriscv --no-default-features
       # Everything except `fcsr`, which is a deliberate compile error until
-      # it's ported.
+      # it is ported.
       - run: cargo build -p libriscv --features ext-a,ext-c,ext-f,ext-v,debug-checks,jit

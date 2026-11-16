@@ -369,7 +369,7 @@ impl<E: GuestVariant> GuestPtr<GuestStdVariant<E>> {
         Ok(self.active_index(m)? == Some(T::INDEX))
     }
     /// The alternative `T`, in place (C++ `get<T>`, a reference into guest
-    /// memory), or an error when it isn't active.
+    /// memory), or an error when it is not active.
     pub fn alternative<T: VariantAlternative<E>>(&self, m: &Machine) -> Result<GuestPtr<T>> {
         if !self.holds_alternative::<T>(m)? {
             return Err(container_error(

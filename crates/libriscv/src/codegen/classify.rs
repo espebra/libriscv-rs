@@ -428,7 +428,7 @@ pub(crate) fn classify(i: Instr, pc: u64) -> Option<JOp> {
                 _ => return None,
             };
             if rd == 0 {
-                // LoadXDummy: signed loads access memory, unsigned ones don't.
+                // LoadXDummy: signed loads access memory, unsigned ones do not.
                 return Some(if signed {
                     JOp::Load {
                         width,
@@ -658,7 +658,7 @@ pub(crate) fn classify(i: Instr, pc: u64) -> Option<JOp> {
 
 /// True if the precise handler of `i` rejects an encoding [`classify`]
 /// accepts. `classify` follows the fast handlers, and FUNCBLOCK entries run
-/// the precise one instead, so these can't be compiled there. The only case
+/// the precise one instead, so these cannot be compiled there. The only case
 /// is FMADD with the H or Q format: a no-op in the fast path
 /// (`FMaddFast`), an illegal instruction in the precise one (`FMadd`).
 #[cfg(all(feature = "ext-f", not(feature = "debug-checks")))]

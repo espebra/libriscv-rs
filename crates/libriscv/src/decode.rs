@@ -397,7 +397,7 @@ const fn writes_x0(i: Instr) -> bool {
 
 /// The compressed half of `instr_decoding.inc` (RV64). `None` falls through
 /// to the illegal/unimplemented handling shared with 4-byte instructions,
-/// which C++ only reaches for opcodes its switch doesn't list.
+/// which C++ only reaches for opcodes its switch does not list.
 fn decode_compressed(ci: CInstr) -> Option<OpInfo> {
     let rd = ci.rd();
     Some(match ci.opcode() {

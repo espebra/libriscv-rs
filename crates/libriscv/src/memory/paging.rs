@@ -1,37 +1,21 @@
-//! Port of the virtual paging parts of `memory.hpp`, `memory.cpp`,
-//! `memory_rw.cpp`, `memory_inline.hpp` and `memory_helpers_paging.hpp` /
-//! `memory_inline_pages.hpp` (`RISCV_VIRTUAL_PAGING` together with
-//! `RISCV_FLAT_RW_ARENA`, the configuration of the reference emulator).
+//! Port of virtual paging in `memory.hpp`, `memory.cpp`, `memory_rw.cpp`,
+//! `memory_inline.hpp`, `memory_helpers_paging.hpp`, and `memory_inline_pages.hpp`.
 //!
-//! Guest memory is the flat arena *plus* a page table:
+//! * Guest loads and stores use arena windows first, bypassing page attributes
+//!   as in C++. Other accesses use paging, including page zero, stores below
+//!   the read-only boundary, and addresses outside the arena.
+//! * Host copy, string, and gather helpers check page attributes, including
+//!   within the arena.
+//! * Arena bytes remain in the arena. Only non-default attributes require page
+//!   entries; a bitmap tracks C++-equivalent active pages for `pages_active`,
+//!   `getrusage`, and discard behavior.
+//! * Missing external pages read from the shared zero page and allocate on
+//!   first write. Owned-page limits are half the memory limit with an arena,
+//!   or the full limit without one.
+//! * A page cache accelerates lookups, including all accesses in arena-free
+//!   machines. Forks share pages copy-on-write; see `Memory::fork_page_table`.
 //!
-//! * Guest loads and stores try the arena first, with the two range checks
-//!   of `memory_inline.hpp` and nothing else, so page attributes don't apply
-//!   there (as in C++). Everything else takes the slow path through the page
-//!   table: page 0 (the guard page), stores below `initial_rodata_end`
-//!   (read-only program segments) and anything outside the arena.
-//! * Host-side accessors (`memcpy`, `memcpy_out`, `memstring`, the gather
-//!   functions used by system calls) always go through the page table, so
-//!   they respect page attributes inside the arena too, like C++.
-//! * Pages inside the arena keep their bytes in the arena. C++ inserts an
-//!   arena page into its page table the first time a slow path touches it.
-//!   Here only arena pages with other than default attributes get a page
-//!   table entry; a bitmap records which arena pages C++ would have, so
-//!   that `pages_active` (and with it `getrusage`'s `ru_maxrss` and the
-//!   choices `memdiscard` makes) matches C++ exactly.
-//! * A missing page outside the arena reads as the shared zero page and is
-//!   created by the first write (the default page fault handler), up to
-//!   half the memory limit in owned pages when there is an arena (C++
-//!   `anywhere_pages`), the whole memory limit otherwise.
-//!
-//! * Lookups go through a page cache (C++ `cached_readable_page`,
-//!   `cached_writable_page`; see [`PageTable`]), which is what makes
-//!   machines without an arena fast, forks included.
-//! * A fork loans its master's pages: shared bytes, copy-on-write (see
-//!   `Memory::fork_page_table`).
-//!
-//! Not ported: memory traps (`RISCV_MEMORY_TRAPS`) and custom page fault
-//! handlers (Phase 3).
+//! Custom page-fault handlers and memory traps remain unimplemented.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -192,7 +176,7 @@ const PAGE_CACHE_SIZE: usize = 512;
 /// (`m_rd_cache`, `m_wr_cache`), holding page pointers that it invalidates
 /// at every such change, in front of a hash map. Here a miss costs a
 /// B-tree lookup instead of a hash, so the cache has more entries; a guest
-/// can't make lookups slower than the B-tree's logarithm.
+/// cannot make lookups slower than the B-tree's logarithm.
 #[derive(Debug)]
 pub(super) struct PageTable {
     /// Page number to slot.
@@ -467,7 +451,7 @@ fn empty_page_cache() -> Box<[AtomicUsize]> {
     (0..PAGE_CACHE_SIZE).map(|_| AtomicUsize::new(0)).collect()
 }
 
-/// The bytes of `page`, writable and its own: data it doesn't own (a
+/// The bytes of `page`, writable and its own: data it does not own (a
 /// fork's loaned page, the zero page, the host code page) becomes an owned
 /// copy first (counted in `owned`), and owned bytes a fork still shares
 /// are copied on the way (`Arc::make_mut`). `None` for arena pages, whose
@@ -509,7 +493,7 @@ fn own_page(page: &mut Page, owned: &mut usize) -> bool {
     true
 }
 
-/// Attributes of a page that isn't in the page table and is outside the
+/// Attributes of a page that is not in the page table and is outside the
 /// arena: the copy-on-write zero page (C++ `Page::cow_page()`).
 const COW_ATTR: PageAttributes = PageAttributes {
     read: true,
@@ -832,7 +816,7 @@ impl Memory {
         Ok(out)
     }
 
-    /// The bytes of page `pageno` if it has an entry, is writable and isn't
+    /// The bytes of page `pageno` if it has an entry, is writable and is not
     /// an arena page (C++ `cached_writable_page` hit).
     #[inline(always)]
     fn cached_writable_bytes(&mut self, pageno: u64) -> Option<&mut PageBytes> {
@@ -998,7 +982,7 @@ impl Memory {
 
     /// Zero-copy view of readable `[addr, addr + len)` (C++ `memview`): the
     /// arena's read window, or a single gathered buffer (an
-    /// `OUT_OF_MEMORY` error when the range isn't contiguous on the host).
+    /// `OUT_OF_MEMORY` error when the range is not contiguous on the host).
     /// More than [`MEMVIEW_MAX`](super::MEMVIEW_MAX) bytes is a protection
     /// fault, as with C++'s default `maxlen`.
     pub fn memview(&self, addr: u64, len: u64) -> Result<&[u8]> {
@@ -1249,11 +1233,11 @@ impl Memory {
             }
             return Ok(());
         }
-        // Don't create pages if the defaults apply.
+        // Do not create pages if the defaults apply.
         if attr.is_default() {
             return Ok(());
         }
-        // These pages don't come from the page fault handler, so bound them
+        // These pages do not come from the page fault handler, so bound them
         // here: otherwise mmap() or mprotect() of a huge range would
         // exhaust host memory.
         if self.paging.len() >= self.paging.pages_max {
@@ -1411,7 +1395,7 @@ impl Memory {
                 pageno.wrapping_mul(PAGE_SIZE).wrapping_add(off as u64),
             ));
         }
-        // C++ zeroes data it doesn't own in place here: the shared host
+        // C++ zeroes data it does not own in place here: the shared host
         // code page (for every machine), a fork's read-only loaned page (in
         // its master). This page gets a private copy instead.
         let bytes = if in_arena {
@@ -1479,13 +1463,13 @@ impl Memory {
 
     /// Port of `Memory::memdiscard` with paging (`MADV_DONTNEED`): zero
     /// `[dst, dst + len)`. Missing pages outside the arena already read as
-    /// zeroes and stay missing; pages that can't be written fault unless
+    /// zeroes and stay missing; pages that cannot be written fault unless
     /// `ignore_protections`.
     ///
     /// C++ uses `madvise(MADV_DONTNEED)` for the arena, which drops the
     /// pages instead of writing to them. Here host pages that are already
     /// zero are skipped, so a guest discarding (or mapping) a huge range
-    /// doesn't make the host commit memory for it.
+    /// does not make the host commit memory for it.
     ///
     /// A range past the top of the address space ends there. C++ wraps
     /// around instead: a range that wraps back into its own first page
@@ -1497,7 +1481,7 @@ impl Memory {
         if len == 0 {
             return Ok(());
         }
-        // At most up to 2^64: dst + len - 1 doesn't overflow.
+        // At most up to 2^64: dst + len - 1 does not overflow.
         let len = if dst == 0 {
             len
         } else {
@@ -1592,7 +1576,7 @@ impl Memory {
     ///
     /// The fork has no arena. The arena pages C++ has in its page table
     /// are copied (C++ loans them out of the master's arena); like in C++,
-    /// the fork doesn't see arena pages that only guest loads and stores
+    /// the fork does not see arena pages that only guest loads and stores
     /// touched, which is why forking a machine with an arena is not
     /// useful.
     pub(super) fn fork_page_table(&self, minimal: bool) -> PageTable {
@@ -1693,7 +1677,7 @@ impl Memory {
 
     /// The executable pages around `pageno` and their bytes (the page scan
     /// of C++ `CPU::next_execute_segment`): `(first page, code)`, or `None`
-    /// if `pageno` isn't executable. At most `max_pages` pages.
+    /// if `pageno` is not executable. At most `max_pages` pages.
     pub(crate) fn executable_area(
         &self,
         pageno: u64,

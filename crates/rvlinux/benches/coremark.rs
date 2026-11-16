@@ -156,7 +156,7 @@ fn variants() -> Vec<Variant> {
 }
 
 /// One run: CoreMark's Iterations/Sec, or `None` (with the output printed)
-/// if the run didn't validate.
+/// if the run did not validate.
 fn run(variant: &Variant, elf: &Path) -> Option<f64> {
     let extra = variant
         .prepare

@@ -18,15 +18,14 @@ license = "BSD-3-Clause"
 repository = "https://github.com/libriscv/libriscv-rs"
 
 [workspace.dependencies]
-# Without its default features, so that `rvlinux`'s own `jit` feature
-# decides whether the JIT is built (members list the extensions they use).
+# Workspace members select their ISA and JIT features explicitly.
 libriscv = { path = "crates/libriscv", default-features = false }
 libriscv-jit-rt = { path = "crates/libriscv-jit-rt" }
 testutil = { path = "crates/testutil" }
 
-# The whole point of this port: no `unsafe` anywhere, in any crate, with one
-# exception: `libriscv-jit-rt`, which the optional `jit` feature pulls in, has
-# its own lint table (see its Cargo.toml and "JIT" in PORTING.md).
+# Enforce safe Rust throughout the workspace. `libriscv-jit-rt` defines a
+# separate lint policy for executable memory, native loading, and arena mappings.
+# See its Cargo.toml and the JIT section in PORTING.md.
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"
@@ -36,7 +35,7 @@ rust_2018_idioms = { level = "warn", priority = -1 }
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 # Emulator code does a lot of deliberate integer reinterpretation; keep these
-# visible in review but don't fail on them.
+# visible in review but do not fail on them.
 cast_possible_truncation = "allow"
 cast_sign_loss = "allow"
 cast_possible_wrap = "allow"
@@ -46,10 +45,9 @@ unwrap_used = "warn"
 expect_used = "warn"
 panic = "warn"
 
-# Dependencies (in practice Cranelift and its crates) are always optimized:
-# unoptimized Cranelift compiles a static glibc in ~40 s instead of ~2 s,
-# which made the JIT difftests take most of the test suite's time. Our own
-# crates stay unoptimized and debuggable.
+# Optimize dependencies, including Cranelift, while keeping workspace crates
+# unoptimized for debugging. This reduces static glibc JIT compilation from
+# approximately 40 s to 2 s in differential tests.
 [profile.dev.package."*"]
 opt-level = 3
 

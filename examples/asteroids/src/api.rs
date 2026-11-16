@@ -1,6 +1,6 @@
 //! The ABI between the engine and the game script: the system call number
 //! of every host function. Both sides include this file (the guest with
-//! `#[path]`), so they can't disagree on a number; the signatures are in
+//! `#[path]`), so they cannot disagree on a number; the signatures are in
 //! `guest/src/main.rs` (`host_functions!`) and the handlers in `engine.rs`.
 //!
 //! A Rust guest calls a host function with a dyncall, which is the system

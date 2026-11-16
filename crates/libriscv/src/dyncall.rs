@@ -16,7 +16,7 @@
 //! [`Machine::install_syscall_handler`](crate::Machine::install_syscall_handler)),
 //! with the counts as the guest's promise of which argument registers the
 //! handler reads and writes: an ECALL without `a7`, which never changes PC
-//! (it is never clone-like or an exit), so it doesn't end its block. The
+//! (it is never clone-like or an exit), so it does not end its block. The
 //! interpreter (the `dispatch::dyncall` bytecode) and the JIT (which calls
 //! the handler from native code) both publish the PC, instruction counter
 //! and limit to the handler, and a stop or penalty takes effect right after
@@ -27,8 +27,8 @@
 //! synchronizes only the promised argument registers, `fa0-fa7` in and
 //! `fa0-fa1` out unless [`floats`](Dyncall::floats) is clear, and `sp`
 //! (so that a handler can preempt into the guest). A handler that reads
-//! or writes other registers sees, or leaves, whatever the register file
-//! held last, which under the JIT may differ from the interpreter.
+//! or writes other registers can observe stale values or lose updates
+//! under the JIT, differing from interpreter behavior.
 //!
 //! Not in C++, where a dyncall is a custom instruction whose handler the
 //! decoder hook picks, and only asmjit publishes the counter to it

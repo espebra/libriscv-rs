@@ -119,7 +119,7 @@ pub fn need_coremark() -> bool {
 }
 
 /// Build freestanding CoreMark (performance run parameters, `iterations`
-/// iterations) for `march` with our port (`guests/coremark`): output through
+/// iterations) for `march` with the test port (`guests/coremark`): output through
 /// the `write` system call, time from `rdinstret` (so the output is
 /// deterministic). ABIs with hardware floating point (`lp64d`) also print
 /// the floating-point statistics.
@@ -469,7 +469,7 @@ pub fn rva23_compiler() -> String {
 
 /// Skip-or-fail helper for tests needing [`rva23_compiler`]. Only checked
 /// when `LIBRISCV_REQUIRE_RVA23=1`: CI has no RVA23 toolchain, just as C++
-/// libriscv's CI can't run its RVA23 suite.
+/// libriscv's CI cannot run its RVA23 suite.
 pub fn need_rva23_compiler() -> bool {
     let cc = rva23_compiler();
     let ok = runs(&cc);
@@ -513,7 +513,7 @@ fn build_with_compiler(
         Lang::Cxx => ("cpp", "-std=gnu++17"),
     };
     // Unique names per call: test threads in one process may build the same
-    // guest concurrently, so the source and output can't be shared. The ELF
+    // guest concurrently, so the source and output cannot be shared. The ELF
     // is renamed into place, so nobody sees a half-written one.
     static BUILDS: AtomicU64 = AtomicU64::new(0);
     let unique = format!(

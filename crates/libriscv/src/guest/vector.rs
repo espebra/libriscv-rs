@@ -363,8 +363,8 @@ impl<T: GuestType> GuestPtr<GuestStdVector<T>> {
         self.set(m, &v)
     }
 
-    /// Make room for `elements` (C++ `reserve`): the elements move to a new
-    /// allocation, and the ones that point into themselves are told.
+    /// Reserve capacity for `elements`, moving to a new allocation and relocating
+    /// self-pointers as needed (C++ `reserve`).
     pub fn reserve(&self, m: &mut Machine, elements: usize) -> Result<()> {
         let old = self.get(m)?;
         if elements <= old.capacity() {

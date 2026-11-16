@@ -15,7 +15,7 @@ const ALLOWED_FILES: [&str; 4] = ["/dev/null", "/dev/zero", "/dev/urandom", "/et
 
 fn options() -> MachineOptions {
     MachineOptions {
-        // Small enough that the arena is cheap to create per input.
+        // Limit arena allocation overhead per input.
         memory_max: 16 << 20,
         ..crate::options()
     }
@@ -247,12 +247,12 @@ fn run_for(m: &mut Machine, fuel: u64, stack_top: u64) -> Snapshot {
 /// set and the native memory ones (a fork has no file descriptors,
 /// signals or native heap, so those would legitimately diverge).
 ///
-/// A fork also has its own memory budget: the pages it was loaned don't
+/// A fork also has its own memory budget: the pages it was loaned do not
 /// count against it (C++ marks them non-owning, and its page fault
 /// handler counts owned pages), so a parent at its limit runs out of
 /// memory where its fork goes on. A fork never owns more pages than its
 /// parent, so only the parent can run out first: when it does, the forks
-/// still run, but aren't compared.
+/// still run, but are not compared.
 pub fn fuzz_fork(data: &[u8]) {
     let _ = fork_and_compare(data);
 }
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn libc_functions_are_patched() {
-        // strlen at offset 16 returns 7 unless it's replaced.
+        // strlen at offset 16 returns 7 unless it is replaced.
         let code = words(&[
             jal(1, 16),
             addi(17, 0, 93),
@@ -368,7 +368,7 @@ mod tests {
     }
 
     /// The first `libcfuzzer` finding: a loop falling through into a
-    /// patched `rawmemchr` (which found its byte at once, so cost 0) wasn't
+    /// patched `rawmemchr` (which found its byte at once, so cost 0) was not
     /// counted, and ran past the instruction limit forever.
     #[test]
     fn a_loop_through_a_patched_function_ends() {

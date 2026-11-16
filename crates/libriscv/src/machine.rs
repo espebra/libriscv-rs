@@ -1,23 +1,16 @@
-//! Port of `machine.hpp`, `machine.cpp`, `machine_inline.hpp` and
-//! `machine_defaults.cpp` (the parts the interpreter needs).
+//! Port of `machine.hpp`, `machine.cpp`, `machine_inline.hpp`, and
+//! `machine_defaults.cpp`.
 //!
-//! Differences from C++:
+//! System call handlers are stored per machine and return `Result`.
+//! [`Machine::simulate`] reports timeouts as errors;
+//! [`Machine::try_simulate`] returns `Ok(false)` on timeout.
 //!
-//! * System call handlers are per machine, not per process (no global
-//!   state), and return `Result` instead of throwing.
-//! * The `simulate<Throw>` template parameter becomes two methods:
-//!   [`Machine::simulate`] (timeout is an error) and
-//!   [`Machine::try_simulate`] (timeout returns `Ok(false)`).
+//! Linux setup, threads, signals, VM calls, typed system call arguments, and
+//! native helpers are defined in their respective modules. Serialization is
+//! not implemented.
 //!
-//! Linux setup is in `linux.rs`, threads in `threads.rs` and signals in
-//! `signals.rs`, VM calls in `vmcall.rs`, typed `sysargs`/`set_result` in
-//! `sysargs.rs`, the native heap and libc fast path in `native/`. Not
-//! ported yet: serialization (Phase 3).
-//!
-//! C++'s `set_userdata(T*)` / `get_userdata<T>()` user pointer is an owned
-//! `Box<dyn Any + Send + Sync>` here ([`Machine::set_userdata`]), checked
-//! by type on access. To share state with the host the way the C++ pointer
-//! does, store an `Arc` of it.
+//! Userdata is stored as `Box<dyn Any + Send + Sync>` and checked by type on
+//! access. Store an `Arc` to share it with the host.
 
 use std::any::Any;
 use std::io::Write;
@@ -48,7 +41,7 @@ pub type Rdtime = fn(&Machine) -> u64;
 pub type Stdin = fn(&Machine, &mut [u8]) -> i64;
 /// The handler of a custom instruction (C++ `Instruction::handler`).
 pub type CustomInstruction = fn(&mut Machine, Instr) -> Result<()>;
-/// Picks the handler for an instruction the decoder doesn't know, or
+/// Picks the handler for an instruction the decoder does not know, or
 /// `None` for the UNIMPLEMENTED_INSTRUCTION fault (C++
 /// `CPU::on_unimplemented_instruction`, returning
 /// `get_unimplemented_instruction()` for `None`).
@@ -130,15 +123,13 @@ fn default_rdtime(m: &Machine) -> u64 {
 }
 
 impl Machine {
-    /// Create a machine and load `binary` (a 64-bit RISC-V ELF) into it.
-    /// An empty `binary` creates a machine with empty memory and no code.
+    /// Create a machine from a 64-bit RISC-V ELF. An empty `binary` creates
+    /// empty memory without code.
     ///
-    /// The machine holds `binary` by reference count instead of copying
-    /// it: every machine created from the same `Arc` (and every fork of
-    /// them) shares one copy of the ELF, which stays alive while any of
-    /// them does. The bytes are never written to. A `Vec<u8>` or `&[u8]`
-    /// converts with `.into()` (one copy); [`Memory::binary`] hands the
-    /// `Arc` back for creating more machines.
+    /// The machine retains the `Arc` without modifying or copying the ELF bytes.
+    /// Machines and forks using the same `Arc` share its storage.
+    /// Use `.into()` to convert a `Vec<u8>` or slice; slice conversion copies.
+    /// [`Memory::binary`] returns the retained `Arc` for creating more machines.
     pub fn new(binary: Arc<[u8]>, options: MachineOptions) -> Result<Self> {
         if options.jit && !cfg!(feature = "jit") {
             return Err(MachineError::new(
@@ -187,30 +178,22 @@ impl Machine {
         self.fork_with(self.options.clone())
     }
 
-    /// Port of the forking constructor `Machine(const Machine& main,
-    /// MachineOptions)`: a new machine that continues from this one's
-    /// state, sharing its memory copy-on-write.
+    /// Create a snapshot with the specified options, sharing memory copy-on-write
+    /// (C++ `Machine(const Machine&, MachineOptions)`).
     ///
-    /// The fork loans every page of this machine (except `dont_fork`
-    /// ones; with `options.minimal_fork`, none), sharing the bytes until
-    /// either machine writes to them, and shares the execute segments and
-    /// the system call table, so forking costs about one page table entry
-    /// per page and no page copies. It starts with this machine's
-    /// registers, instruction counter and limit, and threads.
+    /// Shares all pages except `dont_fork` pages, or none with `minimal_fork`.
+    /// Copies occur when either machine writes. Execute segments and the system
+    /// call table are shared; registers, instruction counter, limit, and thread
+    /// state are copied. The source may change or be dropped independently, and
+    /// forks may be forked again.
     ///
-    /// Like C++, a fork does not get this machine's printer, stdin and
-    /// rdtime callbacks (it has the defaults), file descriptors, signal
-    /// handlers or userdata. The callbacks for unhandled system calls, CSRs
-    /// and instructions are kept (C++ has them per process).
+    /// Printer, stdin, and rdtime callbacks reset to defaults. File descriptors,
+    /// signal handlers, and userdata are not inherited. Callbacks for unhandled
+    /// system calls, CSRs, and instructions are retained.
     ///
-    /// Unlike C++, this machine may be changed or dropped while forks
-    /// exist: a fork sees it as it was at the fork. A fork can be forked
-    /// again.
-    ///
-    /// Forks have no arena, so make the machine to fork from with
-    /// `use_memory_arena: false`. With `options.use_memory_arena` set,
-    /// forking a machine that has an arena fails with
-    /// `ILLEGAL_OPERATION`, as in C++.
+    /// Forks have no arena. Create the source with `use_memory_arena: false`.
+    /// Forking an arena-backed machine with `options.use_memory_arena` enabled
+    /// returns `ILLEGAL_OPERATION`, matching C++.
     pub fn fork_with(&self, options: MachineOptions) -> Result<Self> {
         if options.jit && !cfg!(feature = "jit") {
             return Err(MachineError::new(
@@ -239,7 +222,7 @@ impl Machine {
             mt: self.mt.clone(),
             signals: None,
             userdata: None,
-            // Forks don't get the native heap (a C++ TODO).
+            // Forks do not get the native heap (a C++ TODO).
             arena: None,
             previous_ebreak: self.previous_ebreak,
         })
@@ -320,9 +303,8 @@ impl Machine {
         Ok(())
     }
 
-    /// Switch to the native code of background JIT compilations that have
-    /// finished (with `wait`, block until all of them have), the current
-    /// execute segment included.
+    /// Install completed background JIT results, including the current segment.
+    /// If `wait` is true, wait for pending compilations first.
     #[cfg(feature = "jit")]
     pub(crate) fn refresh_execute_segments(&mut self, wait: bool) {
         #[cfg(test)]
@@ -339,21 +321,15 @@ impl Machine {
         }
     }
 
-    /// Block until the background JIT compilations of this machine's execute
-    /// segments have finished, and switch to their native code. Does nothing
-    /// without pending compilations. The compilations belong to the
-    /// segments, not to the machine that started them: a fork, or a machine
-    /// sharing a segment (`use_shared_execute_segments`), waits for the same
-    /// compilation and gets the same native code.
+    /// Wait for this machine's pending segment compilations and install the results.
+    /// Forks and machines sharing a segment wait for the same compilation.
     pub fn wait_for_jit(&mut self) {
         #[cfg(feature = "jit")]
         self.refresh_execute_segments(true);
     }
 
-    /// True while a background JIT compilation of one of this machine's
-    /// execute segments is running, or has finished and the machine hasn't
-    /// switched to its native code yet (it does at its next slice, see
-    /// `MachineOptions::jit_background`).
+    /// True if a segment compilation is running or its result awaits installation.
+    /// Results are installed at the next slice; see `MachineOptions::jit_background`.
     pub fn jit_pending(&self) -> bool {
         #[cfg(feature = "jit")]
         return self.memory.jit_pending() || self.cpu.exec.jit_outstanding();
@@ -387,23 +363,21 @@ impl Machine {
     pub const fn set_max_instructions(&mut self, value: u64) {
         self.max_counter = value;
     }
-    /// Charge extra instructions (C++ `penalize`). Saturating, unlike C++:
-    /// a counter that wrapped would hand the guest a fresh budget.
+    /// Charge extra instructions, saturating at `u64::MAX` to prevent budget
+    /// renewal through overflow (C++ `penalize`).
     pub const fn penalize(&mut self, value: u64) {
         self.counter = self.counter.saturating_add(value);
     }
 
-    /// Attach a value of your own to the machine, replacing any previous
-    /// one (C++ `set_userdata`). It's available to everything that gets the
-    /// machine: system call handlers, printers, custom instructions. A
-    /// printer only gets `&Machine`, so state it changes needs interior
-    /// mutability (an atomic or a `Mutex`). Store an `Arc` to keep a handle
-    /// on the host side, like the C++ user pointer.
+    /// Replace the machine's userdata (C++ `set_userdata`).
+    /// Handlers, printers, and custom instructions can access it. Printers receive
+    /// `&Machine`, so mutable printer state requires interior mutability.
+    /// Store an `Arc` to retain a host reference.
     pub fn set_userdata<T: Any + Send + Sync>(&mut self, data: T) {
         self.userdata = Some(Box::new(data));
     }
     /// The userdata, if there is some of type `T` (C++ `get_userdata<T>`,
-    /// which can't check the type).
+    /// which cannot check the type).
     pub fn userdata<T: Any>(&self) -> Option<&T> {
         self.userdata.as_deref()?.downcast_ref()
     }
@@ -420,14 +394,13 @@ impl Machine {
         let data: Box<dyn Any> = self.userdata.take()?;
         data.downcast().ok().map(|b| *b)
     }
-    /// Run `f` with the userdata of type `T` and the machine, both
-    /// mutably: for a system call handler that changes its own state while
-    /// it reads its arguments or guest memory, which borrow the machine
-    /// (`userdata_mut` would borrow all of it). The userdata is moved out of
-    /// the machine while `f` runs and back afterwards (no allocation), so
-    /// inside `f` the machine has none, and userdata that `f` sets is
-    /// dropped in favour of it. `None`, without calling `f`, unless there
-    /// is userdata of type `T`.
+    /// Run `f` with mutable access to userdata of type `T` and the machine.
+    /// Enables state updates while borrowing system call arguments or guest memory.
+    /// Returns `None` without calling `f` if userdata has a different type or is absent.
+    ///
+    /// Userdata is temporarily removed without allocation and restored afterwards.
+    /// During `f`, the machine has no userdata; any replacement set by `f` is
+    /// dropped when the original is restored.
     ///
     /// ```no_run
     /// # struct Screen; impl Screen { fn text(&mut self, _: i32, _: i32, _: &str) {} }
@@ -486,8 +459,8 @@ impl Machine {
     ///
     /// With the libc fast path (`MachineOptions::libc_fastpath`), an
     /// EBREAK handler ([`SYSCALL_EBREAK_NR`]) becomes the one the fast
-    /// path's handler chains to for EBREAKs that aren't patched functions,
-    /// so the order of set-up doesn't matter.
+    /// path's handler chains to for EBREAKs that are not patched functions,
+    /// so the order of set-up does not matter.
     pub fn install_syscall_handler(&mut self, number: usize, handler: SyscallHandler) {
         debug_assert!(
             number < SYSCALLS_MAX,
@@ -546,22 +519,15 @@ impl Machine {
     pub const fn set_on_unhandled_csr(&mut self, f: UnhandledCsr) {
         self.on_unhandled_csr = f;
     }
-    /// Set the hook for instructions the decoder doesn't know (C++
-    /// `CPU::on_unimplemented_instruction`), for custom instructions: it
-    /// returns the handler to run, or `None` for the
-    /// UNIMPLEMENTED_INSTRUCTION fault. C++'s hook is one per process and
-    /// asked once per decoder entry; this one is per machine (kept by
-    /// forks) and asked each time such an instruction executes, so it
-    /// should be a quick match on the instruction bits.
+    /// Set the custom-instruction hook (C++ `CPU::on_unimplemented_instruction`).
+    /// The hook returns a handler or `None` for `UNIMPLEMENTED_INSTRUCTION`.
+    /// It is per machine, inherited by forks, and called on each execution of an
+    /// instruction the decoder does not recognize. Keep the lookup inexpensive.
     ///
-    /// Only instructions the decoder falls through on reach it (the
-    /// reserved custom opcodes, for example, but not encodings the
-    /// decoder rejects as illegal itself, as in C++). The interpreter runs
-    /// the handler mid-block without making the PC or the instruction
-    /// counter visible to it, like C++. Valid [`Dyncall`](crate::Dyncall)
-    /// words don't reach it: they are system calls, numbered by their
-    /// index, with the exact PC and counter visible to the handler (unlike
-    /// C++, where they are custom instructions too).
+    /// Encodings explicitly rejected by the decoder do not invoke the hook.
+    /// The handler runs mid-block without publishing PC or the instruction counter.
+    /// Valid [`Dyncall`](crate::Dyncall) words invoke system calls instead, with
+    /// exact PC and counter values.
     pub const fn set_on_unimplemented_instruction(&mut self, f: UnimplementedInstruction) {
         self.on_unimplemented_instruction = Some(f);
     }
@@ -826,11 +792,11 @@ impl Machine {
             // funct3 has three bits, so all values are handled above.
             _ => {}
         }
-        // If we got here, it's an illegal operation!
+        // Reject unsupported SYSTEM instructions.
         Err(illegal_operation(it.funct3()))
     }
 
-    /// The CSRRS case (also reached from CSRRW for CSRs it doesn't know).
+    /// The CSRRS case (also reached from CSRRW for CSRs it does not know).
     fn csrrs(&mut self, has_rd: bool, rd: u32, csr: u32, rs1: u32) -> Result<()> {
         let src = self.cpu.reg(rs1);
         let fcsr = self.cpu.regs.fcsr();

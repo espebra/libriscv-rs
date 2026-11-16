@@ -1,7 +1,6 @@
-//! A dynamic executable's `PT_INTERP` must not choose a host file:
-//! rvlinux always runs its own dynamic linker. Before, it read whatever
-//! path the guest named, so `/dev/zero` exhausted host memory and a FIFO
-//! hung rvlinux.
+//! Dynamic-linker selection tests. `rvlinux` must use its configured host
+//! linker rather than open guest-selected `PT_INTERP` paths, including devices
+//! and FIFOs that could exhaust memory or block execution.
 
 #![allow(
     clippy::panic,

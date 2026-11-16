@@ -1,33 +1,22 @@
-//! Port of the control-flow layout in `tr_emit.cpp` (which writes `goto`s).
+//! Port of control-flow layout in `tr_emit.cpp`, using structured Rust.
 //!
-//! Laying out a region's control flow as structured Rust, after Norman
-//! Ramsey's "Beyond Relooper: Recursive Translation of Unstructured Control
-//! Flow to Structured Control Flow" (ICFP 2022), the algorithm WebAssembly
-//! compilers use. C++'s translator writes `goto`s; Rust has none, so
-//! forward branches become `break 'b<n>` out of labeled blocks, back edges
-//! `continue 'l<n>` of loops, and LLVM sees plain branches. (A `loop { match
-//! pc { .. } }` dispatcher is what [`dispatch`] writes instead: LLVM doesn't
-//! thread the constant `pc` of direct transfers through the loop header, so
-//! every transfer would be an indirect jump through the `match`, with all
-//! the guest registers merged at one point.)
+//! The algorithm follows Norman Ramsey's "Beyond Relooper: Recursive Translation
+//! of Unstructured Control Flow to Structured Control Flow" (ICFP 2022).
+//! Forward branches use labeled `break`; back edges use loop `continue`.
+//! LLVM can lower these to direct branches. [`dispatch`] provides a
+//! `loop { match pc { .. } }` fallback, where LLVM retains indirect dispatch
+//! and merges guest registers at the loop header.
 //!
 //! # Entries
 //!
-//! Every label of a region can be entered from outside (the interpreter
-//! begins blocks there, other regions jump there), which the layout models
-//! as a root `match pc` with an edge to each label. Entering a loop
-//! anywhere but at its header makes the control flow irreducible, which
-//! structured code can't express. So such an entry goes to a copy of the
-//! loop's body without its header, which runs the rest of the iteration and
-//! then enters the loop at its header; loops nested in the copy are treated
-//! the same way. Edges from the region's own code that enter a loop at the
-//! side (statically irreducible control flow) use the copies too. Code only
-//! grows with the loop nesting depth, and the copies are cold: they run at
-//! most one partial iteration per entry.
+//! A root `match pc` models external entries to region labels. Side entries
+//! and irreducible edges target copies of loop bodies without their headers.
+//! Each copy completes the partial iteration before entering the loop header;
+//! nested loops are handled recursively. Copies execute at most one partial
+//! iteration per entry, with growth bounded by loop nesting depth.
 //!
-//! If the result still isn't reducible (it always should be; this is a
-//! safety net), or grows too large, the region is written as a
-//! [`dispatch`] loop instead, which is always correct.
+//! Regions exceeding the growth limit or retaining irreducible control flow
+//! use the [`dispatch`] fallback.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -42,7 +31,7 @@ pub(super) const MAX_GROWTH: usize = 8;
 /// arms, whose transfers set `pc` and continue it. An entry without an arm
 /// (which makes [`structure`] give up) counts its block and leaves with
 /// `EXIT_SLOW`: the interpreter runs the block with its own handlers, and
-/// doesn't count it again (`EXIT_JUMP` would, and would re-enter here
+/// does not count it again (`EXIT_JUMP` would, and would re-enter here
 /// through the patched entry, as would the entry table, `A::I`).
 pub(super) fn dispatch(arms: &[Arm], entry_counts: &[(u64, u64)]) -> String {
     use crate::native_code::{EXIT_JUMP, EXIT_SLOW};
@@ -319,7 +308,7 @@ impl Builder<'_> {
                     *members.get_mut(lp.header)? = false;
                     // The loops enclosing `l`: those before it on its
                     // header's chain. (Every one of them is in `inside`,
-                    // or `l` wouldn't be the outermost loop entered at the
+                    // or `l` would not be the outermost loop entered at the
                     // side.)
                     let chain = s.chains.get(lp.header)?;
                     let context = chain.iter().copied().take_while(|&e| e != l).collect();
@@ -537,7 +526,7 @@ impl Writer<'_> {
 }
 
 /// Add an entry's block count `k` to the counter (nothing for 0: code
-/// ignoring the instruction limit doesn't count).
+/// ignoring the instruction limit does not count).
 fn count(k: u64) -> String {
     if k == 0 {
         String::new()
@@ -547,7 +536,7 @@ fn count(k: u64) -> String {
 }
 
 /// The region's control flow as structured code, and the entries it has,
-/// or `None` if it can't be laid out within `max_growth` nodes per label
+/// or `None` if it cannot be laid out within `max_growth` nodes per label
 /// (then use [`dispatch`]). `entry_counts` are the labels with the block
 /// count entering there adds. Without `side_entries`, the entries that
 /// would enter a loop anywhere but at its header are left out, and need

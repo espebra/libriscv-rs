@@ -1,15 +1,10 @@
-//! Port of the host-side guest memory helpers in `memory_helpers_paging.hpp`
-//! (`membuffer`, `memstring_view`, `strlen`, `memarray`, `try_memarray`,
-//! `memspan`, `try_memmove`, both `memcmp`s and the machine-to-machine
-//! `memcpy`) and of `util/buffer.hpp` (`riscv::Buffer`).
+//! Port of guest memory helpers in `memory_helpers_paging.hpp` and
+//! `util/buffer.hpp`: buffers, strings, typed views, comparisons, and copies.
 //!
-//! C++ hands out raw pointers into guest memory (`T*`, `std::span<T>`,
-//! `std::array<T, N>*`). Safe Rust can't reinterpret guest bytes as `T`, so
-//! the typed views here ([`GuestSlice`], [`GuestSliceMut`]) wrap the
-//! zero-copy byte view and decode/encode elements through [`GuestPod`] on
-//! access. They still alias guest memory: writes through a
-//! [`GuestSliceMut`] are visible to the guest, exactly like writes through
-//! C++'s pointer.
+//! [`GuestSlice`] and [`GuestSliceMut`] wrap zero-copy byte views and use
+//! [`GuestPod`] to decode and encode elements on access. Writes through a
+//! mutable view update guest memory directly without reinterpreting bytes as
+//! Rust references.
 
 use std::cmp::Ordering;
 use std::marker::PhantomData;
@@ -34,7 +29,7 @@ pub trait GuestPod: Sized {
     /// `sizeof(T)` in the guest.
     const SIZE: usize;
     /// `alignof(T)` in the guest. The typed views fault on addresses that
-    /// aren't a multiple of it, as C++ does.
+    /// are not a multiple of it, as C++ does.
     const ALIGN: usize;
     /// Append the value's guest representation (exactly [`SIZE`](Self::SIZE)
     /// bytes).
@@ -128,7 +123,7 @@ impl<'a> Buffer<'a> {
     }
     /// Port of `Buffer::copy_to(char*, size_t)`: copy as many whole pieces
     /// as fit in `dst`, returning the bytes copied. Nothing is copied if
-    /// the first piece doesn't fit.
+    /// the first piece does not fit.
     pub fn copy_to(&self, dst: &mut [u8]) -> usize {
         let mut len = 0;
         for piece in &self.pieces {
@@ -282,7 +277,7 @@ impl<'a, T: GuestPod> GuestSliceMut<'a, T> {
 }
 
 /// `count * T::SIZE`, faulting at `addr` when it would exceed `maxbytes`
-/// (C++ `count > maxbytes / sizeof(T)`, so the multiplication can't
+/// (C++ `count > maxbytes / sizeof(T)`, so the multiplication cannot
 /// overflow).
 fn array_bytes<T: GuestPod>(addr: u64, count: u64, maxbytes: u64) -> Result<u64> {
     let size = T::SIZE as u64;
@@ -297,9 +292,9 @@ fn misaligned<T: GuestPod>(addr: u64) -> bool {
     addr.checked_rem(T::ALIGN as u64).is_some_and(|r| r != 0)
 }
 
-/// How a chunk of an element-wise copy loop reads its own stores, so that
-/// copying the chunk at once gives what the loop gives: the source bytes
-/// as loaded before the chunk, with the loop's repeats applied.
+/// Overlap behavior required for chunked copies to match element-wise loops.
+/// Source bytes are captured before the chunk and adjusted for repeated reads
+/// of earlier stores.
 #[derive(Debug, Clone, Copy)]
 enum Overlap {
     /// Copying forwards with `dst` this far ahead of `src` (modulo 2^64):
@@ -316,8 +311,7 @@ impl Overlap {
         Overlap::Forward(dst.wrapping_sub(src))
     }
 
-    /// Turn `chunk`, the source bytes as they were before the chunk, into
-    /// what the loop stores.
+    /// Apply overlap repetition to the chunk's captured source bytes.
     fn apply(self, chunk: &mut [u8]) {
         match self {
             Overlap::Forward(d) => {
@@ -424,7 +418,7 @@ impl Memory {
     /// `maxlen` bytes (C++ default [`MEMSTRING_MAX`](super::MEMSTRING_MAX)).
     /// Only strings starting inside the flat arena can be viewed; anything
     /// else is a protection fault. Like C++, the arena's read window and
-    /// page attributes aren't checked.
+    /// page attributes are not checked.
     pub fn memstring_view(&self, addr: u64, maxlen: usize) -> Result<&[u8]> {
         if addr < self.arena_size {
             let limit = (maxlen as u64).min(self.arena_size - addr);
@@ -438,7 +432,7 @@ impl Memory {
 
     /// Port of `Memory::try_memmove`: move `len` bytes from `src` to `dst`
     /// inside the flat arena (overlap allowed). Returns false, moving
-    /// nothing, when either range isn't in the arena or `dst` is below the
+    /// nothing, when either range is not in the arena or `dst` is below the
     /// read-only boundary.
     pub fn try_memmove(&mut self, dst: u64, src: u64, len: u64) -> bool {
         if dst == src || len == 0 {
@@ -712,8 +706,8 @@ impl Memory {
         Ok(())
     }
 
-    /// The element-wise loop [`memcpy_within`](Self::memcpy_within) had
-    /// before copying in chunks (C++'s), to test the chunks against.
+    /// Element-wise reference implementation for testing chunked
+    /// [`memcpy_within`](Self::memcpy_within), matching C++ copy order.
     #[cfg(test)]
     pub(super) fn memcpy_within_elementwise(&mut self, dst: u64, src: u64, len: u64) -> Result<()> {
         let (mut dst, mut src, mut len) = (dst, src, len);
@@ -765,27 +759,18 @@ impl Memory {
         Ok(())
     }
 
-    /// How many of the next `len` bytes [`memcpy_within`](Self::memcpy_within)
-    /// can copy at once instead of a byte or word at a time (C++'s loop,
-    /// with a page lookup per element; a native memcpy of up to 512 MiB
-    /// runs before its penalty is charged), or 0. The chunk must give
-    /// exactly what the loop gives:
+    /// Return a safe chunk size for [`memcpy_within`](Self::memcpy_within),
+    /// or 0 to copy one element. Native copies can process up to 512 MiB before
+    /// charging their instruction penalty.
     ///
-    /// - Both ranges stay within one page, outside the arena: every load
-    ///   and store of the loop goes through the page table (no arena
-    ///   window), to the same two pages, so the loop's first element
-    ///   already faults, creates or resolves copy-on-write as the chunk
-    ///   does, in the same order (the load, then the store).
-    /// - With `dst` ahead of `src` by less than the chunk, the loop's later
-    ///   loads see its earlier stores (the bytes repeat); the chunk copies
-    ///   them the same way (see [`Overlap`]). Behind or equal, the loop
-    ///   never loads what it stored.
+    /// Both ranges stay within individual pages outside the arena. Source lookup
+    /// precedes writable destination lookup, preserving faults, page creation,
+    /// and copy-on-write order. Overlapping copies reproduce loads of earlier
+    /// stores through [`Overlap`].
     ///
-    /// The 32-byte loop checks for its arena shortcut at each step, and a
-    /// chunk is outside the arena, where the check fails. If `src` wraps
-    /// around the address space it can reach the arena later, so there
-    /// the caller takes whole steps, keeping the check at the same places.
-    /// Otherwise `src` never comes back to the arena after a chunk.
+    /// The reference loop tests its arena shortcut every 32 bytes. If `src` can
+    /// wrap back into the arena, the caller retains whole steps so these checks
+    /// occur at the same addresses.
     fn paged_copy_chunk(&self, dst: u64, src: u64, len: u64) -> u64 {
         if !self.outside_arena(src) || !self.outside_arena(dst) {
             return 0;
@@ -860,24 +845,17 @@ impl Memory {
         Ok(())
     }
 
-    /// How many bytes [`memmove_backward`](Self::memmove_backward) can copy
-    /// as one chunk ending at `dst + i` / `src + i`, or 0 to take one
-    /// element. The chunk stays in one page of each end, and each end is
-    /// either outside the arena (keeping the loop's page-at-a-time faults:
-    /// a source page is read, then the destination page made writable, as
-    /// the chunk's first element does) or wholly in the arena's read
-    /// (source) or write (destination) window, where the loop's loads and
-    /// stores never fault and skip the page table. Going backwards, a store can only
-    /// reach a later load when `dst` is behind `src` modulo 2^64 (the copy
-    /// wraps the address space); the chunk copies those the loop's way
-    /// (see [`Overlap`]). The bounds are multiples of 8 when the addresses
-    /// are.
+    /// Return a backward chunk size ending at `dst + i` and `src + i`, or 0
+    /// for one element. Each end stays within one page or wholly within its arena
+    /// window. Source access precedes writable destination access, preserving
+    /// fault order. Wrapped overlap uses [`Overlap`] to reproduce later loads of
+    /// earlier stores. Aligned copies retain 8-byte chunk boundaries.
     fn paged_copy_chunk_back(&self, dst: u64, src: u64, i: u64) -> u64 {
         let (s_last, d_last) = (src.wrapping_add(i - 1), dst.wrapping_add(i - 1));
         let n = i
             .min((s_last & PAGE_MASK) + 1)
             .min((d_last & PAGE_MASK) + 1);
-        // In one page, so the starts don't wrap.
+        // In one page, so the starts do not wrap.
         let (s_first, d_first) = (s_last - (n - 1), d_last - (n - 1));
         let src_ok = self.outside_arena(s_last) || self.read_window_range(s_first, n).is_some();
         let dst_ok = self.outside_arena(d_last) || self.write_window_range(d_first, n).is_some();
@@ -974,7 +952,7 @@ impl Memory {
     /// Port of `Memory::memarray<const T>(addr, count, maxbytes)`: a
     /// read-only view of `count` elements at `addr`. A misaligned `addr`
     /// (unless `count` is 0), more than `maxbytes` (C++ default
-    /// [`MEMVIEW_MAX`]) or memory that isn't one contiguous host range is a
+    /// [`MEMVIEW_MAX`]) or memory that is not one contiguous host range is a
     /// fault.
     pub fn memarray<T: GuestPod>(
         &self,

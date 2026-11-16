@@ -1,5 +1,5 @@
 //! What nanosleep and clock_nanosleep charge: one instruction per
-//! microsecond requested, saturating, so a huge request can't be free while
+//! microsecond requested, saturating, so a huge request cannot be free while
 //! the host still sleeps. A suspended second thread keeps each host sleep
 //! at 1 ms.
 

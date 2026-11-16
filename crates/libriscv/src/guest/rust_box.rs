@@ -1,17 +1,13 @@
 //! Port of `guest/guest_rust_box.hpp`: Rust's owning pointers, `Box<T>`,
 //! `Box<[T]>` and `Box<str>`, in guest memory.
 //!
-//! `Box` is the one Rust smart pointer whose layout the language
-//! guarantees: for a sized `T` it is one non-null pointer. The two unsized
-//! forms are the fat pointers of a slice and a `&str`, `{ ptr, len }`, with
-//! ownership. `Box::from_raw` on a host allocation is sound when the guest's
-//! global allocator is the native heap, which is what makes ownership cross
-//! the boundary in both directions.
+//! For sized `T`, `Box<T>` has a guaranteed single non-null pointer layout.
+//! Boxed slices and strings use `{ ptr, len }`. Ownership can transfer between
+//! host and guest when the guest's global allocator uses the native heap.
 //!
-//! A null box isn't a `Box<T>`: it is `Option<Box<T>>::None`, the one
-//! `Option` whose null representation is documented. A default or freed
-//! [`GuestRustBox`] is exactly that, and must not be handed to the guest as
-//! a `Box<T>`.
+//! A null pointer represents `Option<Box<T>>::None`, not a valid `Box<T>`.
+//! Default and freed [`GuestRustBox`] values are null and must not be passed
+//! to the guest as `Box<T>`.
 
 use std::marker::PhantomData;
 
@@ -42,11 +38,10 @@ use crate::vmcall::{ArgRegs, VmCallArg};
 /// ```
 ///
 /// `T` may be the type containing the box (a tree), as the box's layout
-/// doesn't depend on it. Copies are shallow: only one of them may free.
+/// does not depend on it. Copies are shallow: only one of them may free.
 ///
-/// Its own methods are few on purpose (`new`, `from_raw`, `into_raw`,
-/// `is_null`, `free`), so that the boxed value's in-place methods are
-/// reachable through the dereference without being shadowed.
+/// Ownership methods (`new`, `from_raw`, `into_raw`, `is_null`, `free`)
+/// leave the boxed value's mutation methods accessible through dereferencing.
 pub struct GuestRustBox<T> {
     ptr: GuestPtr<T>,
 }
@@ -59,8 +54,8 @@ impl<T> GuestRustBox<T> {
             ptr: GuestPtr::new(addr),
         }
     }
-    /// Give up ownership without freeing anything (`Box::into_raw`): the
-    /// caller owns the allocation from here on.
+    /// Transfer ownership to the caller without freeing the allocation
+    /// (`Box::into_raw`).
     pub const fn into_raw(self) -> u64 {
         self.ptr.address()
     }
@@ -116,7 +111,7 @@ impl<T: GuestType> GuestRustBox<T> {
     /// (a shallow copy that takes over what it owns).
     pub fn new<A: GuestInit<T> + ?Sized>(m: &mut Machine, value: &A) -> Result<Self> {
         if T::SIZE == 0 {
-            // Rust doesn't allocate a zero-sized value: the box dangles
+            // Rust does not allocate a zero-sized value: the box dangles
             let addr = rust_dangling::<T>();
             value.init_at(m, addr)?;
             return Ok(Self::from_raw(addr));
@@ -202,7 +197,7 @@ impl<T> GuestRustBoxedSlice<T> {
     pub const fn as_ptr(&self) -> u64 {
         self.ptr
     }
-    /// Borrow the whole thing as a guest slice.
+    /// Borrow the elements as a guest slice.
     pub const fn as_slice(&self) -> GuestRustSlice<T> {
         GuestRustSlice::from_raw_parts(self.ptr, self.len)
     }

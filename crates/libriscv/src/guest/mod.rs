@@ -1,84 +1,52 @@
 //! Port of `guest_datatypes.hpp`, `guest/guest_common.hpp`,
-//! `guest/guest_cpp_common.hpp`, `guest/guest_rust_common.hpp` and
-//! `guest/guest_arena_object.hpp`: host-side access to the containers that
-//! live in guest memory: the C++ standard containers in libstdc++'s layout
-//! (`std::string`, `std::vector`, `std::unordered_map`, `std::variant`),
-//! and Rust's (`String`, `&str`, `Vec<T>`, `&[T]`, `Box<T>`, `Box<[T]>`,
-//! `Box<str>`, `#[repr(C, uN)]` enums and a sorted attribute map).
+//! `guest/guest_cpp_common.hpp`, `guest/guest_rust_common.hpp`, and
+//! `guest/guest_arena_object.hpp`: host access to RV64 guest containers.
 //!
-//! # Design
+//! Supported layouts include libstdc++ `std::string`, `std::vector`,
+//! `std::unordered_map`, and `std::variant`; Rust strings, vectors, slices,
+//! boxes, `#[repr(C, uN)]` enums, and sorted attribute maps.
 //!
-//! C++ views these containers through raw pointers into guest memory and
-//! changes them in place; a `std::string` (small-string optimization) and a
-//! `std::unordered_map` (its `before_begin` node and single bucket) point
-//! back into themselves. Here:
+//! # Object access and ownership
 //!
-//! * Each container is a [`GuestPod`] value type with the guest layout
-//!   ([`GuestStdString`], [`GuestStdVector`], [`GuestStdUnorderedMap`],
-//!   [`GuestStdVariant`]), so it can be read, copied, nested and passed by
-//!   value like the C++ mirror. Read-only methods work on such values.
-//! * Everything that changes a container works *in place*, on the object
-//!   at its guest address, through a typed handle: [`GuestPtr<T>`] (C++
-//!   `GuestRef`, or a `T*` from `memarray`). That keeps the self-pointers
-//!   coherent without a host copy that could go stale. Methods take the
-//!   machine explicitly, so handles don't borrow it and can be passed to
-//!   `vmcall` while alive.
-//! * [`ScopedArenaObject<T>`] owns a `T` on the native heap (the machine's
-//!   arena, see `setup_native_heap`). C++ frees it in a destructor; Rust
-//!   can't reach the machine from `Drop`, so call
-//!   [`ScopedArenaObject::free`] (it is `#[must_use]`).
-//! * The traits replace C++'s type-trait dispatch: [`GuestType`] (free and
-//!   relocate an object at an address: `free_guest_object`,
-//!   `relocate_guest_object`) and [`GuestInit`] (construct one from a host
-//!   value: `construct_guest_object`).
+//! Containers implement [`GuestPod`] with the guest memory layout. Copies are
+//! shallow and share guest allocations; only one copy may free an allocation.
+//! C++ containers may contain pointers into themselves and require relocation
+//! after a bytewise move. Mutations use [`GuestPtr<T>`] to update objects at
+//! their guest addresses and keep those pointers valid.
 //!
-//! The Rust collections are not a port: they are a Rust scripting layer
-//! with the names of `std` (`len`, `is_empty`, `push`, `pop`, `get`,
-//! `insert`, `remove`, `as_str`, `from_raw_parts`, ...), with one
-//! difference that follows from where the data lives: every method that
-//! touches guest memory takes the [`Machine`], and returns a [`Result`]
-//! because the guest may have lied about what is there.
+//! [`GuestType`] defines freeing and relocation; [`GuestInit`] constructs
+//! objects from host values. [`ScopedArenaObject<T>`] owns a native-heap object
+//! and its allocations. Call [`ScopedArenaObject::free`] explicitly: `Drop`
+//! cannot access the machine.
 //!
-//! - [`GuestRustString`], [`GuestRustVec`], [`GuestRustBoxedSlice`],
-//!   [`GuestRustBoxedStr`] and [`GuestRustAttributes`] are host-side copies
-//!   of the words of a guest collection (a Rust move is a memcpy, and
-//!   nothing points into itself). Their `&mut self` methods change the
-//!   copy, and the guest sees the change once the copy is written back.
-//! - A [`GuestPtr`] to one of them has the same methods, which read, change
-//!   and write back the collection in place.
-//! - [`GuestRustBox<T>`] owns a `T` on the native heap and dereferences to
-//!   its [`GuestPtr`]: it is how the host holds a guest value, and how one
-//!   is passed by reference to a VM call.
-//! - Reads borrow guest memory without copying (`as_bytes`, `to_str`,
-//!   `view`), which needs the bytes to be contiguous in host memory: always
-//!   true with a flat arena.
-//! - There is no `Drop`, as dropping needs the machine: `free` is what
-//!   the guest's drop glue does, and methods that hand a value over (`pop`,
-//!   `remove`, `into_raw`) leave freeing it to the caller.
+//! Rust collection methods follow `std` naming. Methods accessing guest memory
+//! take a [`Machine`] and return a [`Result`] because guest pointers and lengths
+//! require validation. Value methods update the host copy; the corresponding
+//! [`GuestPtr`] methods read, modify, and write the guest object in place.
+//! [`GuestRustBox<T>`] owns a guest value, dereferences to its [`GuestPtr`], and
+//! passes its address to VM calls.
 //!
-//! For a Rust guest to hand collections back and forth, its global
-//! allocator must be the native heap (`setup_native_heap`): then a
-//! collection either side allocates is one the other can grow and drop.
+//! Borrowing methods (`as_bytes`, `to_str`, `view`) require contiguous host
+//! storage, as provided by a flat arena. Rust collections use explicit `free`
+//! instead of `Drop`. Methods transferring ownership (`pop`, `remove`,
+//! `into_raw`) leave freeing to the caller. To exchange owned collections with
+//! a Rust guest, configure its global allocator to use the native heap
+//! (`setup_native_heap`). Both sides can then grow and free shared allocations.
 //!
 //! # Copying to the host
 //!
-//! The guest controls every pointer and length, so the limits on each
-//! container ([`MAX_BYTES`] for a string or a vector's elements,
-//! [`MAX_NESTING`] for depth) don't bound what a whole structure costs:
-//! a `Vec<String>` whose strings all point at one 16 MiB buffer would copy
-//! as `count` × 16 MiB. Every copy to the host therefore also charges
-//! what it allocates to a budget for the whole top-level operation,
-//! [`MAX_HOST_COPY`] by default (see [`with_host_copy_limit`]), and fails
-//! with an error when it runs out.
+//! [`MAX_BYTES`] bounds individual containers and [`MAX_NESTING`] bounds
+//! recursive traversal. [`MAX_HOST_COPY`] additionally bounds allocations for
+//! one complete host copy; [`with_host_copy_limit`] overrides that budget.
+//! Aliased guest data can otherwise produce host copies much larger than guest
+//! memory. Budget exhaustion returns an error.
 //!
-//! The budget covers one call. A host that keeps what it copies across
-//! calls (a log, a message queue, ...) must cap the total it keeps itself;
-//! and borrowing zero-copy (`as_bytes`, `to_str`, the `&[u8]`, `&str`,
-//! `Buffer` and `GuestSlice` system call arguments) then copying with
-//! `.to_vec()` or `.to_owned()` is bounded only by guest memory per call.
+//! Hosts retaining copies across calls must enforce their own aggregate limits.
+//! Zero-copy system call arguments and borrowing methods do not consume this
+//! budget. Copies made directly with `.to_vec()` or `.to_owned()` are bounded
+//! only by guest memory per call.
 //!
-//! Only RV64 guests: the 32-bit variants of the layouts and of `std::hash`
-//! are not ported.
+//! Only RV64 layouts and hashes are supported.
 
 mod hash;
 mod rust_attributes;
@@ -170,29 +138,20 @@ pub(crate) fn nested<R>(f: impl FnOnce() -> Result<R>) -> Result<R> {
     f()
 }
 
-/// The most host memory one copy of guest objects to the host may
-/// allocate, in bytes, unless [`with_host_copy_limit`] sets another limit.
+/// Maximum host allocation budget for one complete guest-object copy,
+/// in bytes. Override with [`with_host_copy_limit`]. Per-container limits
+/// cannot bound copies of aliased guest data, such as vectors whose strings
+/// all reference the same buffer.
 ///
-/// The per-container limits ([`MAX_BYTES`] for a string's bytes or a
-/// vector's elements) bound each piece, not the whole: the guest controls
-/// every pointer, so all the strings of a `Vec<String>` can point at the
-/// same 16 MiB buffer, and copying them would allocate `count` × 16 MiB on
-/// the host while the guest uses 16 MiB. So every copy to the host (the
-/// [`ToHost`] impls, `to_string`, `to_bytes`, `to_vec`,
-/// `to_string_vector`, `to_map`) charges what it allocates (bytes of text,
-/// and at least one byte per element, box and map entry) against a budget
-/// shared by everything one top-level copy does, nested containers
-/// included, and fails with an `IllegalOperation` error when it runs out.
-/// That also bounds the work of walking a guest structure whose pointers
-/// share subtrees.
+/// [`ToHost`], `to_string`, `to_bytes`, `to_vec`, `to_string_vector`, and `to_map`
+/// charge text bytes and at least one byte per element, box, or map entry.
+/// Nested copies share the budget; exhaustion returns `IllegalOperation`.
+/// This also bounds traversal of shared subtrees.
 ///
-/// The budget is per top-level call: a host that keeps what it copies
-/// across calls (or system calls) must bound the total itself. Zero-copy
-/// reads (`as_bytes`, `to_str`, `view`, and the `&[u8]`, `&str`,
-/// [`Buffer`](crate::memory::Buffer) and [`GuestSlice`](crate::memory::GuestSlice)
-/// system call arguments) allocate nothing and are not charged; copying
-/// one of them (`.to_vec()`, `.to_owned()`) is bounded only by the
-/// per-call limit, and only by guest memory per call.
+/// Hosts retaining copies across calls must enforce aggregate limits.
+/// Zero-copy views and arguments, including [`Buffer`](crate::memory::Buffer)
+/// and [`GuestSlice`](crate::memory::GuestSlice), are not charged. Direct
+/// `.to_vec()` and `.to_owned()` copies require separate host limits.
 pub const MAX_HOST_COPY: usize = 4 * MAX_BYTES;
 
 thread_local! {
@@ -202,11 +161,9 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Run `f` with at most `limit` bytes for the copies of guest objects to
-/// the host that it makes (see [`MAX_HOST_COPY`]), all of them sharing
-/// the one budget. Inside another such call (or a copy already under
-/// way), the limit is at most what is left there, and what `f` uses is
-/// charged there too.
+/// Run `f` with a shared `limit`-byte budget for guest-object copies to the host.
+/// See [`MAX_HOST_COPY`]. Nested calls cannot exceed the enclosing remaining
+/// budget, and their allocations also consume that budget.
 ///
 /// ```no_run
 /// # use libriscv::{Machine, Result};
@@ -219,7 +176,7 @@ thread_local! {
 /// # Ok(()) }
 /// ```
 pub fn with_host_copy_limit<R>(limit: usize, f: impl FnOnce() -> Result<R>) -> Result<R> {
-    /// Hand what is left back to the enclosing budget however `f` ends.
+    /// Restore the enclosing budget on normal return or unwinding.
     struct Scope {
         outer: Option<usize>,
         start: usize,
@@ -341,7 +298,7 @@ pub(crate) fn write_u64(m: &mut Machine, addr: u64, value: u64) -> Result<()> {
 
 /// A typed guest address (C++ `GuestRef<T>`, or the `T*` that `memarray`
 /// returns): the handle through which a guest object is read, written and
-/// changed in place. It doesn't borrow the machine; every access checks
+/// changed in place. It does not borrow the machine; every access checks
 /// the memory, and faults like C++ `memarray` (including on misalignment).
 pub struct GuestPtr<T> {
     addr: u64,
@@ -451,7 +408,7 @@ impl<T: GuestType> GuestPtr<T> {
 /// A guest object type: a [`GuestPod`] with the container operations that
 /// C++ selects with `is_guest_datatype` and
 /// `is_self_referencing_guest_object`. Plain values use the defaults (they
-/// own nothing and don't point into themselves).
+/// own nothing and do not point into themselves).
 pub trait GuestType: GuestPod {
     /// C++ `is_self_referencing_guest_object`: the object points back into
     /// itself and must be told when it moves.
@@ -469,7 +426,7 @@ pub trait GuestType: GuestPod {
         Ok(())
     }
     /// Release the guest memory owned by this host-side value (C++
-    /// `free(machine)` on an object that isn't in guest memory, e.g. a
+    /// `free(machine)` on an object that is not in guest memory, e.g. a
     /// variant built on the host and passed by value). The value stays
     /// valid and empty.
     fn free_value(&mut self, m: &mut Machine) -> Result<()> {

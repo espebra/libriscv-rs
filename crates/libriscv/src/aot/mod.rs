@@ -1,15 +1,12 @@
-//! Port of `tr_translate.cpp`, `tr_compiler.cpp` and the embedded and
-//! `dlopen`ed translations of `tr_api.cpp`: ahead-of-time translation of
-//! execute segments to safe Rust (C++ translates to C).
+//! Port of `tr_translate.cpp`, `tr_compiler.cpp`, and translation loading in
+//! `tr_api.cpp`: ahead-of-time translation of execute segments to safe Rust.
 //!
-//! A machine with [`MachineOptions::aot_output`](crate::MachineOptions::aot_output)
-//! translates every execute segment it creates (its `emit` module). The translation
-//! of a whole program is one Rust source file ([`AotOutput::source`]),
-//! which can be used in two ways:
+//! [`MachineOptions::aot_output`](crate::MachineOptions::aot_output) records
+//! each new segment's translation. [`AotOutput::source`] emits one Rust file
+//! for embedding or shared-object compilation:
 //!
-//! * **Embedded**: compiled into the host program, where it is safe code
-//!   like the rest (`forbid(unsafe_code)`), and registered with
-//!   [`register`]:
+//! * **Embedded**: compile into the host under `forbid(unsafe_code)` and
+//!   call [`register`]:
 //!
 //!   ```ignore
 //!   // At the crate root: the translation uses `become` and the
@@ -22,25 +19,22 @@
 //!   libriscv::aot::register(translation::META, translation::enter);
 //!   ```
 //!
-//! * **Shared object**: [`AotOutput::write_shared_object`] compiles it with
-//!   `rustc` into a `cdylib`, which [`load_shared_object`] (feature
-//!   `aot-dylib`) loads at run time. The translated code is the same safe
-//!   code; only the two exported functions at the boundary use `unsafe`,
-//!   and so does loading it (in `libriscv-jit-rt`).
+//! * **Shared object**: [`AotOutput::write_shared_object`] compiles a `cdylib`
+//!   with `rustc`. [`load_shared_object`] requires `aot-dylib`. Translated
+//!   bodies remain safe Rust; the two C exports and loading operations in
+//!   `libriscv-jit-rt` form the unsafe boundary.
 //!
 //! Translations are keyed like the JIT cache: on the segment (address,
 //! length, CRC32-C and a 64-bit hash of the code, execute-only, libc fast
-//! path), the guest memory layout baked into the code, and a fingerprint
+//! path), the guest memory layout compiled into the code, and a fingerprint
 //! of the translator ([`fingerprint`]). When a machine with
 //! [`MachineOptions::aot`](crate::MachineOptions::aot) (the default)
 //! creates a segment that has a registered translation, the segment runs
 //! it instead of being interpreted or JIT-compiled.
 //!
-//! Translated code behaves exactly like the JIT (it runs the same regions
-//! of the same instructions, `codegen`): results and instruction counts
-//! are the interpreter's, and it leaves to the interpreter at the same
-//! places. Unlike the JIT, it doesn't depend on the host: the source can be
-//! compiled for any 64-bit target.
+//! AOT and JIT share `codegen` regions, instruction selection, counting, and
+//! interpreter exits. Generated source can be compiled for any 64-bit target;
+//! native shared objects retain their target CPU requirements.
 
 mod emit;
 mod structure;
@@ -121,8 +115,8 @@ fn features_expr() -> String {
     e
 }
 
-/// The features of the feature word `features` this CPU lacks: a
-/// translation needing them would die of an illegal instruction.
+/// Required target features missing from this CPU. Reject translations
+/// requiring them to avoid illegal-instruction faults.
 fn missing_features(features: u64) -> Vec<&'static str> {
     #[cfg(target_arch = "x86_64")]
     let detected = x86_detected();
@@ -144,16 +138,14 @@ fn missing_features(features: u64) -> Vec<&'static str> {
 /// The entry function of a translation (`translation::enter`):
 /// `enter(segment, decoder_index, regs, fregs, arena, io)`, where `io` is
 /// `[pc, counter, max, frm]` on entry and `[exit_kind, pc, counter, 0]` on
-/// return. Returns false if the code can't run (unknown segment or entry,
+/// return. Returns false if the code cannot run (unknown segment or entry,
 /// arena too small), without having run anything.
 pub type AotEnter =
     fn(usize, usize, &mut [u64; 32], &mut [u64; 32], &mut [u8], &mut [u64; 4]) -> bool;
 
-/// Everything the code translated for a segment depends on besides the
-/// segment itself and the memory layout: the libriscv version, its
-/// extension features (which decide decoding and the decoder layout), and
-/// the source of the translator and of what decides which instructions it
-/// translates. Translations from another fingerprint are ignored.
+/// Translator build fingerprint: libriscv version, ISA features, translator
+/// sources, and shared instruction-selection sources. Translations with
+/// mismatched fingerprints are ignored.
 pub fn fingerprint() -> u64 {
     static FINGERPRINT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *FINGERPRINT.get_or_init(|| {
@@ -264,8 +256,8 @@ struct Registered {
 
 /// The process-wide registry of translations.
 static REGISTRY: Mutex<Option<HashMap<AotKey, Registered>>> = Mutex::new(None);
-/// The registry has translations (checked without locking, before hashing
-/// a segment for nothing).
+/// Whether any translation is registered. Checked without locking to avoid
+/// unnecessary segment hashing.
 static HAS_UNITS: AtomicBool = AtomicBool::new(false);
 
 fn registry() -> MutexGuard<'static, Option<HashMap<AotKey, Registered>>> {
@@ -294,7 +286,7 @@ impl Reader<'_> {
 
 /// Add the segments described by `meta` to the registry, keeping existing
 /// translations for a key. Returns the number added, or `None` if `meta`
-/// isn't valid metadata or the code needs CPU features this one lacks.
+/// is not valid metadata or the code needs CPU features this one lacks.
 fn add(meta: &[u64], module: &Module) -> Option<usize> {
     let mut r = Reader(meta);
     if r.word()? != META_MAGIC || r.word()? != ABI_VERSION {
@@ -365,13 +357,11 @@ pub fn register(meta: &'static [u64], enter: AotEnter) -> usize {
     add(meta, &Module::Embedded(enter)).unwrap_or(0)
 }
 
-/// Load the translation compiled into the shared object at `path` (by
-/// [`AotOutput::write_shared_object`]) into the process-wide registry.
-/// Returns the number of segments added; segments already registered keep
-/// their translation.
+/// Load a shared object produced by [`AotOutput::write_shared_object`] into
+/// the process-wide registry. Returns the number of added segments; existing
+/// segments retain their translations.
 ///
-/// Loading a shared object runs native code from it: only load files you
-/// would also run.
+/// Loading executes native code. Only load trusted objects.
 #[cfg(feature = "aot-dylib")]
 pub fn load_shared_object(path: impl AsRef<Path>) -> io::Result<usize> {
     let lib = libriscv_jit_rt::aot::AotLibrary::load(path.as_ref())?;
@@ -453,11 +443,10 @@ pub(crate) fn translate(exec: &DecodedSegment, layout: MemoryLayout) -> Option<T
     emit::translate(exec, &analysis, layout)
 }
 
-/// Collects the translations of the execute segments machines create, to
-/// write them as Rust source ([`write_source`](Self::write_source)) or a
-/// shared object ([`write_shared_object`](Self::write_shared_object)); see
-/// `MachineOptions::aot_output`. Clones share the same collection, so
-/// several machines can record into one translation.
+/// Collect segment translations for export as Rust source
+/// ([`write_source`](Self::write_source)) or shared objects
+/// ([`write_shared_object`](Self::write_shared_object)). See `MachineOptions::aot_output`.
+/// Clones share storage so multiple machines can contribute.
 #[derive(Debug, Clone, Default)]
 pub struct AotOutput {
     units: Arc<Mutex<Vec<(AotKey, Translation)>>>,
@@ -633,15 +622,13 @@ pub mod translation {{
         std::fs::write(path, self.source())
     }
 
-    /// Compile the translation into a shared object for
-    /// [`load_shared_object`], with `rustc` (`$RUSTC`, else `rustc`: a
-    /// nightly with `explicit_tail_calls` and `rust_preserve_none_cc`, like
-    /// libriscv's own toolchain, which rustup is asked for unless
-    /// `$RUSTUP_TOOLCHAIN` says otherwise). Optimized for the host CPU
-    /// (`-C target-cpu=native`): the shared object records the CPU features
-    /// it was compiled with, and [`load_shared_object`] refuses it on a CPU
-    /// without them. `$LIBRISCV_AOT_RUSTFLAGS` adds flags. The source is
-    /// kept next to it, with `.rs` appended to its name.
+    /// Compile a shared object for [`load_shared_object`] with `$RUSTC` or `rustc`.
+    /// Requires nightly `explicit_tail_calls` and `rust_preserve_none_cc`.
+    /// Uses libriscv's toolchain unless `$RUSTUP_TOOLCHAIN` overrides it.
+    ///
+    /// Compilation targets the host CPU (`-C target-cpu=native`). Required features
+    /// are recorded and checked on load. `$LIBRISCV_AOT_RUSTFLAGS` adds flags.
+    /// The source is retained at the output path with `.rs` appended.
     pub fn write_shared_object(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let path = path.as_ref();
         let mut source = path.as_os_str().to_owned();
