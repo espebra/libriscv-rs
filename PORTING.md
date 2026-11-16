@@ -35,7 +35,8 @@ When the C++ side moves, bump this hash and the ones in
 ## Scope
 
 In scope: the interpreter, **RV64 only**, extensions I M A C F D Zba Zbb Zbc
-Zbs Zicond Zbkb Zfh(min) Zcb Zimop/Zcmop and V; ELF loading; flat arena memory
+Zbs Zicond Zbkb Zfh(min) Zcb Zimop/Zcmop and V with Zvbb and Zvfhmin (all of
+RVA23U64); ELF loading; flat arena memory
 with virtual paging; dynamic executables (through `ld.so`); Linux, newlib and minimal syscall sets; vmcall/preempt;
 fork/CoW; serialization; threads; native heap/libc; debugger, disassembler and
 GDB stub.
@@ -666,8 +667,12 @@ safe Rust can't do without slowing every dispatch. Instead:
   see the real limit (the slice end is translated in and out), a `stop()`
   or a new limit from a handler ends slicing, and the PC is only published
   where an uninterrupted run would publish it (it's observable after a
-  fault). `jit::tests` checks all of this with a compilation that never
-  finishes.
+  fault). The one check that halts *at* an instruction it already ran is
+  a CSR instruction's (C++ halts there at the limit, and so does this):
+  for a slice's limit, it ends the slice at the next block instead, or the
+  next slice would run the instruction again. Vector loops read the `vl`
+  CSR on every iteration, which made that visible. `jit::tests` checks all
+  of this with a compilation that never finishes.
 - Results for segments that went stale meanwhile are dropped (the copy
   shares the original's stale flag, so marking either marks both).
   `Machine::wait_for_jit` blocks until the compilations of the machine's
@@ -1253,11 +1258,11 @@ Phase 5) and `insert_non_owned_memory`.
 | Layer | Where | What |
 |---|---|---|
 | Unit | `#[cfg(test)]` in each module | Decoding, helpers, edge cases |
-| Integration | `crates/libriscv/tests/` | Ports of `../libriscv/tests/unit/*.cpp` (Catch2 → `#[test]`); guests built with `testutil::build_and_load`. `linux.rs`: `security.cpp`, Linux cases of `protections.cpp`, threads, signals, the file sandbox, and every system call with random arguments. `paging.rs`: the memory cases of `protections.cpp`, `va_execute.cpp` (code on mprotected and high pages, FENCE.I/`riscv_flush_icache`, constant pools) and `dynamic.cpp` (PIE). `vmcall.rs`: `vmcall.cpp` (the fork case included) and preemption (restoring, clobbering, errors, shared budget, nested under background JIT). `custom.rs`: `custom.cpp`'s custom instruction, and userdata (`with_userdata` included). `filesystem.rs`: the file system sandbox (no filter means no access, normalised paths, special files) without a guest toolchain. `dyncall.rs`: `dyncall.cpp`, adapted to dyncalls being system calls (interpreter and JIT, exactly equal). `native.rs`: `native.cpp` (native heap system calls and the guest C++ containers). `native_rust.rs`: `native_rust.cpp` (the guest Rust containers against a Rust guest, built with `testutil::build_rust`; needs the `riscv64gc-unknown-linux-gnu` target of the pinned toolchain). `rust_collections.rs`: guest-built cycles and deep nesting of the Rust containers, without a Rust guest. `brutal.rs`: `brutal.cpp` (forks, stepping a few instructions at a time, copy-on-write and page cache cases) plus fork snapshots, forks of forks, forking from threads and fork page accounting |
+| Integration | `crates/libriscv/tests/` | Ports of `../libriscv/tests/unit/*.cpp` (Catch2 → `#[test]`); guests built with `testutil::build_and_load`. `linux.rs`: `security.cpp`, Linux cases of `protections.cpp`, threads, signals, the file sandbox, and every system call with random arguments. `paging.rs`: the memory cases of `protections.cpp`, `va_execute.cpp` (code on mprotected and high pages, FENCE.I/`riscv_flush_icache`, constant pools) and `dynamic.cpp` (PIE). `vmcall.rs`: `vmcall.cpp` (the fork case included) and preemption (restoring, clobbering, errors, shared budget, nested under background JIT). `custom.rs`: `custom.cpp`'s custom instruction, and userdata (`with_userdata` included). `filesystem.rs`: the file system sandbox (no filter means no access, normalised paths, special files) without a guest toolchain. `dyncall.rs`: `dyncall.cpp`, adapted to dyncalls being system calls (interpreter and JIT, exactly equal). `native.rs`: `native.cpp` (native heap system calls and the guest C++ containers). `native_rust.rs`: `native_rust.cpp` (the guest Rust containers against a Rust guest, built with `testutil::build_rust`; needs the `riscv64gc-unknown-linux-gnu` target of the pinned toolchain). `rust_collections.rs`: guest-built cycles and deep nesting of the Rust containers, without a Rust guest. `brutal.rs`: `brutal.cpp` (forks, stepping a few instructions at a time, copy-on-write and page cache cases) plus fork snapshots, forks of forks, forking from threads and fork page accounting. `rvv.rs`: `rvv.cpp` (RVV 1.0 in inline assembly, `-march=rv64gcv`; also under the JIT). `rva23.rs`: `rva23.cpp` (Zfhmin, Zimop, Zcmop and Zawrs as raw `.insn`) |
 | Example | `examples/asteroids/tests/headless.rs` | The example game played without a terminal: frames at a fixed rate with scripted input, the JIT against the interpreter frame by frame (screens and instruction counts), heap balance across frames. Builds the Rust guest with cargo; skipped without the guest toolchain |
-| Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Static and dynamic glibc C and C++ programs (stdio, malloc, threads incl. `test_threads.cpp`, condvars, abort, a fault with a signal handler, timeouts; dynamic ones run under `ld.so`), code generated at runtime (mprotect, FENCE.I, pages far outside the arena, `dlopen`, an execute fault), `getrusage`'s page accounting, the prebuilt Rust/Zig/newlib fixtures (Go: output only, its count varies under the oracle too) and glibc CoreMark, and `--libc-fastpath` (the guest of `libc_fastpath.cpp` calling every patched function, the glibc C and C++ programs, timeouts, and faults inside patched functions). Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics; RV64IM and RV64IMC+Zcb with Zba/Zbb/Zbc/Zbs/Zicond/Zbkb for bit manipulation; RV64IMFD and RV64IMAFDC+Zcb with Zfhmin/Zfa for floating point; CoreMark (soft-float, F/D, F/D+B), whose clock is the instruction counter so its whole output is compared. `rvlinux --call` (a VM call after the program exits). Each scenario is one test per Rust configuration (`<name>::interp`, `::jit`, `::jit_upfront`), and long fuel loops are split, so the harness runs them concurrently |
+| Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Static and dynamic glibc C and C++ programs (stdio, malloc, threads incl. `test_threads.cpp`, condvars, abort, a fault with a signal handler, timeouts; dynamic ones run under `ld.so`), code generated at runtime (mprotect, FENCE.I, pages far outside the arena, `dlopen`, an execute fault), `getrusage`'s page accounting, the prebuilt Rust/Zig/newlib fixtures (Go: output only, its count varies under the oracle too) and glibc CoreMark, and `--libc-fastpath` (the guest of `libc_fastpath.cpp` calling every patched function, the glibc C and C++ programs, timeouts, and faults inside patched functions). Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics; RV64IM and RV64IMC+Zcb with Zba/Zbb/Zbc/Zbs/Zicond/Zbkb for bit manipulation; RV64IMFD and RV64IMAFDC+Zcb with Zfhmin/Zfa for floating point; CoreMark (soft-float, F/D, F/D+B), whose clock is the instruction counter so its whole output is compared. `rvlinux --call` (a VM call after the program exits). C++'s RVA23 suite (`../libriscv/tests/rva23/`, port of its `run.sh` and `isa/run.sh`): the ten programs built with the RVA23 compiler (`$RVCC`, default `~/riscv/bin/riscv64-unknown-linux-gnu-gcc`) must print what their host builds print, the instruction-level probe must pass, and both must match the reference, also at timeouts inside vector code; skipped without `$RVCC` (`LIBRISCV_REQUIRE_RVA23=1` fails instead), which CI doesn't have. Each scenario is one test per Rust configuration (`<name>::interp`, `::jit`, `::jit_upfront`), and long fuel loops are split, so the harness runs them concurrently |
 | Instruction | ports of `../libriscv/tests/instructions/` | Per-instruction checks incl. RVC (`test_rv32c.cpp` → `tests/rvc.rs`, widened to RV64) |
-| ISA | `../libriscv/tests/rva23/` | Needs a full RVA23 toolchain; run by hand |
+| ISA | `../libriscv/tests/rva23/` | Ported into `difftest.rs` (`rva23_*`, see above); needs a full RVA23 toolchain |
 | Fuzz | `fuzz/` (`cargo fuzz`, a separate workspace; see `fuzz/README.md`) | Port of `../libriscv/fuzz/fuzz.cpp`: `vmfuzzer` (instruction set), `elffuzzer` (ELF loader + Linux system calls, seeded with the prebuilt RV64 ELFs), `nativefuzzer` (native heap and memory system calls; C++ `FUZZ_NAT` without native threads), `syshelperfuzzer` (system call memory helpers). Beyond C++: `linuxfuzzer` (Linux system calls, threads, signals, sandboxed file system), `libcfuzzer` (libc fast path), `forkfuzzer` (forks must continue exactly like their parent), `guestfuzzer` (guest C++ containers), `vmcallfuzzer` (VM calls, nested preemption, dyncalls, system call arguments) and `jitdifffuzzer` (JIT against the interpreter, exact). Built with debug assertions and overflow checks; any panic is a bug. `overnight.sh` runs them all for hours, collecting findings |
 
 Prebuilt guests (Rust, Go, Zig, newlib, tinycc) live in
@@ -1313,9 +1318,9 @@ timeouts.
 
 Expected until the listed phase:
 
-- Vector CSRs go to `on_unhandled_csr` (Phase 5), and the unit-stride
-  vector loads/stores in the LOAD-FP/STORE-FP opcodes are illegal
-  instructions here.
+- VMV.X.S, VCPOP.M and VFIRST.M with rd = x0: the oracle writes x0, which
+  then reads back nonzero; here they are NOPs (`decode::decode_vector`),
+  until C++ fixes it. No compiler emits them.
 - The oracle's FMIN/FMAX result for a single *signaling* NaN operand
   depends on the C++ compiler: clang inlines `std::fmin` as `minnum` (the
   other operand, as here), while a call into glibc returns a quiet NaN. The
@@ -2009,7 +2014,7 @@ itself, so:
 - [x] Shared execute segments across machines and forks, background JIT results reaching every holder (`decoder_cache.cpp` `SharedExecuteSegments`, `util/crc32.hpp`); see "Shared execute segments"
 - [x] Shared read-only data (`shared_rodata.cpp`), copy-on-write, with the `jit` feature; see "Shared read-only data"
 - [ ] Bounds-check elimination audit (`cargo asm`)
-- [x] Cranelift JIT (`jit` feature) replacing asmjit; see "JIT". RV64IMFDC, Zcb, B (no CLMUL), Zicond; A, CSRs, Zfa and Zfhmin stay interpreted
+- [x] Cranelift JIT (`jit` feature) replacing asmjit; see "JIT". RV64IMFDC, Zcb, B (no CLMUL), Zicond; A, CSRs, Zfa, Zfhmin and V stay interpreted
 - [x] JIT: background compilation (`jit_background`, `rvlinux -B`/`--no-background`)
 - [x] JIT: F/D (FCVT to integers exact, NaNs the host's)
 - [x] JIT: code cache, Cranelift output saved as an object to link in or a shared object to load (`jit_cache`, `rvlinux --jit-save-object`/`--jit-save-shared`/`--jit-load`, `RVLINUX_JIT_EMBED`; the role of C++'s translation cache and embedded translations); see "Code cache" under "JIT"
@@ -2021,7 +2026,19 @@ itself, so:
 
 ### Phase 5 — Remaining features
 
-- [ ] V extension (`rvv.hpp`, `rvv_instr.cpp`, `rvv_registers.hpp`)
+- [x] V extension (`rvv.hpp`, `rvv_instr.cpp`, `rvv_registers.hpp`): RVV 1.0
+  with Zvbb and Zvfhmin, VLEN = 256, the vector CSRs (`handle_vector_csr`);
+  tests: `rvv.cpp`, `rva23.cpp` (`tests/rvv.rs`, `tests/rva23.rs`) and the
+  RVA23 suite (`difftest.rs`). Every vector instruction is a slow-path
+  (FUNCTION) instruction, as in C++; the JIT and AOT leave them to the
+  interpreter. The C++ handlers are generic lambdas over SEW; the `int_sew!`,
+  `widen_sew!` and `fp_sew!` macros expand the same bodies per SEW, and the
+  fixed-point rounding helpers work in `i128` instead of per element type.
+  Unit-stride and whole-register transfers copy straight between guest memory
+  and the register file, so a fault midway leaves the same partial state as
+  C++'s `memcpy`. VMV.X.S, VCPOP.M and VFIRST.M with rd = x0 decode as
+  NOPs (C++ writes x0; see "Known differences from the oracle").
+  Performance is not a goal yet
 - [ ] Native threads (`native_threads.cpp`); POSIX threads are done (Phase 2)
 - [x] Native heap and libc fast paths (`native_heap.hpp`, `native_libc.cpp`; see "Native heap and libc fast path"), breakpoints (`ebreak_locations`); tests: `heaptest.cpp`, `heap_invariants.cpp`, `libc_fastpath.cpp` (`tests/heap.rs`, `tests/libc_fastpath.rs`), `native.cpp` (`tests/native.rs`, with the container cases), `exceptions.cpp`, difftests with `--libc-fastpath`
 - [x] Guest datatypes, C++ and Rust containers (`guest_datatypes.hpp`, `guest/guest_{common,arena_object,cpp_*,rust_*}.hpp`); see "Guest containers". Tests: `native.cpp` (`tests/native.rs`), `native_rust.cpp` (`tests/native_rust.rs`, Rust guests built by `testutil::build_rust`, the port of `rustbuilder.cpp`)
@@ -2050,18 +2067,18 @@ phase starts; names below are the intended targets.
 | `memory_mmap.cpp`, `mmap_cache.hpp` | `memory/mmap.rs` | 2 | ✅ (+ flat-arena `memdiscard`, `memstring`, `flush_execute_segments`) |
 | `memory_helpers_paging.hpp`, `memory_inline_pages.hpp` | `memory/paging.rs`, `memory/helpers.rs` | 3, 5 | ✅ incl. page caches, fork page tables and the host-side helpers (`membuffer`, `memarray`, `memspan`, ...) |
 | `cached_address.hpp` (`CachedAddress`) | — | 3 | not yet (a cached `address_of`) |
-| `registers.hpp`, `rvv_registers.hpp` | `registers.rs` | 1–2 | ✅ integer, FP (raw bits) + FCSR (the `fp64reg` views are in `isa/rvfd.rs`; vector: Phase 5) |
+| `registers.hpp`, `rvv_registers.hpp` | `registers.rs`, `rvv_registers.rs` | 1–2, 5 | ✅ integer, FP (raw bits) + FCSR (the `fp64reg` views are in `isa/rvfd.rs`), vector |
 | `cpu.hpp`, `cpu.cpp`, `cpu_inline.hpp` | `cpu.rs` | 1 | ✅ (`create_block_ending_entry_at`, `install_ebreak_for`: `decoder_cache.rs`; other debugger helpers: Phase 5) |
 | `tailcall_dispatch.cpp` | `dispatch.rs` | 1, 4 | ✅ |
 | `cpu_dispatch.cpp`, `threaded_dispatch.cpp`, `cpu_inaccurate_dispatch.cpp`, `threaded_inaccurate_dispatch.cpp` | — | — | superseded by tail-call dispatch; `cpu_dispatch.cpp` defines the observable semantics (see "Dispatch") |
 | `machine.hpp`, `machine.cpp`, `machine_inline.hpp` | `machine.rs`, `sysargs.rs` | 1–3 | Phase 1 part ✅ (`system()`, syscalls, simulate), fork ✅, typed `sysargs`/`set_result` ✅ |
 | `machine_vmcall.hpp`, `prepared_call.hpp` | `vmcall.rs` | 3 | ✅ `vmcall`/`preempt` (`PreparedCall`: not yet) |
-| `instruction_list.hpp`, `instr_decoding.inc`, `instr_helpers.hpp`, `safe_instr_loader.hpp` | `decode.rs` | 1–2 | ✅ RV64IMAFDC + Zcb + B + Zfhmin/Zfa (`safe_instr_loader.hpp` is in `decoder_cache.rs`) |
+| `instruction_list.hpp`, `instr_decoding.inc`, `instr_helpers.hpp`, `safe_instr_loader.hpp` | `decode.rs` | 1–2 | ✅ RV64IMAFDCV + Zcb + B + Zfhmin/Zfa (`safe_instr_loader.hpp` is in `decoder_cache.rs`) |
 | `rvi_instr.cpp`, `rv64i.cpp` | `isa/rvi.rs` | 1–2 | ✅ I + M + Zba/Zbb/Zbc/Zbs/Zicond/Zbkb (Zbkb's ZIP/UNZIP are RV32-only and unimplemented, as in C++) |
 | `rvc.hpp`, `rvc_instr.cpp` | `instruction.rs` (`CInstr`), `isa/rvc.rs` | 2 | ✅ RV64 C + Zcb |
 | `rva.hpp`, `rva_instr.cpp` | `isa/rva.rs` | 2 | ✅ RV64 (the reservation is copied on fork; on deserialize: Phase 3) |
 | `rvfd.hpp`, `rvfd_util.hpp`, `rvf_instr.cpp`, `fp16.hpp` | `isa/rvfd.rs` | 2 | ✅ F, D, Zfhmin, Zfa (RV64), NaN-boxing under `debug-checks` (FCSR emulation: not ported) |
-| `rvv.hpp`, `rvv_instr.cpp` | `isa/rvv.rs` | 5 | |
+| `rvv.hpp`, `rvv_instr.cpp` | `isa/rvv.rs` | 5 | ✅ RVV 1.0, Zvbb, Zvfhmin (printers: with the disassembler) |
 | `rvi_fuse.cpp` | — | — | dead code in C++ (`try_fuse` is never called) |
 | `instruction_counter.hpp` | `dispatch.rs` (`Counter`) | 1 | ✅ |
 | `decoder_cache.*`, `decoded_exec_segment.hpp` | `decoder_cache.rs` | 1, 4 | ✅ incl. shared segments, EBREAK locations and the libc fast path patches |

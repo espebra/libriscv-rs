@@ -13,6 +13,8 @@ pub(crate) mod rvc;
 #[cfg(feature = "ext-f")]
 pub(crate) mod rvfd;
 pub(crate) mod rvi;
+#[cfg(feature = "ext-v")]
+pub(crate) mod rvv;
 
 use crate::error::Result;
 use crate::instruction::Instr;

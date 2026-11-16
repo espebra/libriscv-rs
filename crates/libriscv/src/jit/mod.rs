@@ -989,6 +989,42 @@ pub(crate) mod tests {
         }
     }
 
+    /// A CSR instruction ends its block and checks the limit after it ran;
+    /// at the real limit the machine halts *at* it, as C++ does. A slice
+    /// ending there must not do the same, or the next slice runs (and
+    /// counts) the instruction again. Vectorised string functions read the
+    /// `vl` CSR on every iteration.
+    #[test]
+    fn slices_dont_rerun_csr_instructions() {
+        // csrrs rd, instret, x0
+        const fn rdinstret(rd: u32) -> u32 {
+            (0xC02 << 20) | (2 << 12) | (rd << 7) | 0x73
+        }
+        let code: Vec<u8> = [
+            addi(5, 0, 300),
+            // loop:
+            rdinstret(11),
+            addi(6, 6, 3),
+            rdinstret(12),
+            addi(5, 5, -1),
+            bne(5, 0, -16),
+            addi(8, 8, 1),
+            JSELF,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let mut fuels: Vec<u64> = (0..30).collect();
+        fuels.extend([100, 101, 102, 103, 1499, 1500, 1501, 1502, 1_000_000]);
+        for fuel in fuels {
+            let expected = run(&code, None, fuel);
+            for slice in [1, 2, 3, 5, 16, 100] {
+                let got = run(&code, Some(slice), fuel);
+                assert_eq!(got, expected, "fuel {fuel}, slice {slice}");
+            }
+        }
+    }
+
     #[test]
     fn slices_are_not_observable() {
         for final_syscall in [501, 502, 0] {

@@ -116,6 +116,13 @@ struct Slice {
 }
 
 impl DispatchState {
+    /// True if `c` is past the limit of the slice being run but not past
+    /// the real limit: only the slicing stops the chain here.
+    #[inline]
+    fn only_slice_overflowed(&self, c: Counter) -> bool {
+        matches!(self.slice, Some(s) if c.max == s.end && c.value < s.max)
+    }
+
     /// The limit host code (system calls) sees for the chain's limit `max`:
     /// the real one while running a slice, so slicing isn't observable.
     #[inline]
@@ -640,8 +647,11 @@ pub(crate) extern "rust-preserve-none" fn system(
         max: chain_max(m),
     };
     // Stopped, or PC changed: continue *at* PC (so a stopped machine
-    // resumes at this instruction).
-    if c.overflowed() || m.cpu.regs.pc != pc {
+    // resumes at this instruction). C++ halts there at the limit too, after
+    // running the instruction. Only the limit of a slice is different: the
+    // next slice must go on as an uninterrupted run would, so the slice
+    // ends at the next block instead, without running this one twice.
+    if (c.overflowed() && !m.dispatch.only_slice_overflowed(c)) || m.cpu.regs.pc != pc {
         overflow_checked_jump!(exec, cache, m, m.cpu.regs.pc, c)
     }
     next_block!(exec, cache, i, m, pc, c, 4, true)

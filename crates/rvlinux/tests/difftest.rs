@@ -1922,6 +1922,129 @@ int main(int argc, char** argv) {
     }
 }
 
+/// C++ libriscv's RVA23 suite (`tests/rva23/`, a port of its `run.sh` and
+/// `isa/run.sh`), built with the RVA23 compiler (`$RVCC`): ten programs
+/// whose RVA23 build, with the vector extension on, must print what their
+/// host build prints, and an instruction-level probe of every instruction
+/// the RVA23U64 profile makes mandatory. Every run is also compared with
+/// the reference, instruction counts included. Skipped without an RVA23
+/// toolchain, which CI doesn't have.
+fn rva23_dir() -> PathBuf {
+    testutil::cpp_source_dir().join("tests").join("rva23")
+}
+
+fn have_rva23_tools() -> bool {
+    testutil::need_rva23_compiler() && testutil::need_reference()
+}
+
+/// `run.sh`'s RISC-V build of `progs/<name>.c`. -ffp-contract=off matters
+/// for the comparison with the host build: RISC-V has a fused multiply-add
+/// and baseline x86-64 does not, so contraction would let the two builds
+/// round `a*b+c` differently in the tests' own scalar code.
+const RVA23_OPT: &str = "-O3 -ffp-contract=off";
+
+fn build_rva23_program(name: &str) -> (PathBuf, String) {
+    let src = rva23_dir().join("progs").join(format!("{name}.c"));
+    let code = std::fs::read_to_string(&src).unwrap_or_else(|e| panic!("{}: {e}", src.display()));
+    let elf = testutil::build_rva23(&code, &format!("{RVA23_OPT} -static"))
+        .unwrap_or_else(|e| panic!("{e}"));
+    (elf, code)
+}
+
+/// The output of the program built for the host (`$CC`, default `cc`):
+/// what the RISC-V build must print.
+fn rva23_native_output(name: &str, code: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_owned());
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (code, &cc, RVA23_OPT).hash(&mut h);
+    let dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| testutil::workspace_root().join("target"), PathBuf::from)
+        .join("rva23-native");
+    std::fs::create_dir_all(&dir).unwrap();
+    let exe = dir.join(format!("{name}-{:016x}", h.finish()));
+    if !exe.exists() {
+        // Unique names: the modes of one program build it concurrently.
+        static BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = format!(
+            "{name}-{}-{}",
+            std::process::id(),
+            BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let tmp = dir.join(&unique);
+        let src = dir.join(format!("{unique}.c"));
+        std::fs::write(&src, code).unwrap();
+        let out = std::process::Command::new(&cc)
+            .args(RVA23_OPT.split_whitespace())
+            .arg("-o")
+            .arg(&tmp)
+            .arg(&src)
+            .arg("-lm")
+            .output()
+            .unwrap_or_else(|e| panic!("host compiler `{cc}`: {e}"));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::rename(&tmp, &exe).unwrap();
+        let _ = std::fs::remove_file(&src);
+    }
+    let out = std::process::Command::new(&exe).output().unwrap();
+    assert!(out.status.success(), "{} failed", exe.display());
+    String::from_utf8(out.stdout).unwrap()
+}
+
+fn rva23_program(name: &str) {
+    if !have_rva23_tools() {
+        return;
+    }
+    let (elf, code) = build_rva23_program(name);
+    let expected = rva23_native_output(name, &code);
+    let reference = diff(&elf);
+    assert_eq!(reference.exit_code, Some(0), "{name}: {}", reference.stdout);
+    // The reference's output is the Rust emulator's (checked by `diff`).
+    assert_eq!(
+        reference.stdout, expected,
+        "{name}: RVA23 and host builds differ"
+    );
+}
+
+/// Timeouts inside the vectorised code: counts and the exception line must
+/// match there too.
+fn rva23_timeouts(name: &str, fuels: &[u64]) {
+    if !have_rva23_tools() {
+        return;
+    }
+    let (elf, _) = build_rva23_program(name);
+    for fuel in fuels {
+        diff_with(&elf, &["--fuel", &fuel.to_string()], &[]);
+    }
+}
+
+/// `isa/run.sh`: the instruction-level probe, freestanding so that it needs
+/// no host build, since every check carries its own answer. -mno-relax keeps
+/// the linker from making static data references gp-relative.
+fn rva23_isa() {
+    if !have_rva23_tools() {
+        return;
+    }
+    let src = rva23_dir().join("isa").join("rva23_isa.c");
+    let code = std::fs::read_to_string(&src).unwrap_or_else(|e| panic!("{}: {e}", src.display()));
+    let elf = testutil::build_rva23(
+        &code,
+        "-O1 -mno-relax -nostdlib -nostartfiles -static -ffreestanding",
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let reference = diff(&elf);
+    // A trap leaves the line naming the instruction unterminated.
+    assert!(
+        reference.stdout.contains("all checks passed") && !reference.stdout.contains("FAIL"),
+        "{}",
+        reference.stdout
+    );
+}
+
 difftests!(
     freestanding_compute,
     freestanding_timeouts,
@@ -1967,4 +2090,17 @@ difftests!(
     runtime_code,
     page_accounting,
     vmcall_after_exit,
+    rva23_intloops = rva23_program("01_intloops"),
+    rva23_floats = rva23_program("02_floats"),
+    rva23_memops = rva23_program("03_memops"),
+    rva23_structs = rva23_program("04_structs"),
+    rva23_reduce = rva23_program("05_reduce"),
+    rva23_fixedpoint = rva23_program("06_fixedpoint"),
+    rva23_permute = rva23_program("07_permute"),
+    rva23_widening = rva23_program("08_widening"),
+    rva23_addressing = rva23_program("09_addressing"),
+    rva23_floatforms = rva23_program("10_floatforms"),
+    rva23_memops_timeouts = rva23_timeouts("03_memops", &[2_000, 163_285, 500_000, 3_000_000]),
+    rva23_addressing_timeouts = rva23_timeouts("09_addressing", &[150_000, 200_001, 250_000]),
+    rva23_isa,
 );

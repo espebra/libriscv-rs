@@ -21,6 +21,7 @@ plan and the C++ → Rust file mapping live there.
 cargo test                                   # all tests, JIT included (tool-dependent tests skip if tools missing)
 LIBRISCV_REQUIRE_TOOLCHAIN=1 cargo test      # same, but fail instead of skipping
 cargo test -- --ignored                      # include not-yet-enabled difftests
+cargo test -p rvlinux --test difftest rva23  # C++'s RVA23 suite; needs an RVA23 gcc ($RVCC, default ~/riscv/bin/riscv64-unknown-linux-gnu-gcc), else skips (LIBRISCV_REQUIRE_RVA23=1 fails)
 cargo clippy --all-targets -- -D warnings    # must be clean (also with --no-default-features)
 cargo test --workspace --no-default-features # interpreter only: no Cranelift, no unsafe in the build
 cargo test --workspace --features libriscv/aot-dylib,rvlinux/aot-dylib  # + AOT (needs rustc)
@@ -30,7 +31,8 @@ cargo run --release -p asteroids             # example game: Rust engine + Rust 
 rvlinux dynamic.elf                          # JIT by default (-n interprets); caches ld.so + system libraries in ~/.cache/rvlinux/jit by itself (--jit-cache-dir, --no-jit-cache)
 ```
 
-Expected durations (warm build, 32 cores): the whole suite ~42 s with the JIT,
+Expected durations (warm build, 32 cores): the whole suite ~48 s with the JIT
+(~42 s without an RVA23 toolchain),
 the default (test binaries run one after another: `difftest.rs` ~18 s, bounded
 by one up-front JIT compile of static libstdc++; `libriscv`'s tests ~21 s,
 `shared_rodata.rs`'s `jit_runs_on_shared_rodata` alone ~7 s), ~9 s without (`--no-default-features`). Cranelift is always built optimized

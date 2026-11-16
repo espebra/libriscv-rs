@@ -28,6 +28,8 @@ use crate::isa::rvc::*;
 #[cfg(feature = "ext-f")]
 use crate::isa::rvfd::*;
 use crate::isa::rvi::*;
+#[cfg(feature = "ext-v")]
+use crate::isa::rvv::*;
 use crate::isa::{InstrFn, Op};
 use crate::registers::REG_SP;
 
@@ -57,6 +59,9 @@ pub(crate) const FNMSUB: u32 = 0b100_1011;
 #[cfg(feature = "ext-f")]
 pub(crate) const FNMADD: u32 = 0b100_1111;
 pub(crate) const FPFUNC: u32 = 0b101_0011;
+/// The vector arithmetic and configuration opcode (C++ `RV32V_OP`).
+#[cfg(feature = "ext-v")]
+pub(crate) const OP_V: u32 = 0b101_0111;
 
 const CBO_FUNCT3: u32 = 0b010;
 /// Whether the F/D bytecodes exist (their entry bits are re-encoded).
@@ -231,6 +236,8 @@ pub(crate) fn decode(i: Instr) -> OpInfo {
                     return info;
                 }
             }
+            #[cfg(feature = "ext-v")]
+            OP_V => return decode_vector(i),
             _ => {}
         }
     }
@@ -295,12 +302,33 @@ fn decode_float(i: Instr) -> Option<OpInfo> {
             0x1 => OpInfo::of::<Flh>(),
             0x2 => OpInfo::of::<Flw>(),
             0x3 => OpInfo::of::<Fld>(),
+            // The vector loads. The unmasked, single-field, unit-stride ones
+            // get a handler per EEW, so only what vtype decides is left.
+            #[cfg(feature = "ext-v")]
+            0x0 | 0x5 | 0x6 | 0x7 if is_unit_stride(i.whole()) => match fi.funct3() {
+                0x0 => OpInfo::of::<VLoadUnit<0>>(),
+                0x5 => OpInfo::of::<VLoadUnit<1>>(),
+                0x6 => OpInfo::of::<VLoadUnit<2>>(),
+                _ => OpInfo::of::<VLoadUnit<3>>(),
+            },
+            #[cfg(feature = "ext-v")]
+            0x0 | 0x5 | 0x6 | 0x7 => OpInfo::of::<VLoad>(),
             _ => OpInfo::of::<Illegal>(),
         },
         STORE_FP => match fi.funct3() {
             0x1 => OpInfo::of::<Fsh>(),
             0x2 => OpInfo::of::<Fsw>(),
             0x3 => OpInfo::of::<Fsd>(),
+            // The vector stores, as the loads above.
+            #[cfg(feature = "ext-v")]
+            0x0 | 0x5 | 0x6 | 0x7 if is_unit_stride(i.whole()) => match fi.funct3() {
+                0x0 => OpInfo::of::<VStoreUnit<0>>(),
+                0x5 => OpInfo::of::<VStoreUnit<1>>(),
+                0x6 => OpInfo::of::<VStoreUnit<2>>(),
+                _ => OpInfo::of::<VStoreUnit<3>>(),
+            },
+            #[cfg(feature = "ext-v")]
+            0x0 | 0x5 | 0x6 | 0x7 => OpInfo::of::<VStore>(),
             _ => OpInfo::of::<Illegal>(),
         },
         FMADD => OpInfo::of::<FMadd>(),
@@ -333,6 +361,38 @@ fn decode_float(i: Instr) -> Option<OpInfo> {
             _ => return None,
         },
     })
+}
+
+/// The `RV32V_OP` case of `instr_decoding.inc`. Every vector instruction
+/// is a slow-path (FUNCTION) instruction, as in C++.
+#[cfg(feature = "ext-v")]
+fn decode_vector(i: Instr) -> OpInfo {
+    match i.itype().funct3() {
+        0x0 => OpInfo::of::<VOpiVv>(),
+        0x1 if is_opfvv_arith(i.whole() >> 26) => OpInfo::of::<VOpfVvArith>(),
+        0x1 => OpInfo::of::<VOpfVv>(),
+        // VMV.X.S, VCPOP.M and VFIRST.M with rd = x0 write nothing (C++
+        // writes x0, which then reads back nonzero).
+        0x2 if writes_x0(i) => OpInfo::of::<Nop>(),
+        0x2 | 0x6 => OpInfo::of::<VOpmVv>(),
+        0x3 | 0x4 => OpInfo::of::<VOpiVi>(),
+        0x5 => OpInfo::of::<VOpfVf>(),
+        // Vector configuration
+        _ => match i.whole() >> 30 {
+            0x0 | 0x1 => OpInfo::of::<VSetVli>(),
+            0x2 => OpInfo::of::<VSetVl>(),
+            _ => OpInfo::of::<VSetIvli>(),
+        },
+    }
+}
+
+/// An OPMVV instruction with an integer destination (VMV.X.S, VCPOP.M,
+/// VFIRST.M: funct6 010000, selected by vs1) whose destination is x0.
+#[cfg(feature = "ext-v")]
+const fn writes_x0(i: Instr) -> bool {
+    let w = i.whole();
+    let (rd, vs1, funct6) = ((w >> 7) & 31, (w >> 15) & 31, w >> 26);
+    rd == 0 && funct6 == 0b010000 && matches!(vs1, 0b00000 | 0b10000 | 0b10001)
 }
 
 /// The compressed half of `instr_decoding.inc` (RV64). `None` falls through

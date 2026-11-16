@@ -3,7 +3,7 @@
 //!
 //! Floating-point registers are stored as raw 64-bit patterns (C++
 //! `fp64reg`); the F/D extension adds the NaN-boxing views. Vector registers
-//! come with the V extension (Phase 5).
+//! come with the V extension (`rvv_registers.rs`).
 
 /// C++ `nanboxing`: single-precision values get the upper half of their
 /// register filled with ones only in the `debug-checks` build.
@@ -81,6 +81,8 @@ pub struct Registers {
     pub pc: u64,
     fcsr: Fcsr,
     f: [u64; 32],
+    #[cfg(feature = "ext-v")]
+    rvv: crate::rvv_registers::VectorRegisters,
 }
 
 impl Registers {
@@ -162,6 +164,16 @@ impl Registers {
     }
     pub const fn fcsr_mut(&mut self) -> &mut Fcsr {
         &mut self.fcsr
+    }
+
+    /// The vector registers and vector CSRs (C++ `rvv()`).
+    #[cfg(feature = "ext-v")]
+    pub const fn rvv(&self) -> &crate::rvv_registers::VectorRegisters {
+        &self.rvv
+    }
+    #[cfg(feature = "ext-v")]
+    pub const fn rvv_mut(&mut self) -> &mut crate::rvv_registers::VectorRegisters {
+        &mut self.rvv
     }
 }
 

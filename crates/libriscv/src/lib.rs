@@ -103,6 +103,8 @@ mod native;
 mod native_code;
 mod options;
 pub mod registers;
+#[cfg(feature = "ext-v")]
+pub mod rvv_registers;
 mod signals;
 mod sysargs;
 mod syscalls;

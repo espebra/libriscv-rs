@@ -14,11 +14,13 @@
 //! |---|---|---|
 //! | `RCC` | `riscv64-linux-gnu-gcc-14` | C cross compiler |
 //! | `RCXX` | `riscv64-linux-gnu-g++-14` | C++ cross compiler |
+//! | `RVCC` | `~/riscv/bin/riscv64-unknown-linux-gnu-gcc` | RVA23 C compiler (default `-march` with V, Zvbb, Zvfhmin; [`build_rva23`]) |
 //! | `RUSTC` | `rustc` | Compiler of the Rust guests ([`build_rust`]) |
 //! | `RUST_LINKER` | first of `riscv64-linux-gnu-gcc-{14,13,12,}` | Cross linker of the Rust guests |
 //! | `LIBRISCV_CPP` | `../libriscv` (sibling of the workspace) | C++ libriscv checkout |
 //! | `LIBRISCV_CPP_EMULATOR` | `$LIBRISCV_CPP/emulator/rvlinux` | Reference emulator binary |
 //! | `LIBRISCV_REQUIRE_TOOLCHAIN` | unset | If `1`, missing tools fail tests instead of skipping them |
+//! | `LIBRISCV_REQUIRE_RVA23` | unset | If `1`, a missing `RVCC` fails the RVA23 suite instead of skipping it |
 
 #![forbid(unsafe_code)]
 
@@ -453,7 +455,49 @@ pub fn build_with_sources(
     args: &str,
     lang: Lang,
 ) -> Result<PathBuf, BuildError> {
-    let cc = compiler(lang);
+    build_with_compiler(&compiler(lang), code, sources, args, lang)
+}
+
+/// The RVA23 C compiler (`$RVCC`), as `tests/rva23/run.sh` in C++ libriscv
+/// finds it: one whose default `-march` is RVA23, with the vector extension.
+pub fn rva23_compiler() -> String {
+    std::env::var("RVCC").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/riscv/bin/riscv64-unknown-linux-gnu-gcc")
+    })
+}
+
+/// Skip-or-fail helper for tests needing [`rva23_compiler`]. Only checked
+/// when `LIBRISCV_REQUIRE_RVA23=1`: CI has no RVA23 toolchain, just as C++
+/// libriscv's CI can't run its RVA23 suite.
+pub fn need_rva23_compiler() -> bool {
+    let cc = rva23_compiler();
+    let ok = runs(&cc);
+    if !ok {
+        let required = std::env::var("LIBRISCV_REQUIRE_RVA23").is_ok_and(|v| v == "1");
+        assert!(
+            !required,
+            "RVA23 compiler `{cc}` is required (LIBRISCV_REQUIRE_RVA23=1) but not available"
+        );
+        eprintln!("SKIPPED: RVA23 compiler `{cc}` not available (set RVCC)");
+    }
+    ok
+}
+
+/// Compile C `code` with the RVA23 compiler ([`rva23_compiler`]) and return
+/// the path to the cached ELF.
+pub fn build_rva23(code: &str, args: &str) -> Result<PathBuf, BuildError> {
+    build_with_compiler(&rva23_compiler(), code, &[], args, Lang::C)
+}
+
+fn build_with_compiler(
+    cc: &str,
+    code: &str,
+    sources: &[PathBuf],
+    args: &str,
+    lang: Lang,
+) -> Result<PathBuf, BuildError> {
+    let cc = cc.to_owned();
     let mut h = DefaultHasher::new();
     (code, sources, args, lang, &cc).hash(&mut h);
     let key = format!("{:016x}", h.finish());

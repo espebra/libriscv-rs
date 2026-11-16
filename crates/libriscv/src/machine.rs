@@ -622,9 +622,17 @@ impl Machine {
 
     /// Port of `Machine::system`: SYSTEM instructions other than the ones
     /// the dispatcher handles itself, i.e. EBREAK, the Zicsr CSR
-    /// instructions and Zimop. (Vector CSRs arrive with the V extension.)
+    /// instructions and Zimop, and the vector CSRs.
     pub(crate) fn system(&mut self, instr: Instr) -> Result<()> {
         let it = instr.itype();
+        // The vector CSRs are shared by all six CSR instructions.
+        #[cfg(feature = "ext-v")]
+        if it.funct3() != 0x0
+            && it.funct3() != 0x4
+            && let Some(res) = crate::isa::rvv::vector_csr(self, instr)
+        {
+            return res;
+        }
         let rd = it.rd();
         let has_rd = rd != 0;
         let csr = it.imm();
