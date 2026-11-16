@@ -98,8 +98,11 @@ fn cached(m: &Machine) -> bool {
 
 /// The JIT runs here and a host C compiler driver links shared objects.
 fn supported() -> bool {
-    if !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
-        eprintln!("SKIPPED: the JIT cache needs x86-64 Linux");
+    if !cfg!(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_os = "linux"
+    )) {
+        eprintln!("SKIPPED: the JIT cache needs x86-64 or AArch64 Linux");
         return false;
     }
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());

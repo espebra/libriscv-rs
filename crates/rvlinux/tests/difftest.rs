@@ -866,9 +866,10 @@ const FP_ABI: &str = "-mabi=lp64d -mno-relax -fno-math-errno";
 /// single-precision write keeps the upper half), plus compiler-generated
 /// floating-point code.
 ///
-/// Two NaN operands with different payloads are avoided in binary
-/// operations (which one a host FPU propagates depends on the operand order
-/// the compiler picks), and FMIN/FMAX skip signaling NaNs (C++ `std::fmin`
+/// Arithmetic on two NaN operands only hashes whether the result is a NaN:
+/// which payload a host FPU propagates depends on the operand order the
+/// compiler picks, which differs between GCC and LLVM on AArch64 (many
+/// sweep values are NaNs in the other width). FMIN/FMAX skip signaling NaNs (C++ `std::fmin`
 /// gives the other operand when clang inlines it and a quiet NaN in glibc).
 const FLOAT: &str = r#"
 typedef unsigned long ulong;
@@ -883,7 +884,10 @@ static void puthex(ulong v) {
     char b[17]; for (int i = 15; i >= 0; i--) { b[i] = "0123456789abcdef"[v & 15]; v >>= 4; }
     b[16] = 0; put(b);
 }
-static ulong h[200];
+static ulong h[320];
+/* Each function folds into its own slots (from `n`), so a difference
+   points at one instruction: bin 0, fused 32, unary 40, fromint 90,
+   fli 101, memops 140, compiled 150. */
 static int n;
 static void fold(ulong v) { h[n] = (h[n] ^ v) * 0x100000001b3ul; h[n] = (h[n] << 7) | (h[n] >> 57); n++; }
 
@@ -902,12 +906,19 @@ static void fold(ulong v) { h[n] = (h[n] ^ v) * 0x100000001b3ul; h[n] = (h[n] <<
 
 static int snan32(ulong v) { return (v & 0x7fc00000) == 0x7f800000 && (v & 0x3fffff); }
 static int snan64(ulong v) { return (v & 0x7ff8000000000000ul) == 0x7ff0000000000000ul && (v & 0x7ffffffffffful); }
+static int nan32(ulong v) { return (v & 0x7f800000) == 0x7f800000 && (v & 0x7fffff); }
+static int nan64(ulong v) { return (v & 0x7ff0000000000000ul) == 0x7ff0000000000000ul && (v & 0xffffffffffffful); }
+static ulong canon32(ulong v) { return nan32(v) ? 0x7fc00000 : v; }
+static ulong canon64(ulong v) { return nan64(v) ? 0x7ff8000000000000ul : v; }
+/* Arithmetic: with two NaN operands, only whether the result is a NaN. */
+#define A2(op, w) do { ulong r; asm volatile(LD op " ft3, ft0, ft1\n\tfmv.x.d %0, ft3" : "=r"(r) IN); \
+    fold(nan##w(a) && nan##w(b) ? canon##w(r) : r); } while (0)
 
 /* Binary and fused operations. */
 static void __attribute__((noinline)) bin(ulong a, ulong b, ulong c, ulong d) {
     n = 0;
-    F2("fadd.s"); F2("fsub.s"); F2("fmul.s"); F2("fdiv.s");
-    F2("fadd.d"); F2("fsub.d"); F2("fmul.d"); F2("fdiv.d");
+    A2("fadd.s", 32); A2("fsub.s", 32); A2("fmul.s", 32); A2("fdiv.s", 32);
+    A2("fadd.d", 64); A2("fsub.d", 64); A2("fmul.d", 64); A2("fdiv.d", 64);
     F2("fsgnj.s"); F2("fsgnjn.s"); F2("fsgnjx.s");
     F2("fsgnj.d"); F2("fsgnjn.d"); F2("fsgnjx.d");
     if (!snan32(a) && !snan32(b)) { F2("fmin.s"); F2("fmax.s"); } else n += 2;
@@ -918,18 +929,21 @@ static void __attribute__((noinline)) bin(ulong a, ulong b, ulong c, ulong d) {
 }
 /* FMA NaN results are the host fma()'s: C++ calls glibc's, which uses the
    CPU's FMA instruction, and which NaN that returns varies between CPUs;
-   Rust uses compiler-builtins' software fma(). Only fold whether it's NaN. */
-static ulong canon32(ulong v) { return ((v & 0x7f800000) == 0x7f800000 && (v & 0x7fffff)) ? 0x7fc00000 : v; }
-static ulong canon64(ulong v) { return ((v & 0x7ff0000000000000ul) == 0x7ff0000000000000ul && (v & 0xffffffffffffful)) ? 0x7ff8000000000000ul : v; }
+   Rust uses compiler-builtins' software fma(). Only fold whether it's NaN.
+   FNMADD is -fma(a, b, c) in both emulators, whose exact zero is -0, but
+   AArch64 compilers may emit the host's FNMADD (-(a*b) - c, rounded once),
+   whose exact zero is +0: its zeros fold without their sign. */
+static ulong nz32(ulong v) { v = canon32(v); return (v & 0x7fffffff) == 0 ? v & ~0x80000000ul : v; }
+static ulong nz64(ulong v) { v = canon64(v); return (v << 1) == 0 ? 0 : v; }
 static void __attribute__((noinline)) fused(ulong a, ulong b, ulong c, ulong d) {
-    n = 0;
-    F3("fmadd.s", canon32); F3("fmsub.s", canon32); F3("fnmadd.s", canon32); F3("fnmsub.s", canon32);
-    F3("fmadd.d", canon64); F3("fmsub.d", canon64); F3("fnmadd.d", canon64); F3("fnmsub.d", canon64);
+    n = 32;
+    F3("fmadd.s", canon32); F3("fmsub.s", canon32); F3("fnmadd.s", nz32); F3("fnmsub.s", canon32);
+    F3("fmadd.d", canon64); F3("fmsub.d", canon64); F3("fnmadd.d", nz64); F3("fnmsub.d", canon64);
 }
 /* Single-operand operations, including signaling NaNs. */
 static void __attribute__((noinline)) unary(ulong a, ulong d) {
     ulong b = 0, c = 0;
-    n = 0;
+    n = 40;
     F1("fsqrt.s"); F1("fsqrt.d"); X1("fclass.s"); X1("fclass.d");
     F1("fcvt.s.d"); F1("fcvt.d.s"); X1("fmv.x.w"); X1("fmv.x.d");
     X1R("fcvt.w.s", "rne"); X1R("fcvt.w.s", "rtz"); X1R("fcvt.w.s", "rdn"); X1R("fcvt.w.s", "rup");
@@ -949,14 +963,14 @@ static void __attribute__((noinline)) unary(ulong a, ulong d) {
 /* Integer to floating-point. The rounding mode is ignored without FCSR. */
 static void __attribute__((noinline)) fromint(ulong a, ulong d) {
     ulong b = 0, c = 0;
-    n = 0;
+    n = 90;
     I1("fcvt.s.w"); I1("fcvt.s.wu"); I1("fcvt.s.l"); I1R("fcvt.s.lu", "rtz");
     I1("fcvt.d.w"); I1("fcvt.d.wu"); I1R("fcvt.d.l", "rup"); I1("fcvt.d.lu");
     I1("fmv.w.x"); I1("fmv.d.x"); I1("fmv.h.x");
 }
 static void __attribute__((noinline)) fli(ulong d) {
     ulong a = 0, b = 0, c = 0;
-    n = 0;
+    n = 101;
     FLI(0x78, 0); FLI(0x78, 1); FLI(0x78, 2); FLI(0x78, 3); FLI(0x78, 4); FLI(0x78, 5);
     FLI(0x78, 6); FLI(0x78, 7); FLI(0x78, 8); FLI(0x78, 9); FLI(0x78, 10); FLI(0x78, 11);
     FLI(0x78, 12); FLI(0x78, 13); FLI(0x78, 14); FLI(0x78, 15); FLI(0x78, 16); FLI(0x78, 17);
@@ -1053,8 +1067,9 @@ int main(void) {
     asm volatile("csrwi frm, 0");
     for (int i = 0; i < (int)(sizeof(ints) / sizeof(ints[0])); i++) fromint(ints[i], d);
     fli(d); fli(0);
-    n = 0; memops(d); memops(F(0x40490fdb)); compiled();
-    for (int i = 0; i < 60; i++) { puthex(h[i]); put("\n"); }
+    n = 140; memops(d); memops(F(0x40490fdb)); compiled();
+    const int end = n;
+    for (int i = 0; i < end; i++) { puthex(h[i]); put("\n"); }
     return 0;
 }
 void _start(void) { sys(93, main(), 0, 0); }

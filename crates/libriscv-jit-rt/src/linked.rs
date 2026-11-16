@@ -5,7 +5,7 @@
 //! format). The object has one *record* per segment in the section
 //! [`SECTION`], and a *table* of its records behind the symbol
 //! [`TABLE_SYMBOL`]. All of them are `u64` words, and the addresses in them
-//! are relative (`R_X86_64_PC64`), so the sections need no run-time
+//! are relative (`R_X86_64_PC64`, `R_AARCH64_PREL64`), so the sections need no run-time
 //! relocations and can be read-only:
 //!
 //! * record (`RECORD_WORDS`): `[RECORD_MAGIC, code - &word[1], code_len,

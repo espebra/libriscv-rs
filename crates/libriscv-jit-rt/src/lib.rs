@@ -66,6 +66,7 @@ use memmap2::Mmap;
 
 pub mod aot;
 mod arena;
+mod icache;
 mod linked;
 pub use arena::{GuestArena, RodataImage, host_page_size, shared_rodata_supported};
 pub use linked::{
@@ -407,6 +408,7 @@ impl CodeMemory {
         map.copy_from_slice(code);
         let map = map.make_exec()?;
         let base = map.as_ptr() as usize;
+        icache::flush(&map);
         Self::with_backing(
             Backing::Mapped { _map: map },
             base,
@@ -535,6 +537,8 @@ impl CodeMemory {
             return None;
         }
         let code = (self.base + self.trampoline) as *const u8;
+        // The code may have been written on another thread (see `icache`).
+        icache::synchronize();
         // SAFETY: `code` is the start of the trampoline, a function with the
         // platform's C calling convention and the `Trampoline` signature,
         // inside the code, which is executable and stays mapped as long as

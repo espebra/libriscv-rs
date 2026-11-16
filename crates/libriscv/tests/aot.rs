@@ -812,9 +812,13 @@ fn loading_a_bad_file_fails() {
     let dir = scratch("bad");
     assert!(libriscv::aot::load_shared_object(dir.join("missing.so")).is_err());
     // libm is a shared object without a translation.
-    let libm = ["/lib/x86_64-linux-gnu/libm.so.6", "/usr/lib/libm.so.6"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists());
+    let libm = [
+        "/lib/x86_64-linux-gnu/libm.so.6",
+        "/lib/aarch64-linux-gnu/libm.so.6",
+        "/usr/lib/libm.so.6",
+    ]
+    .into_iter()
+    .find(|p| std::path::Path::new(p).exists());
     if let Some(libm) = libm {
         let e = libriscv::aot::load_shared_object(libm).unwrap_err();
         assert!(e.to_string().contains("no libriscv translation"), "{e}");

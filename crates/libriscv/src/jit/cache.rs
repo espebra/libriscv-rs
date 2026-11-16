@@ -22,8 +22,8 @@
 //!
 //! See `libriscv_jit_rt`'s `linked` module for the records and the table
 //! that lead to each segment's code and metadata. The code is the image
-//! as the JIT links it, with its libcalls as `R_X86_64_GOTPCREL`
-//! relocations against the C library's functions. The metadata is
+//! as the JIT links it, with its libcalls (x86-64 only) as
+//! `R_X86_64_GOTPCREL` relocations against the C library's functions. The metadata is
 //! little-endian `u64`s: [`META_MAGIC`], the key (see [`NativeKey::words`]),
 //! the trampoline offset, the entry count and the entries (`u32`, see
 //! [`Image::entries`]), the patch count and the patched decoder
@@ -675,7 +675,8 @@ impl JitCacheOutput {
         }
     }
 
-    /// The recorded code as an ELF relocatable object (x86-64).
+    /// The recorded code as an ELF relocatable object for the host (x86-64
+    /// or AArch64).
     pub fn object(&self) -> io::Result<Vec<u8>> {
         write_elf(&self.units())
     }
@@ -729,7 +730,7 @@ impl JitCacheOutput {
     }
 }
 
-// ELF constants (x86-64, relocatable).
+// ELF constants (relocatable).
 const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
@@ -740,7 +741,15 @@ const SHF_INFO_LINK: u64 = 0x40;
 /// Never garbage-collect the section (`--gc-sections`).
 const SHF_GNU_RETAIN: u64 = 0x20_0000;
 const R_X86_64_GOTPCREL: u32 = 9;
-const R_X86_64_PC64: u32 = 24;
+/// The host's machine type and its 64-bit PC-relative relocation (`S + A -
+/// P`): x86-64, or AArch64, where generated code has no libcalls (Cranelift
+/// rounds and fuses natively), so it needs no GOT relocations.
+#[cfg(target_arch = "aarch64")]
+const HOST: Option<(u16, u32)> = Some((183, 260)); // EM_AARCH64, R_AARCH64_PREL64
+#[cfg(target_arch = "x86_64")]
+const HOST: Option<(u16, u32)> = Some((62, 24)); // EM_X86_64, R_X86_64_PC64
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const HOST: Option<(u16, u32)> = None;
 const STB_LOCAL: u8 = 0;
 const STB_GLOBAL: u8 = 1;
 const STB_WEAK: u8 = 2;
@@ -774,12 +783,13 @@ fn write_elf(units: &[Unit]) -> io::Result<Vec<u8>> {
     if units.is_empty() {
         return Err(invalid_data("no compiled code to write"));
     }
-    if !cfg!(target_arch = "x86_64") {
-        return Err(io::Error::new(
+    let unsupported = || {
+        io::Error::new(
             io::ErrorKind::Unsupported,
-            "saving JIT code is only supported on x86-64",
-        ));
-    }
+            "saving JIT code is only supported on x86-64 and AArch64",
+        )
+    };
+    let (machine, r_pc64) = HOST.ok_or_else(unsupported)?;
     let mut text = Vec::new();
     let mut text_rela: Vec<Rela> = Vec::new();
     let mut meta = Vec::new();
@@ -795,6 +805,9 @@ fn write_elf(units: &[Unit]) -> io::Result<Vec<u8>> {
         text.resize(text.len().next_multiple_of(64), 0);
         let code = text.len() as u64;
         text.extend_from_slice(&image.bytes);
+        if !image.libcalls.is_empty() && !cfg!(target_arch = "x86_64") {
+            return Err(unsupported());
+        }
         for site in &image.libcalls {
             let index = match libcalls.iter().position(|&c| c == site.call) {
                 Some(i) => i,
@@ -826,14 +839,14 @@ fn write_elf(units: &[Unit]) -> io::Result<Vec<u8>> {
         ] {
             records.extend_from_slice(&w.to_le_bytes());
         }
-        records_rela.push((record + 8, SYM_TEXT, R_X86_64_PC64, code as i64));
-        records_rela.push((record + 24, SYM_META, R_X86_64_PC64, meta_at as i64));
+        records_rela.push((record + 8, SYM_TEXT, r_pc64, code as i64));
+        records_rela.push((record + 24, SYM_META, r_pc64, meta_at as i64));
     }
     let mut table = Vec::new();
     for w in [TABLE_MAGIC, units.len() as u64, 0] {
         table.extend_from_slice(&w.to_le_bytes());
     }
-    let table_rela: Vec<Rela> = vec![(16, SYM_RECORDS, R_X86_64_PC64, 0)];
+    let table_rela: Vec<Rela> = vec![(16, SYM_RECORDS, r_pc64, 0)];
     debug_assert_eq!(records.len(), units.len() * RECORD_WORDS * 8);
 
     // Symbols and their names.
@@ -984,7 +997,7 @@ fn write_elf(units: &[Unit]) -> io::Result<Vec<u8>> {
     header.extend_from_slice(&[2, 1, 1, 0]); // 64-bit, little-endian, v1, SysV
     header.extend_from_slice(&[0; 8]);
     header.extend_from_slice(&1u16.to_le_bytes()); // ET_REL
-    header.extend_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+    header.extend_from_slice(&machine.to_le_bytes());
     header.extend_from_slice(&1u32.to_le_bytes());
     header.extend_from_slice(&0u64.to_le_bytes()); // e_entry
     header.extend_from_slice(&0u64.to_le_bytes()); // e_phoff

@@ -471,7 +471,7 @@ pub(crate) mod tests {
         for background in [false, true] {
             let (got, compiles) = run_page(&page, true, background, 1 << 20, FUEL);
             assert_eq!(got, expected, "background {background}");
-            if cfg!(target_arch = "x86_64") && !background {
+            if super::emit::HOST_SUPPORTED && !background {
                 // The main segment and the page's first segment.
                 assert_eq!(compiles, 2);
             }
@@ -499,7 +499,7 @@ pub(crate) mod tests {
             assert_eq!(got, expected, "background {background}");
             // In the background the code may arrive after the run: only the
             // results are compared then.
-            if cfg!(target_arch = "x86_64") && !background {
+            if super::emit::HOST_SUPPORTED && !background {
                 // The main segment, the page, and its rebuild, which then
                 // runs natively.
                 assert_eq!(compiles, 3);
@@ -601,7 +601,7 @@ pub(crate) mod tests {
         let (compiled, compiles) = run(true);
         assert_eq!(compiled, interpreted);
         assert!(interpreted.1 > 500, "{interpreted:?}");
-        if cfg!(target_arch = "x86_64") {
+        if super::emit::HOST_SUPPORTED {
             // The main segment and the loop's page, once.
             assert_eq!(compiles, 2);
         }
@@ -672,9 +672,14 @@ pub(crate) mod tests {
     }
 
     /// Without SSE4.1 and FMA, rounding and FMA are calls to the helpers in
-    /// `emit`: the same results as the interpreter.
+    /// `emit`: the same results as the interpreter. (AArch64 has both.)
     #[test]
-    #[cfg(all(feature = "ext-f", not(feature = "debug-checks"), target_os = "linux"))]
+    #[cfg(all(
+        feature = "ext-f",
+        not(feature = "debug-checks"),
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
     fn fp_libcalls_match_the_interpreter() {
         use std::sync::atomic::Ordering;
         const fn fp(fpfunc: u32, fmt: u32, rm: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
@@ -733,13 +738,19 @@ pub(crate) mod tests {
     }
 
     /// Serializes the tests that compile for baseline x86-64.
+    #[cfg(target_arch = "x86_64")]
     static BASELINE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Saved code with libcalls (baseline x86-64: rounding and FMA are
     /// calls) links them against the C library's `nearbyint`, `fma` and so
     /// on, through the GOT: the same results as the interpreter.
     #[test]
-    #[cfg(all(feature = "ext-f", not(feature = "debug-checks"), target_os = "linux"))]
+    #[cfg(all(
+        feature = "ext-f",
+        not(feature = "debug-checks"),
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
     fn saved_libcalls_match_the_interpreter() {
         use std::sync::atomic::Ordering;
         if !std::process::Command::new("cc")
@@ -900,7 +911,7 @@ pub(crate) mod tests {
         assert!(a.regions.len() >= 400, "{} regions", a.regions.len());
         let layout = m.memory.native_layout();
         let one = super::emit::compile_on(exec, &a, layout, 1);
-        assert_eq!(one.is_some(), cfg!(target_arch = "x86_64"));
+        assert_eq!(one.is_some(), super::emit::HOST_SUPPORTED);
         for threads in [2, 8, 64] {
             let many = super::emit::compile_on(exec, &a, layout, threads);
             assert_eq!(format!("{one:?}"), format!("{many:?}"), "{threads} threads");

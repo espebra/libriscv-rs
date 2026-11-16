@@ -212,11 +212,14 @@ pub(crate) fn build_fingerprint() -> Option<u64> {
     })
 }
 
-/// The host ISA, or `None` where the JIT is not supported. Only x86-64 is
-/// enabled for now: AArch64 needs an explicit instruction-cache flush after
-/// writing code, which `libriscv-jit-rt` does not do yet.
+/// True where the JIT generates code: x86-64 and AArch64 (where
+/// `libriscv-jit-rt` keeps the instruction cache coherent).
+pub(crate) const HOST_SUPPORTED: bool = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"));
+
+/// The host ISA, or `None` where the JIT is not supported
+/// ([`HOST_SUPPORTED`]).
 fn host_isa() -> Option<OwnedTargetIsa> {
-    if !cfg!(target_arch = "x86_64") {
+    if !HOST_SUPPORTED {
         return None;
     }
     let mut flags = settings::builder();

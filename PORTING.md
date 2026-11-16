@@ -350,9 +350,13 @@ by default; `-n`/`--no-translate` or `--no-jit` selects interpretation.
 
 Instruction selection and region analysis are in `codegen/`; compilation and
 caching are in `jit/`. Executable memory and native entry are isolated in
-`libriscv-jit-rt`. JIT execution currently supports x86-64. AArch64 requires
-an instruction-cache flush in the runtime. Cranelift x64 tail calls require
-`preserve_frame_pointers`.
+`libriscv-jit-rt`. JIT execution supports x86-64 and AArch64
+(`emit::HOST_SUPPORTED`); other hosts interpret. On AArch64,
+`CodeMemory::new` cleans the data cache and invalidates the instruction cache
+for new code (`dc cvau`/`ic ivau`, as `__clear_cache`), and `CodeMemory::enter`
+issues an `isb`, because background compilation writes code on another thread.
+Cranelift's AArch64 backend rounds and fuses natively, so its code has no
+libcalls. Cranelift x64 tail calls require `preserve_frame_pointers`.
 
 ### Unsafe boundary
 
@@ -505,7 +509,8 @@ object without additional dependencies. `write_shared_object` links with
 `$CC` or `cc -shared -nostdlib ... -lm`.
 
 Each `libriscv_jitcache` record contains magic, PC-relative code and metadata
-offsets (`R_X86_64_PC64`), and lengths. Libcalls use `R_X86_64_GOTPCREL`.
+offsets (`R_X86_64_PC64`, `R_AARCH64_PREL64`), and lengths. Libcalls (x86-64
+only) use `R_X86_64_GOTPCREL`.
 The weak `libriscv_jitcache_table` symbol supports `dlsym`; embedded objects
 use `__start_`/`__stop_` symbols and `SHF_GNU_RETAIN`. An empty runtime record
 ensures section symbols exist. Shared objects need no runtime relocations in
@@ -532,7 +537,7 @@ Loading a static glibc C++ program's 20 MB image took 0.14 s versus 12 s to
 compile in a debug build. Tests cover library and CLI APIs, multiple segments,
 libcalls through `libm`, invalid files, dynamic executables, and embedded
 objects. Slow dynamic and embedded tests are ignored by default. Re-exporting
-cached code and AArch64 support remain unimplemented.
+cached code remains unimplemented.
 
 ### Cache directory
 
@@ -924,6 +929,10 @@ without `jit`). The distribution's glibc is RV64GC, so tests running glibc
 guests are ignored (or, for `linux.rs` and `vmcall.rs`, compiled out)
 without the A, C and F features; freestanding guests are built for what
 the features allow.
+
+CI runs the `test`, `stream` and `lint` jobs on both x86-64
+(`ubuntu-24.04`) and AArch64 (`ubuntu-24.04-arm`) hosts, with the C++
+reference built natively on each.
 
 CI runs the dynamic STREAM executable (`binaries/STREAM/stream.dyn`)
 under Ubuntu's riscv64 glibc: on Linux with the interpreter and `-j`
@@ -1531,7 +1540,8 @@ and JIT. `rustguestfuzzer` exercises collection operations on supplied bytes.
 - [x] JIT: native calls between regions (asmjit `emit_direct_call`, shared with AOT in `codegen::calls`); see "Native calls" under "JIT"
 - [x] JIT: dyncall handlers called from native code (asmjit `emit_dyncall`); see "Dyncalls" under "JIT"
 - [x] AOT: translation to safe Rust (`aot`/`aot-dylib` features, `rvlinux --aot-save`/`--aot-save-shared`/`--aot-load`, `RVLINUX_AOT_EMBED`), structured control flow, region-to-region `become`, native calls (inlined when self-contained, devirtualized for address-taken functions); see "AOT"
-- [ ] JIT: lazy compilation, AArch64 (icache flush in `libriscv-jit-rt`). Lazy compilation matters most for dynamic executables: `libc.so`'s whole executable mapping (1.5 MB) becomes one segment, and compiling it up front takes ~10 s (release)
+- [x] JIT: AArch64 hosts (instruction-cache maintenance in `libriscv-jit-rt`; code cache with `R_AARCH64_PREL64`)
+- [ ] JIT: lazy compilation. Lazy compilation matters most for dynamic executables: `libc.so`'s whole executable mapping (1.5 MB) becomes one segment, and compiling it up front takes ~10 s (release)
 
 ### Phase 5 — Remaining features
 

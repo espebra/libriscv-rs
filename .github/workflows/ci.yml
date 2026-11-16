@@ -15,17 +15,30 @@ env:
 
 jobs:
   lint:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # The JIT's instruction-cache maintenance and the code cache's ELF
+        # writer have AArch64-only code.
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install
       - run: cargo fmt --all --check
+        if: matrix.os == 'ubuntu-24.04'
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --no-default-features -- -D warnings
 
   test:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # x86-64 and AArch64 hosts: the JIT runs on both, and the C++
+        # reference is built natively on each.
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
@@ -42,7 +55,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: libriscv-cpp/emulator/.build/rvlinux
-          key: rvlinux-${{ env.LIBRISCV_CPP_REF }}
+          key: rvlinux-${{ runner.arch }}-${{ env.LIBRISCV_CPP_REF }}
 
       - name: Fetch C++ libriscv
         run: |
@@ -95,7 +108,11 @@ jobs:
   # interpreted, with the JIT (cold cache), and with the JIT again, which
   # must use the cached code of ld.so and libc.
   stream:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
