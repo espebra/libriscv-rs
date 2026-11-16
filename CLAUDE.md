@@ -58,7 +58,7 @@ Toolchain: the crates, interpreter and JIT build on the stable Rust pinned in
 `fuzz/rust-toolchain.toml` (`cargo +nightly-2026-09-28`; also `NIGHTLY` in
 CI). Do not bump either as part of unrelated work; see "Toolchain" in
 `PORTING.md`. `.cargo/config.toml` aligns all functions on
-x86-64 for the stable dispatch.
+x86-64 and AArch64 for the stable dispatch.
 
 Guests compile with `riscv64-linux-gnu-gcc-14` (`$RCC`); outputs are cached in
 `target/riscv-guests/`. Rust guests (`testutil::build_rust`, `tests/native_rust.rs`)
