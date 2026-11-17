@@ -122,10 +122,14 @@ do not grow the stack in unoptimized builds; `tests/dispatch.rs`
 (`handler_chains_do_not_grow_the_stack`) checks both modes, and with
 `--release` that the stable dispatch's calls are jumps.
 
-`.cargo/config.toml` aligns every function to 64 bytes on x86-64
-(`-C llvm-args=-align-all-functions=6`) for the stable dispatch, which
-cannot align just its handlers (see "Dispatch"). It applies to builds in this
-workspace only, and not when `RUSTFLAGS` is set.
+`.cargo/config.toml` aligns every function to 64 bytes on x86-64 and
+AArch64 (`-C llvm-args=-align-all-functions=6`) for the stable dispatch,
+which cannot align just its handlers (see "Dispatch"). It applies to builds
+in this workspace only, and not when `RUSTFLAGS` is set: Cargo ignores the
+`.cargo/config.toml` of dependencies, so a program that uses `libriscv` as a
+crate gets the unaligned stable dispatch unless it passes the flag itself.
+`-align-all-functions` is an LLVM option rather than a Rust flag, so a
+toolchain bump can change or remove it; re-run the benchmarks.
 
 ## Dispatch
 
@@ -179,6 +183,12 @@ Stable-mode findings (2026-11-16, Ryzen 9 7950X, fixed-iteration CoreMark,
   8.24G, `nightly-dispatch` 8.39G, stable 8.48G (+1-3%, within this
   machine's noise). Host instructions: 27.81G nightly, 29.05G stable
   (+4.5%); rv64imafdc_zba_zbb_zbs 27.84G / 30.77G.
+- On AArch64 (96-core Neoverse-N1, stable 1.98, `rvlinux -n`, CoreMark
+  rv64gc, median of seven interleaved runs, iterations/s) alignment closes
+  most but not all of the gap: `nightly-dispatch` 1126, stable unaligned
+  1011 (-10.2%), stable aligned 1084 (-3.7%). Alignment does not change
+  `nightly-dispatch` (1125). It grows `rvlinux`'s text by 3.5% (2.8% with
+  `nightly-dispatch`).
 
 Sibling calls are an optimization, not a guarantee: unoptimized builds make
 real calls (~500 bytes of stack each). The dispatcher therefore runs in
