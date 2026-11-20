@@ -523,6 +523,33 @@ const COMPRESSED_ASM_CASES: &[(&str, &str)] = &[
         "li a0, 1\n mv a1, sp\n li a7, 93\n c.ld a1, 8(a1)",
     ),
     ("c_fall_off_end_sub", "li a0, 2\n li a7, 93\n c.sub a0, a5"),
+    ("c_fall_off_end_and", "li a0, 2\n li a7, 93\n c.and a0, a5"),
+    (
+        "c_fall_off_end_subw",
+        "li a0, 2\n li a7, 93\n c.subw a0, a5",
+    ),
+    (
+        "c_fall_off_end_addw",
+        "li a0, 2\n li a7, 93\n c.addw a0, a5",
+    ),
+    (
+        "c_fall_off_end_srai",
+        "li a0, -1\n li a7, 93\n c.srai a0, 35",
+    ),
+    ("c_fall_off_end_lui", "li a7, 93\n c.lui a0, 0xfffe1"),
+    // C.MUL is a bytecode here but C++'s RV32C_BC_FUNCTION.
+    ("c_fall_off_end_mul", "li a0, 2\n li a7, 93\n c.mul a0, a5"),
+    // C.FLDSP, C.FSDSP, C.FLD and C.FSD (no D extension in the assembler)
+    ("c_fall_off_end_fldsp", "li a7, 93\n .half 0x2502"),
+    ("c_fall_off_end_fsdsp", "li a7, 93\n .half 0xa42a"),
+    (
+        "c_fall_off_end_fld",
+        "li a0, 1\n mv s1, sp\n li a7, 93\n .half 0x2088",
+    ),
+    (
+        "c_fall_off_end_fsd",
+        "li a0, 1\n mv s1, sp\n li a7, 93\n .half 0xa488",
+    ),
     ("c_fall_off_end_zcb", "li a0, 2\n li a7, 93\n .half 0x9d65"),
 ];
 
@@ -758,8 +785,9 @@ fn freestanding_bitmanip() {
 /// and the fault data of a force-ended segment end, which is C++'s
 /// re-encoded bytecode operand (or the original bits on the slow path).
 const BITMANIP_ASM_CASES: &[(&str, &str)] = &[
-    // rd == x0 is a no-op for all of them: the OP-32 fast paths ADD.UW and
-    // ZEXT.H become `LI x0, 0`, the others take the slow path (a NOP).
+    // rd == x0 is a no-op for all of them: the OP-32 fast paths ADD.UW,
+    // SH1ADD.UW, SH2ADD.UW and ZEXT.H become `LI x0, 0`, the others take the
+    // slow path (a NOP).
     (
         "x0_not_written_by_add_uw",
         "li a1, 5\n li a2, 7\n add.uw x0, a1, a2\n add a0, x0, x0\n li a7, 93\n ecall",
@@ -771,6 +799,10 @@ const BITMANIP_ASM_CASES: &[(&str, &str)] = &[
     (
         "fall_off_end_after_add_uw_x0",
         "li a0, 3\n li a7, 93\n add.uw x0, a1, a2\n addi a0, a0, 1",
+    ),
+    (
+        "fall_off_end_after_sh1add_uw_x0",
+        "li a0, 3\n li a7, 93\n sh1add.uw x0, a1, a2\n addi a0, a0, 1",
     ),
     (
         "fall_off_end_after_zext_h_x0",
@@ -832,6 +864,19 @@ const BITMANIP_ASM_CASES: &[(&str, &str)] = &[
     (
         "fall_off_end_add_uw",
         "li a0, 3\n li a7, 93\n add.uw a0, a1, a2",
+    ),
+    // SH1ADD.UW and SH2ADD.UW are OP-32 fast paths; SH3ADD.UW is not.
+    (
+        "fall_off_end_sh1add_uw",
+        "li a0, 3\n li a7, 93\n sh1add.uw a0, a1, a2",
+    ),
+    (
+        "fall_off_end_sh2add_uw",
+        "li a0, 3\n li a7, 93\n sh2add.uw a0, a1, a2",
+    ),
+    (
+        "fall_off_end_sh3add_uw",
+        "li a0, 3\n li a7, 93\n sh3add.uw a0, a1, a2",
     ),
     (
         "fall_off_end_zext_h",

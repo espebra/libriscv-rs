@@ -572,8 +572,8 @@ ops! {
             0x40 => AddUw::compute(a.into(), reg(m, rt.rs2())), // ADD.UW
             0x44 if rt.rs2() == 0 => u64::from(a as u16),      // ZEXT.H
             0x44 => sext32(u32::from(a as u16) | (b << 16)),    // PACKW
-            0x102 => reg(m, rt.rs2()).wrapping_add(u64::from(a) << 1), // SH1ADD.UW
-            0x104 => reg(m, rt.rs2()).wrapping_add(u64::from(a) << 2), // SH2ADD.UW
+            0x102 => Sh1addUw::compute(a.into(), reg(m, rt.rs2())), // SH1ADD.UW
+            0x104 => Sh2addUw::compute(a.into(), reg(m, rt.rs2())), // SH2ADD.UW
             0x106 => reg(m, rt.rs2()).wrapping_add(u64::from(a) << 3), // SH3ADD.UW
             0x200 => sext32(a.wrapping_sub(b)),                // SUBW
             0x205 => ((a as i32) >> (b & 31)) as i64 as u64,   // SRAW
@@ -588,6 +588,8 @@ ops! {
     Subw = |m, i| { rtype_alu::<Subw>(m, i) }
     Mulw = |m, i| { rtype_alu::<Mulw>(m, i) }
     AddUw = |m, i| { rtype_alu::<AddUw>(m, i) }
+    Sh1addUw = |m, i| { rtype_alu::<Sh1addUw>(m, i) }
+    Sh2addUw = |m, i| { rtype_alu::<Sh2addUw>(m, i) }
     /// OP-32 ZEXT.H (PACKW with `rs2 = x0`).
     ZextH = |m, i| { rtype_alu::<ZextH>(m, i) }
 
@@ -722,6 +724,8 @@ rtype_alu! {
     Sh2add => |a, b| b.wrapping_add(a << 2);
     Sh3add => |a, b| b.wrapping_add(a << 3);
     AddUw => |a, b| b.wrapping_add(a & 0xFFFF_FFFF);
+    Sh1addUw => |a, b| b.wrapping_add((a & 0xFFFF_FFFF) << 1);
+    Sh2addUw => |a, b| b.wrapping_add((a & 0xFFFF_FFFF) << 2);
     ZextH => |a, _b| a & 0xFFFF;
 }
 #[inline(always)]

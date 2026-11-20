@@ -567,6 +567,14 @@ enum CBytecode {
     Std,
     Ldw,
     Stw,
+    Fld,
+    Fsd,
+    Lui,
+    Srai,
+    Sub,
+    And,
+    Subw,
+    Addw,
 }
 
 /// Port of the compressed half of `CPU::computed_index_for` (RV64).
@@ -587,9 +595,10 @@ fn compressed_bytecode(ci: CInstr) -> CBytecode {
             || x == ci_code(0b011, 0b00) =>
         {
             match ci.funct3() {
+                0x1 => B::Fld,
                 0x2 => B::Ldw,
                 0x3 => B::Ldd,
-                _ => B::Function, // C.FLD
+                _ => B::Function,
             }
         }
         x if x == ci_code(0b101, 0b00)
@@ -597,6 +606,7 @@ fn compressed_bytecode(ci: CInstr) -> CBytecode {
             || x == ci_code(0b111, 0b00) =>
         {
             match ci.funct3() {
+                5 => B::Fsd, // C.FSD
                 6 => B::Stw, // C.SW
                 7 => B::Std, // C.SD
                 _ => B::Function,
@@ -619,8 +629,10 @@ fn compressed_bytecode(ci: CInstr) -> CBytecode {
         x if x == ci_code(0b011, 0b01) => {
             if rd == 2 && ci.ci16_imm() != 0 {
                 B::Addi // C.ADDI16SP
+            } else if rd != 0 && rd != 2 && ci.ci_upper_imm() != 0 {
+                B::Lui
             } else {
-                B::Function // C.LUI, C.MOP.n, hints, illegal
+                B::Function // C.MOP.n, hints, illegal
             }
         }
         x if x == ci_code(0b001, 0b01) => {
@@ -640,6 +652,7 @@ fn compressed_bytecode(ci: CInstr) -> CBytecode {
         {
             match ci.funct3() {
                 0x0 if rd != 0 => B::Slli,
+                0x1 => B::Fld,            // C.FLDSP
                 0x2 if rd != 0 => B::Ldw, // C.LWSP
                 0x3 if rd != 0 => B::Ldd, // C.LDSP
                 _ => B::Function,
@@ -647,13 +660,17 @@ fn compressed_bytecode(ci: CInstr) -> CBytecode {
         }
         x if x == ci_code(0b100, 0b01) => match ci.ca_funct6() & 0x3 {
             0x0 => B::Srli,
+            0x1 => B::Srai,
             0x2 => B::Andi,
-            0x3 => match ci.ca_funct2() | (ci.ca_funct6() & 0x4) {
+            _ => match ci.ca_funct2() | (ci.ca_funct6() & 0x4) {
+                0x0 => B::Sub,
                 0x1 => B::Xor,
                 0x2 => B::Or,
-                _ => B::Function,
+                0x3 => B::And,
+                0x4 => B::Subw,
+                0x5 => B::Addw,
+                _ => B::Function, // C.MUL and the Zcb unary ops
             },
-            _ => B::Function, // C.SRAI
         },
         x if x == ci_code(0b100, 0b10) => {
             let topbit = ci.bit12() != 0;
@@ -675,6 +692,7 @@ fn compressed_bytecode(ci: CInstr) -> CBytecode {
             || x == ci_code(0b111, 0b10) =>
         {
             match ci.funct3() {
+                5 => B::Fsd, // C.FSDSP
                 6 => B::Stw, // C.SWSP
                 7 => B::Std, // C.SDSP
                 _ => B::Function,
@@ -708,39 +726,24 @@ fn compressed_fast_handler(
     let quadrant0 = ci.quadrant() == 0;
     Some(match compressed_bytecode(ci) {
         B::Invalid => return None,
-        // C1_ALU_OPS and C.LUI that C++ leaves to RV32C_BC_FUNCTION.
-        B::Function if ci.opcode() == ci_code(0b100, 0b01) => {
-            let handler: Handler = match ci.ca_funct6() & 0x3 {
-                1 => bc::c_srai,
-                3 => match ci.ca_funct2() | (ci.ca_funct6() & 0x4) {
-                    0 => bc::c_op::<Sub>,
-                    3 => bc::c_op::<And>,
-                    4 => bc::c_op::<Subw>,
-                    5 => bc::c_op::<Addw>,
-                    6 => bc::c_op::<Mul>,
-                    // Zcb unary ops
-                    _ => return Some((decode(i).cfunction, i.whole())),
-                },
-                _ => return Some((decode(i).cfunction, i.whole())),
-            };
-            if ci.ca_funct6() & 0x3 == 1 {
-                (handler, itype(srs1, 0, (ci.cab_shamt() & 63) as i32))
-            } else {
-                (handler, itype(srs1, srd, 0))
-            }
-        }
+        // C.MUL, which C++ leaves to RV32C_BC_FUNCTION.
         B::Function
-            if ci.opcode() == ci_code(0b011, 0b01)
-                && rd != 0
-                && rd != 2
-                && ci.ci_upper_imm() != 0 =>
+            if ci.opcode() == ci_code(0b100, 0b01)
+                && ci.ca_funct6() & 0x3 == 3
+                && ci.ca_funct2() | (ci.ca_funct6() & 0x4) == 6 =>
         {
-            (
-                bc::c_lui,
-                FasterJtype::encode((ci.ci_upper_imm() as u32) >> 8, rd),
-            )
+            (bc::c_op::<Mul>, itype(srs1, srd, 0))
         }
         B::Function => (decode(i).cfunction, i.whole()),
+        B::Lui => (
+            bc::c_lui,
+            FasterJtype::encode((ci.ci_upper_imm() as u32) >> 8, rd),
+        ),
+        B::Srai => (bc::c_srai, itype(srs1, 0, (ci.cab_shamt() & 63) as i32)),
+        B::Sub => (bc::c_op::<Sub>, itype(srs1, srd, 0)),
+        B::And => (bc::c_op::<And>, itype(srs1, srd, 0)),
+        B::Subw => (bc::c_op::<Subw>, itype(srs1, srd, 0)),
+        B::Addw => (bc::c_op::<Addw>, itype(srs1, srd, 0)),
         B::Addi if ci.opcode() == ci_code(0b000, 0b00) => {
             (bc::c_addi, itype(srd, REG_SP, ci.ciw_offset() as i32))
         }
@@ -773,6 +776,10 @@ fn compressed_fast_handler(
         B::Ldw => (bc::c_ldw, itype(rd, REG_SP, ci.ci2_offset() as i32)),
         B::Stw if quadrant0 => (bc::c_stw, itype(srs1, srd, ci.cl_offset() as i32)),
         B::Stw => (bc::c_stw, itype(REG_SP, rs2, ci.css_offset4() as i32)),
+        B::Fld if quadrant0 => (bc::c_fld, itype(srd, srs1, ci.csd_offset() as i32)),
+        B::Fld => (bc::c_fld, itype(rd, REG_SP, ci.cifld_offset() as i32)),
+        B::Fsd if quadrant0 => (bc::c_fsd, itype(srs1, srd, ci.csd_offset() as i32)),
+        B::Fsd => (bc::c_fsd, itype(REG_SP, rs2, ci.csfsd_offset() as i32)),
     })
 }
 
@@ -799,14 +806,17 @@ fn compressed_entry_bits(ci: CInstr, original: u32) -> u32 {
         B::Srli => itype(srs1, 0, ci.cab_shamt() as i32),
         B::Andi => itype(srs1, 0, ci.cab_imm()),
         B::Add => itype(rd, rs2, 0),
-        B::Xor | B::Or => itype(srs1, srd, 0),
+        B::Xor | B::Or | B::Sub | B::And | B::Subw | B::Addw => itype(srs1, srd, 0),
+        B::Srai => itype(srs1, 0, (ci.cab_shamt() & 63) as i32),
+        // FasterJtype: offset24 | rd << 24
+        B::Lui => (((ci.ci_upper_imm() as u32) >> 8) & 0xFF_FFFF) | (rd << 24),
         B::Beqz | B::Bnez => itype(srs1, 0, ci.cb_imm()),
         B::Jmp => ci.cj_imm() as u32,
         B::Jr | B::Jalr => rd,
-        B::Ldd if quadrant0 => itype(srd, srs1, ci.csd_offset() as i32),
-        B::Ldd => itype(rd, REG_SP, ci.cifld_offset() as i32),
-        B::Std if quadrant0 => itype(srs1, srd, ci.csd_offset() as i32),
-        B::Std => itype(REG_SP, rs2, ci.csfsd_offset() as i32),
+        B::Ldd | B::Fld if quadrant0 => itype(srd, srs1, ci.csd_offset() as i32),
+        B::Ldd | B::Fld => itype(rd, REG_SP, ci.cifld_offset() as i32),
+        B::Std | B::Fsd if quadrant0 => itype(srs1, srd, ci.csd_offset() as i32),
+        B::Std | B::Fsd => itype(REG_SP, rs2, ci.csfsd_offset() as i32),
         B::Ldw if quadrant0 => itype(srd, srs1, ci.cl_offset() as i32),
         B::Ldw => itype(rd, REG_SP, ci.ci2_offset() as i32),
         B::Stw if quadrant0 => itype(srs1, srd, ci.cl_offset() as i32),
@@ -989,8 +999,10 @@ pub(crate) fn fast_handler(i: Instr, pc: u64, begin: u64, end: u64) -> Option<(H
                 0x200 => bc::op::<Subw>,
                 0x10 => bc::op::<Mulw>,
                 0x40 => bc::op::<AddUw>,
+                0x102 => bc::op::<Sh1addUw>,
+                0x104 => bc::op::<Sh2addUw>,
                 0x44 if rt.rs2() == 0 => bc::op::<ZextH>,
-                // SH*ADD.UW, PACKW, ROLW and the rest
+                // SH3ADD.UW (no C++ bytecode), PACKW, ROLW and the rest
                 _ => return function(),
             };
             Some(if rt.rd() == 0 {
@@ -1134,9 +1146,9 @@ pub(crate) fn cpp_entry_bits(i: Instr, pc: u64, begin: u64, end: u64) -> u32 {
         },
         OP32 => match rt.jumptable_friendly_op() {
             // Rewritten to LI x0, 0 (all operand bits zero).
-            0x0 | 0x10 | 0x40 | 0x200 if rd == 0 => 0,
+            0x0 | 0x10 | 0x40 | 0x102 | 0x104 | 0x200 if rd == 0 => 0,
             0x44 if rd == 0 && rt.rs2() == 0 => 0,
-            0x0 | 0x10 | 0x40 | 0x200 => optype(rt.rd(), rt.rs1(), rt.rs2()),
+            0x0 | 0x10 | 0x40 | 0x102 | 0x104 | 0x200 => optype(rt.rd(), rt.rs1(), rt.rs2()),
             0x44 if rt.rs2() == 0 => optype(rt.rd(), rt.rs1(), rt.rs2()),
             _ => original,
         },

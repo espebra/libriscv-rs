@@ -133,6 +133,9 @@ fn short_instruction(r: &mut Rng) -> u16 {
         let funct3 = c >> 13;
         let rs2 = (c >> 2) & 31;
         let control = match quadrant {
+            // Loads and stores (C.LW, C.LD, C.FLD, C.SW, C.SD, C.FSD, Zcb)
+            // and C.ADDI4SPN
+            0 => false,
             // C.JAL/C.J, C.BEQZ, C.BNEZ (C.JAL is C.ADDIW on RV64)
             1 => matches!(funct3, 0b101..=0b111),
             // C.JR, C.JALR, C.EBREAK

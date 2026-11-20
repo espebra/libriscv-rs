@@ -353,9 +353,9 @@ handler! {
 }
 
 handler! {
-    /// The CA-format register-register ops that C++ leaves to
-    /// `RV32C_BC_FUNCTION` (C.SUB, C.AND, C.SUBW, C.ADDW, C.MUL): `rs1 = rs1 op
-    /// rs2`, then the next entry, exactly what that bytecode does.
+    /// The CA-format register-register ops `rs1 = rs1 op rs2`: C++
+    /// `RV32C_BC_SUB`, `AND`, `SUBW` and `ADDW`, and C.MUL, which C++ leaves
+    /// to `RV32C_BC_FUNCTION`.
     pub(crate) fn c_op<O: RtypeAlu>(f) {
         let fi = FasterItype(f.ins());
         let v = O::compute(reg(f.m, fi.rs1()), reg(f.m, fi.rs2()));
@@ -365,13 +365,12 @@ handler! {
 }
 
 sequential! {
-    /// C.SRAI (`RV32C_BC_FUNCTION` in C++)
+    /// C++ `RV32C_BC_SRAI`
     c_srai, 1, |m, ins| {
         let fi = FasterItype(ins);
         set(m, fi.rs1(), (reg(m, fi.rs1()) as i64).wrapping_shr(fi.unsigned_imm()) as u64);
     }
-    /// C.LUI (`RV32C_BC_FUNCTION` in C++), in the `FasterJtype` format of
-    /// `RV32I_BC_LUI`
+    /// C++ `RV32C_BC_LUI`, in the `FasterJtype` format of `RV32I_BC_LUI`
     c_lui, 1, |m, ins| {
         let fi = FasterJtype(ins);
         set(m, fi.rd(), fi.upper_imm());
@@ -466,9 +465,11 @@ loads! {
     ldd, ldd_cached, ldd_slow, STEP, 8, |m, rd, b| set(m, rd, u64::from_le_bytes(b));
     /// C++ `RV32C_BC_LDW` (C.LW, C.LWSP)
     c_ldw, c_ldw_cached, c_ldw_slow, 1, 4, |m, rd, b| set(m, rd, sext32(u32::from_le_bytes(b)));
-    /// C++ `RV32C_BC_LDD` (C.LDSP, and C.LD, which C++ leaves to
-    /// `RV32C_BC_FUNCTION` even though its rewriter supports it)
+    /// C++ `RV32C_BC_LDD` (C.LD, C.LDSP)
     c_ldd, c_ldd_cached, c_ldd_slow, 1, 8, |m, rd, b| set(m, rd, u64::from_le_bytes(b));
+    /// C++ `RV32C_BC_FLD` (C.FLD, C.FLDSP). Like the precise C.FLD handlers,
+    /// not gated on the F extension.
+    c_fld, c_fld_cached, c_fld_slow, 1, 8, |m, rd, b| m.cpu.regs.set_fp_bits(rd, u64::from_le_bytes(b));
 }
 
 #[cfg(feature = "ext-f")]
@@ -550,6 +551,8 @@ stores! {
     c_stw, c_stw_cached, c_stw_slow, 1, |m, rs2| (reg(m, rs2) as u32).to_le_bytes();
     /// C++ `RV32C_BC_STD` (C.SD, C.SDSP)
     c_std, c_std_cached, c_std_slow, 1, |m, rs2| reg(m, rs2).to_le_bytes();
+    /// C++ `RV32C_BC_FSD` (C.FSD, C.FSDSP)
+    c_fsd, c_fsd_cached, c_fsd_slow, 1, |m, rs2| m.cpu.regs.fp_bits(rs2).to_le_bytes();
 }
 
 #[cfg(feature = "ext-f")]

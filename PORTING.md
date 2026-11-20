@@ -268,12 +268,16 @@ like a bytecode, this port uses the bytecode (results, counts and faults are
 the same; the rewriter's C++-exact bits are kept for fault data, see
 `decode::cpp_entry_bits`):
 
-- C.SUB, C.AND, C.SUBW, C.ADDW, C.MUL, C.SRAI and C.LUI: new compressed
-  bytecodes (`c_op`, `c_srai`, `c_lui`), hot in compiled code.
+- C.MUL: `c_op::<Mul>`, like C.SUB.
 
 Both implementations now select C.LD (`RV32C_BC_LDD`) and SRAIW
 (`RV64I_BC_SRAIW`) bytecodes. The upstream C.LD operand swap is fixed.
 Previously, the C.LD slow path consumed about 10% of CoreMark interpreter time.
+Upstream `21d86a87` added C.SUB, C.AND, C.SUBW, C.ADDW, C.SRAI and C.LUI
+bytecodes, which this port already had (`c_op`, `c_srai`, `c_lui`), and
+C.FLD, C.FLDSP, C.FSD and C.FSDSP (`RV32C_BC_FLD`/`FSD`, here `c_fld`/`c_fsd`).
+`e5fe5d27` added SH1ADD.UW and SH2ADD.UW (`RV64I_BC_OP_SH1ADD_UW`/`SH2ADD_UW`).
+SH3ADD.UW stays on the slow path, as in C++.
 
 `rvi_fuse.cpp` is not ported: nothing in C++ calls `try_fuse`.
 
