@@ -211,8 +211,10 @@ mod tests {
             RET,
         ]);
         let mut m = vmcall_machine(&code).unwrap();
-        assert_eq!(m.vmcall_limited(1000, CODE, (37u64,)).unwrap(), 42);
-        assert_eq!(m.vmcall_limited(1000, CODE + 8, ()).unwrap(), 42);
+        // The first return to the exit function decodes its host page,
+        // which is charged 1024 instructions (a page / 4), as in C++.
+        assert_eq!(m.vmcall_limited(MAX_CYCLES, CODE, (37u64,)).unwrap(), 42);
+        assert_eq!(m.vmcall_limited(MAX_CYCLES, CODE + 8, ()).unwrap(), 42);
     }
 
     /// The Rust scripting API's readers, on arguments set up by hand in

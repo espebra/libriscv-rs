@@ -1,0 +1,169 @@
+From 89455dcc62b0b100278aa24cf7c68b9d00ed93ba Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Alf-Andr=C3=A9=20Walla?= <fwsgonzo@hotmail.com>
+Date: Sat, 14 Nov 2026 13:53:14 +0100
+Subject: [PATCH] Pin shared libraries at fixed addresses for dynamic
+ executables
+
+FileDescriptors::pinned_mappings maps a (filtered) path to a guest
+address. ld.so's first mmap of a pinned file (no address, offset 0) goes
+to that address if it is page aligned, inside the arena and free in the
+mmap area, and where mmap would have put it otherwise.
+
+rvlinux pins its allow-listed libraries for dynamic executables, each in
+its own 16 MiB slot from 1 GiB up (libc.so.6 at 0x43000000). Before, a
+library's address depended on the size of the program ld.so mapped
+first, so code saved for it (keyed by address) missed for every other
+program.
+Rebased onto master: next to guest_paths, openat records the filtered
+host path of a file in FileDescriptors::paths when there are pinned
+mappings, which mmap looks up.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ emulator/src/main.cpp                | 27 ++++++++++++++++++++-------
+ lib/libriscv/linux/syscalls_mman.cpp | 28 +++++++++++++++++++++++++++-
+ lib/libriscv/linux/system_calls.cpp  |  2 ++
+ lib/libriscv/posix/filedesc.hpp      | 16 ++++++++++++++++
+ 4 files changed, 65 insertions(+), 8 deletions(-)
+
+diff --git a/emulator/src/main.cpp b/emulator/src/main.cpp
+index 4ccd3b07..b748c38c 100644
+--- a/emulator/src/main.cpp
++++ b/emulator/src/main.cpp
+@@ -19,6 +19,19 @@ static const std::string DYNAMIC_LINKER = "/usr/riscv64-linux-gnu/lib/ld-linux-r
+ static const std::string DYNAMIC_LINKER_NAME = "ld-linux-riscv64-lp64d.so.1";
+ static constexpr size_t MAX_DYNAMIC_LINKER_SIZE = size_t(64) << 20;
+ static std::vector<uint8_t> load_host_file(const std::string& filename, size_t max_size);
++// The real path to the libraries (on the host system)
++static const std::string GUEST_REAL_LIBDIR = "/usr/riscv64-linux-gnu/lib/";
++// The libraries a dynamic executable may open (from /lib/riscv64-linux-gnu/)
++static const std::vector<std::string> GUEST_LIBS = {
++	"libdl.so.2", "libm.so.6", "libgcc_s.so.1", "libc.so.6", "libatomic.so.1",
++	"libstdc++.so.6", "libresolv.so.2", "libnss_dns.so.2", "libnss_files.so.2"
++};
++// ld.so maps each library in GUEST_LIBS in its own slot, in list order from
++// LIBRARY_PIN_BASE up, so a library has the same address in every program
++// and code saved for it (keyed by address) is found again. With an arena too
++// small for a slot, or a library larger than one, it goes where mmap puts it.
++static constexpr uint64_t LIBRARY_PIN_BASE = 1ull << 30;
++static constexpr uint64_t LIBRARY_PIN_SLOT = 16ull << 20;
+ 
+ struct Arguments {
+ 	bool verbose = false;
+@@ -433,6 +446,11 @@ static void run_program(
+ 		machine.fds().permit_filesystem = !cli_args.sandbox;
+ 		machine.fds().permit_sockets    = !cli_args.sandbox;
+ 		machine.fds().permit_special_files = true;
++		if (is_dynamic) {
++			for (size_t i = 0; i < GUEST_LIBS.size(); i++)
++				machine.fds().pinned_mappings.emplace(GUEST_REAL_LIBDIR + GUEST_LIBS[i],
++					LIBRARY_PIN_BASE + i * LIBRARY_PIN_SLOT);
++		}
+ 		if (cli_args.proxy_mode) {
+ 			if (cli_args.sandbox)
+ 				fprintf(stderr, "Warning: Proxy mode is enabled, but sandbox is also enabled\n");
+@@ -483,13 +501,8 @@ static void run_program(
+ 
+ 			// Paths that are allowed to be opened
+ 			static const std::string sandbox_libdir  = "/lib/riscv64-linux-gnu/";
+-			// The real path to the libraries (on the host system)
+-			static const std::string real_libdir = "/usr/riscv64-linux-gnu/lib/";
+-			// The dynamic linker and libraries we allow
+-			static const std::vector<std::string> libs = {
+-				"libdl.so.2", "libm.so.6", "libgcc_s.so.1", "libc.so.6", "libatomic.so.1",
+-				"libstdc++.so.6", "libresolv.so.2", "libnss_dns.so.2", "libnss_files.so.2"
+-			};
++			const std::string& real_libdir = GUEST_REAL_LIBDIR;
++			const std::vector<std::string>& libs = GUEST_LIBS;
+ 
+ 			if (path.find(sandbox_libdir) == 0) {
+ 				// Find the library name
+diff --git a/lib/libriscv/linux/syscalls_mman.cpp b/lib/libriscv/linux/syscalls_mman.cpp
+index 430d872a..dbe0d28a 100644
+--- a/lib/libriscv/linux/syscalls_mman.cpp
++++ b/lib/libriscv/linux/syscalls_mman.cpp
+@@ -67,7 +67,33 @@ static void add_mman_syscalls()
+ 				const int real_fd = machine.fds().translate(vfd);
+ 
+ 				address_type<W> dst = 0x0;
+-				if (addr_g == 0x0) {
++				// A pinned file (see FileDescriptors::pinned_mappings) goes to
++				// its fixed address, if the range fits in the arena and is free
++				const std::string* path = (addr_g == 0x0 && voff == 0)
++					? machine.fds().path_of(vfd) : nullptr;
++				auto pin = path ? machine.fds().pinned_mappings.find(*path)
++					: machine.fds().pinned_mappings.end();
++				address_type<W> pinned = 0x0;
++				if (pin != machine.fds().pinned_mappings.end()) {
++					const address_type<W> addr = pin->second;
++					if (addr % Page::size() == 0 && addr + length >= addr
++						&& addr + length <= machine.memory.memory_arena_size()
++						&& addr >= machine.memory.mmap_start())
++					{
++						if (addr >= nextfree) {
++							// Untouched territory: the skipped gap goes to the free list
++							if (addr > nextfree)
++								machine.memory.mmap_cache().insert(nextfree, addr - nextfree);
++							nextfree = addr + length;
++							pinned = addr;
++						} else if (machine.memory.mmap_cache().carve(addr, length)) {
++							pinned = addr;
++						}
++					}
++				}
++				if (pinned != 0x0) {
++					dst = pinned;
++				} else if (addr_g == 0x0) {
+ 					if (nextfree + length < nextfree)
+ 						MMAP_HAS_FAILED();
+ 					dst = nextfree;
+diff --git a/lib/libriscv/linux/system_calls.cpp b/lib/libriscv/linux/system_calls.cpp
+index 3d36445c..97b93226 100644
+--- a/lib/libriscv/linux/system_calls.cpp
++++ b/lib/libriscv/linux/system_calls.cpp
+@@ -759,6 +759,8 @@ static void syscall_openat(Machine<W>& machine)
+ 		}
+ 		const int vfd = fds.assign_file(real_fd);
+ 		fds.guest_paths.emplace(vfd, std::move(guest_path));
++		if (!fds.pinned_mappings.empty())
++			fds.paths.emplace(vfd, host_path);
+ 		machine.set_result(vfd);
+ 		SYSPRINT("SYSCALL openat(real_fd: %d) => %d\n",
+ 			real_fd, machine.template return_value<int>());
+diff --git a/lib/libriscv/posix/filedesc.hpp b/lib/libriscv/posix/filedesc.hpp
+index 732bb4c7..643f1722 100644
+--- a/lib/libriscv/posix/filedesc.hpp
++++ b/lib/libriscv/posix/filedesc.hpp
+@@ -59,6 +59,21 @@ struct FileDescriptors
+ 	std::function<bool(void*, std::string&)> filter_readlink = nullptr; /* NOTE: Can modify path */
+ 	std::function<bool(void*, const std::string&)> filter_stat = nullptr;
+ 	std::function<bool(void*, uint64_t)> filter_ioctl = nullptr;
++
++	/// @brief Files whose mmap without an address (ld.so mapping a shared
++	/// library) goes to a fixed guest address: filtered path -> address.
++	/// The address is used when it is page aligned, the whole mapping fits
++	/// in the arena and that range of the mmap area is free; otherwise the
++	/// mapping goes where it would have gone. Not a Linux feature: it keeps
++	/// libraries at the same address in every program, so code saved for
++	/// them (keyed by address) is found again.
++	std::map<std::string, uint64_t> pinned_mappings;
++	/// @brief The (filtered) paths that files were opened with, by virtual FD.
++	std::map<int, std::string> paths;
++	const std::string* path_of(int vfd) const {
++		auto it = paths.find(vfd);
++		return (it != paths.end()) ? &it->second : nullptr;
++	}
+ };
+ 
+ inline int FileDescriptors::assign(FileDescriptors::real_fd_type real_fd, bool socket)
+@@ -93,6 +108,7 @@ inline FileDescriptors::real_fd_type FileDescriptors::erase(int virtfd)
+ 		// Remove the virt FD
+ 		translation.erase(it);
+ 		guest_paths.erase(virtfd);
++		paths.erase(virtfd);
+ 		return real_fd;
+ 	}
+ 	return -EBADF;
+-- 
+2.43.0
+

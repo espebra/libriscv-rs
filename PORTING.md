@@ -4,8 +4,11 @@ Architecture, implementation status, and validation requirements for the port.
 Update status entries in the same commit as implementation changes.
 
 **Reference:** C++ libriscv at `../libriscv` (override with `$LIBRISCV_CPP`),
-tracking upstream commit `9adb3f6618308111a3b1c5e3c407fdc246ce1916` (v1.11+).
-Update this hash together with the reference hashes in
+tracking upstream commit `cafba3e8c29feb76a7fdd9a553f3b25014001d6e` (v1.11+)
+with `scripts/cpp-reference-patches/*.patch` applied (`git apply`, in order):
+the shared-library pinning (`FileDescriptors::pinned_mappings`) that
+upstream master does not have. Drop a patch once the pinned commit
+contains it. Update this hash together with the reference hashes in
 `.github/workflows/ci.yml` and `fuzzing.yml`.
 
 ## Goals
@@ -1101,16 +1104,16 @@ Paging and resource-limit differences:
   Evicted slots remain occupied to preserve `MAX_EXECUTE_SEGS` timing.
   Embedders should budget the segment limit in addition to guest memory
   and native code; reduce it for pools of small machines.
-- Runtime decoding charges `len / 4` instructions after the per-machine
-  `free_decode_bytes` allowance, default 16 MiB. Newly mapped segments and
-  stale rebuilds share the allowance; load-time and explicit
-  `init_execute_area` segments are excluded. C++ charges no runtime
-  decoding. This bounds repeated copying, hashing, and decoding of large
-  areas after FENCE.I; a measured 200-instruction case otherwise consumed
-  436 ms. Charges reaching the limit halt before the next block and do
-  not make deferred compilations hot. Dynamic glibc text is about 4 MiB,
-  within the allowance; existing differential guests retain C++ counts.
-  `Machine::penalize` saturates instead of wrapping.
+- Runtime decoding charges `max(len / 4, 1)` instructions, as C++
+  `penalize_execute_segment_decode` (upstream `f601956a`). Newly mapped
+  segments and stale rebuilds are charged; load-time and explicit
+  `init_execute_area` segments are not. This bounds repeated copying,
+  hashing, and decoding of large areas after FENCE.I; a measured
+  200-instruction case otherwise consumed 436 ms. Charges reaching the
+  limit halt before the next block and do not make deferred compilations
+  hot. `MachineOptions::free_decode_bytes` (not in C++, default 0) makes
+  that many decoded bytes free per machine. `Machine::penalize` saturates
+  instead of wrapping.
 - Slow accesses crossing a page boundary use both pages. C++ can access
   beyond an owned heap page; arena crossings use adjacent arena bytes in
   both implementations.
@@ -1320,8 +1323,12 @@ the guest raw host access, the port is deliberately stricter:
   reading fds 1/2 is `EBADF`, and the guest can have at most 1024 files
   open (`EMFILE`).
 - `ppoll` answers from the descriptor table (stdin readable, stdout/stderr
-  writable, files both, unknown `POLLNVAL`) instead of polling host fds,
-  and never waits.
+  writable, files both, unknown `POLLNVAL`, negative ignored) instead of
+  polling host fds, and never waits. As in C++ (`5135210c`), invalid
+  timeouts are `EINVAL` and revents is always written back. C++ charges
+  the host time a sandboxed `ppoll` with a nonzero timeout took
+  (`cafba3e8`), a microsecond per instruction; here nothing waits and
+  nothing is charged. `tests/ppoll.rs`.
 - `getrusage` is always the deterministic answer (`ru_maxrss` from the
   pages in use, as C++); time is `SystemTime` and monotonic clocks count
   from machine creation (C++: host uptime).
@@ -1412,8 +1419,7 @@ The port preserves these C++ behaviors unless an explicit difference is listed:
   byte at a time with two page lookups per byte as C++ does (same result
   and faults): one native memcmp of up to 512 MiB runs before its penalty
   is charged, so the instruction limit cannot bound it.
-- Not reproduced (C++ bugs): `ppoll` with a NULL timeout faults in C++;
-  killing a suspended thread (`tgkill`) leaves a dangling pointer in C++'s
+- Not reproduced (C++ bugs): killing a suspended thread (`tgkill`) leaves a dangling pointer in C++'s
   scheduler lists, here the thread is removed from them; a signal number
   above 64 throws `std::out_of_range`, here it is `ILLEGAL_OPERATION`.
 - Not reproduced (C++ bug, as far as the port's reading of `threads.hpp`

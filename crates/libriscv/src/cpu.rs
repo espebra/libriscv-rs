@@ -227,12 +227,17 @@ impl Machine {
             self.cpu.stale_restart_pc = u64::MAX;
         }
         // Charge the decoded bytes past the free allowance (new segments
-        // and rebuilds alike): a quarter instruction per byte, as
-        // `flush_execute_segments` charges.
+        // and rebuilds alike): a quarter instruction per byte, at least one
+        // (C++ `Memory::penalize_execute_segment_decode`).
         let bytes = code.len() as u64;
         let free = bytes.min(self.cpu.free_decode_bytes);
         self.cpu.free_decode_bytes -= free;
-        Ok((pc, (bytes - free) / 4))
+        let charge = if free == bytes {
+            0
+        } else {
+            ((bytes - free) / 4).max(1)
+        };
+        Ok((pc, charge))
     }
 
     /// Handle a jump to a block-start STOP in another usable segment without

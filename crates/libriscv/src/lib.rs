@@ -135,10 +135,9 @@ pub use syscalls::fds::{FileDescriptors, IoctlFilter, OpenFile, PathFilter, Stat
 pub use threads::{MAIN_THREAD_TID, MultiThreading, Thread};
 pub use vmcall::{ArgRegs, CallTarget, OnStack, VmCallArg, VmCallArgs};
 
-/// Default runtime decoding allowance: 16 MiB.
-/// See [`MachineOptions::free_decode_bytes`]. Dynamic glibc programs typically
-/// map about 4 MiB of text across `ld.so`, `libc`, `libstdc++`, `libm`, and `libgcc_s`.
-pub const FREE_DECODE_BYTES: u64 = 16 << 20;
+/// Default runtime decoding allowance: none, as in C++, which charges every
+/// runtime decode. See [`MachineOptions::free_decode_bytes`].
+pub const FREE_DECODE_BYTES: u64 = 0;
 
 /// The default [`MachineOptions::jit_background_slice`].
 pub const JIT_BACKGROUND_SLICE: u64 = 1 << 20;

@@ -52,13 +52,14 @@ pub struct MachineOptions {
     /// for short programs.
     pub jit_background: bool,
     /// Bytes of executable code that may be decoded at runtime without an
-    /// instruction charge. Includes newly mapped code and stale-segment rebuilds
-    /// after FENCE.I. Each decode copies, hashes, and decodes the surrounding
-    /// executable area. Beyond this allowance, decoding costs `len / 4`
-    /// instructions, bounding repeated decodes by the instruction limit.
+    /// instruction charge (default 0). Includes newly mapped code and
+    /// stale-segment rebuilds after FENCE.I. Each decode copies, hashes, and
+    /// decodes the surrounding executable area. Beyond this allowance, a
+    /// decode costs `max(len / 4, 1)` instructions, as in C++, bounding
+    /// repeated decodes by the instruction limit.
     ///
-    /// C++ does not charge for runtime decoding; instruction counts match only
-    /// within this allowance. Load-time segments and `init_execute_area` are excluded.
+    /// C++ has no allowance; instruction counts match it only with the
+    /// default. Load-time segments and `init_execute_area` are not charged.
     pub free_decode_bytes: u64,
     /// Instructions between checks for completed background compilations,
     /// clamped to at least 1. Smaller slices reduce the delay before native execution.

@@ -7,9 +7,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # C++ libriscv commit used as the differential-testing oracle.
-  # Keep in sync with PORTING.md.
-  LIBRISCV_CPP_REF: 9adb3f6618308111a3b1c5e3c407fdc246ce1916
+  # C++ libriscv commit used as the differential-testing oracle, with
+  # scripts/cpp-reference-patches/*.patch applied. Keep in sync with
+  # PORTING.md.
+  LIBRISCV_CPP_REF: cafba3e8c29feb76a7fdd9a553f3b25014001d6e
   # eembc/coremark commit for the CoreMark difftest and benchmark.
   COREMARK_REF: eefc986ebd3452d6adde22eafaff3e5c859f29e4
   # The pinned nightly for the opt-in `nightly-dispatch` and `aot` features;
@@ -64,13 +65,16 @@ jobs:
         uses: actions/cache@v4
         with:
           path: libriscv-cpp/emulator/.build/rvlinux
-          key: rvlinux-${{ runner.arch }}-${{ env.LIBRISCV_CPP_REF }}
+          key: rvlinux-${{ runner.arch }}-${{ env.LIBRISCV_CPP_REF }}-${{ hashFiles('scripts/cpp-reference-patches/*.patch') }}
 
       - name: Fetch C++ libriscv
         run: |
           git init libriscv-cpp
           git -C libriscv-cpp fetch --depth 1 https://github.com/libriscv/libriscv.git "$LIBRISCV_CPP_REF"
           git -C libriscv-cpp checkout FETCH_HEAD
+          for patch in scripts/cpp-reference-patches/*.patch; do
+            git -C libriscv-cpp apply "$PWD/$patch"
+          done
 
       - name: Fetch CoreMark
         run: |

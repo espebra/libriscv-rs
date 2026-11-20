@@ -457,17 +457,16 @@ pub(crate) mod tests {
     /// iteration rebuilds the page from changed bytes. The rebuilds are
     /// interpreted (each would take a compilation of milliseconds) until
     /// one stays valid for `jit_background_slice` instructions, which none
-    /// does here. (Nor do the instructions charged for the rebuilds past
-    /// `free_decode_bytes` make them hot.)
+    /// does here. (Nor do the instructions charged for the rebuilds make
+    /// them hot.)
     #[test]
     fn code_rewritten_in_a_loop_is_not_compiled_each_time() {
         const J_BACK_12: u32 = 0xFF5F_F06F; // jal x0, -12
-        // Past the 4096 free rebuilds (`free_decode_bytes`), each is charged
-        // 1024 instructions (a page).
+        // Each rebuild is charged 1024 instructions (a page).
         const FUEL: u64 = 2_000_000;
         let page = [SW_T1_PAGE, addi(6, 6, 1), FENCE_I, J_BACK_12];
         let (expected, _) = run_page(&page, false, false, 1 << 20, FUEL);
-        assert!(expected.1[6] > 5000, "{expected:?}");
+        assert!(expected.1[6] > 1500, "{expected:?}");
         for background in [false, true] {
             let (got, compiles) = run_page(&page, true, background, 1 << 20, FUEL);
             assert_eq!(got, expected, "background {background}");
@@ -552,7 +551,8 @@ pub(crate) mod tests {
     /// made from executable pages: the main segment is never stale). The
     /// rebuilds reuse the JIT code instead of compiling the unchanged page
     /// again (each compile takes milliseconds), with the results of the
-    /// interpreter.
+    /// interpreter. (Decoding is free here, so that the loop iterates
+    /// many times within a small instruction limit.)
     #[test]
     fn fence_i_loops_reuse_the_compiled_code() {
         const FENCE_I: u32 = 0x100F;
@@ -569,6 +569,7 @@ pub(crate) mod tests {
                     memory_max: 1 << 20,
                     jit,
                     jit_background: false,
+                    free_decode_bytes: u64::MAX,
                     ..Default::default()
                 },
             )

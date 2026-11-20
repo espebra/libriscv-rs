@@ -231,7 +231,13 @@ fn run_exactly_x_instructions() {
         0xffdf_f06f,    // j -4
     ];
     let code: Vec<u8> = program.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let mut machine = empty_machine(MachineOptions::default());
+    // C++ steps with a DebugMachine, which decodes the execute segment
+    // without a charge; step_one reads from the page instead, so the
+    // simulation below decodes it, and would be charged for it.
+    let mut machine = empty_machine(MachineOptions {
+        free_decode_bytes: u64::MAX,
+        ..Default::default()
+    });
     machine.copy_to_guest(DST, &code).unwrap();
     machine
         .memory

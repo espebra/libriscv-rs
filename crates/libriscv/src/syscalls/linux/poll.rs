@@ -5,7 +5,9 @@
 //! never block, so readiness is answered without asking the host:
 //! descriptors that are not open get `POLLNVAL`, the others are ready for
 //! what was asked (stdin only for input, stdout and stderr only for
-//! output). Nothing ever waits, so the timeout is not used.
+//! output). Nothing ever waits, so the timeout is only validated. C++ charges
+//! the host time a sandboxed `ppoll` took (a microsecond per instruction);
+//! here that is none.
 
 use crate::error::{ExceptionKind, MachineError, Result};
 use crate::machine::Machine;
@@ -16,17 +18,24 @@ const POLLIN: i16 = 0x1;
 const POLLOUT: i16 = 0x4;
 const POLLNVAL: i16 = 0x20;
 const MAX_POLL_FDS: u64 = 128;
+const NSEC_PER_SEC: i64 = 1_000_000_000;
 
 /// ppoll(fds, nfds, timeout, sigmask)
 pub(super) fn syscall_ppoll(m: &mut Machine) -> Result<()> {
     let g_fds = m.sysarg(0);
     let nfds = u64::from(m.sysarg(1) as u32);
     let g_ts = m.sysarg(2);
-    // C++ always reads the timeout, and faults on a NULL one (an infinite
-    // wait). That is a C++ bug; here NULL is accepted.
+    // A NULL timeout is an infinite wait.
     if g_ts != 0 {
         let mut ts = [0u8; 16];
         m.copy_from_guest(&mut ts, g_ts)?;
+        let (sec, nsec) = ts.split_at(8);
+        let sec = i64::from_le_bytes(sec.try_into().unwrap_or_default());
+        let nsec = i64::from_le_bytes(nsec.try_into().unwrap_or_default());
+        if sec < 0 || !(0..NSEC_PER_SEC).contains(&nsec) {
+            m.set_result(neg(EINVAL));
+            return Ok(());
+        }
     }
     if nfds > MAX_POLL_FDS {
         m.set_result(neg(EINVAL));
@@ -44,16 +53,16 @@ pub(super) fn syscall_ppoll(m: &mut Machine) -> Result<()> {
         let [f0, f1, f2, f3, e0, e1, _, _] = *pfd;
         let fd = i32::from_le_bytes([f0, f1, f2, f3]);
         let events = i16::from_le_bytes([e0, e1]);
-        let possible = match fds.translate(fd) {
-            None => POLLNVAL,
-            Some(Target::Stdio(0)) => POLLIN,
-            Some(Target::Stdio(_)) => POLLOUT,
-            Some(Target::File(_)) => POLLIN | POLLOUT,
-        };
-        let revents = if possible == POLLNVAL {
-            POLLNVAL
+        // Negative descriptors are ignored, as on Linux.
+        let revents = if fd < 0 {
+            0
         } else {
-            possible & events
+            match fds.translate(fd) {
+                None => POLLNVAL,
+                Some(Target::Stdio(0)) => POLLIN & events,
+                Some(Target::Stdio(_)) => POLLOUT & events,
+                Some(Target::File(_)) => (POLLIN | POLLOUT) & events,
+            }
         };
         let [r0, r1] = revents.to_le_bytes();
         *pfd = [f0, f1, f2, f3, e0, e1, r0, r1];
@@ -61,9 +70,8 @@ pub(super) fn syscall_ppoll(m: &mut Machine) -> Result<()> {
             ready += 1;
         }
     }
-    if ready > 0 {
-        m.copy_to_guest(g_fds, &raw)?;
-    }
+    // Linux always writes back revents, also when nothing is ready.
+    m.copy_to_guest(g_fds, &raw)?;
     m.set_result(ready);
     Ok(())
 }

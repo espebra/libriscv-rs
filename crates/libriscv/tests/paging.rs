@@ -79,8 +79,9 @@ fn basic_page_protections() {
 
     m.cpu.jump(V).unwrap();
     assert_eq!(m.cpu.pc(), V);
-    // The data at V is all zeroes, an illegal instruction.
-    assert_eq!(kind(m.simulate(1)), ExceptionKind::IllegalOpcode);
+    // The data at V is all zeroes, an illegal instruction. (Decoding the
+    // execute segment is charged first.)
+    assert_eq!(kind(m.simulate(25_000)), ExceptionKind::IllegalOpcode);
 
     // V is not readable anymore
     let fault = ExceptionKind::ProtectionFault;
@@ -217,10 +218,11 @@ fn page_attributes_are_bounded_by_memory_max() {
 const RWX: PageAttributes = PageAttributes::rwx(true, true, true);
 
 /// Run the (zeroed, so illegal) instruction at `pc`: the machine first
-/// creates an execute segment from the executable pages around it.
+/// creates an execute segment from the executable pages around it (and is
+/// charged a quarter instruction per byte for it).
 fn execute_at(m: &mut Machine, pc: u64) -> libriscv::Result<()> {
     m.cpu.jump(pc)?;
-    m.simulate(1)
+    m.simulate(1 << 40)
 }
 
 /// A machine whose main execute segment is one page at `V`, as an ELF's
@@ -933,10 +935,10 @@ fn rebuild_loop(area: u64, calls: i32, free_decode_bytes: u64, limit: u64) -> (M
 }
 
 /// Rebuilding a stale execute segment copies and decodes the whole
-/// executable area. Past the free allowance (16 MiB by default; not C++)
-/// it is charged per byte, so a FENCE.I loop over a large area runs into a
-/// small instruction limit after a few rebuilds instead of decoding
-/// megabytes per guest instruction (security review finding 2).
+/// executable area. It is charged per byte (as C++ charges every runtime
+/// decode), so a FENCE.I loop over a large area runs into a small
+/// instruction limit instead of decoding megabytes per guest instruction
+/// (security review finding 2).
 #[test]
 fn stale_segment_rebuilds_count_towards_the_instruction_limit() {
     const AREA: u64 = 4 << 20;
@@ -944,16 +946,15 @@ fn stale_segment_rebuilds_count_towards_the_instruction_limit() {
     assert_eq!(free, libriscv::FREE_DECODE_BYTES);
     let (m, timed_out, calls) = rebuild_loop(AREA, 1000, free, 200);
     assert!(timed_out);
-    // The first call decodes twice, each further one once: the allowance
-    // is used up during the third call, the fourth is charged far beyond
-    // the limit.
+    // There is no allowance by default: the first decode is charged far
+    // beyond the limit.
     assert!(calls <= free / AREA, "{calls} calls");
     assert!(m.instruction_counter() >= AREA / 4);
 }
 
-/// The exact charge: the allowance is free (counts stay those of C++),
-/// every further byte costs a quarter instruction, as
-/// `flush_execute_segments` charges.
+/// The exact charge: an allowance (none by default, as in C++) is free,
+/// every further byte costs a quarter instruction, as C++
+/// `penalize_execute_segment_decode` charges.
 #[test]
 fn segment_decodes_past_the_allowance_cost_a_quarter_instruction_per_byte() {
     const AREA: u64 = 64 << 10;
