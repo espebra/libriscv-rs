@@ -2,7 +2,7 @@
 //! (`INSTRUCTION`, `MUSTTAIL`, `preserve_none`, `NEXT_BLOCK` and friends).
 //!
 //! This is the only module whose code differs between the two dispatch
-//! modes. Handlers in `dispatch.rs` and `bytecode.rs` are written once,
+//! modes. Handlers in `dispatch.rs`, `bytecode.rs` and `fused.rs` are written once,
 //! against a [`Frame`] and the transfer macros here, and compile to either:
 //!
 //! - **`nightly-dispatch`** (opt-in, pinned nightly): guaranteed tail calls
@@ -417,6 +417,18 @@ macro_rules! execute {
     }};
 }
 
+/// C++ `NEXT_INSTR_TO(bc)`: continue at entry `$i` of the same block in
+/// handler `$h`, known statically, instead of the entry's own. A fused
+/// pair's handler continues in its second half this way (a direct jump),
+/// while that entry keeps its own handler for when it is jumped to.
+macro_rules! execute_to {
+    ($f:ident, $h:expr, $i:expr) => {{
+        let i: usize = $i;
+        let e = $crate::dispatch::abi::entry!($f, i, $f.exec.address_of(i));
+        $crate::dispatch::abi::call!($f, $h, i, e.instr, $f.pc)
+    }};
+}
+
 /// C++ `BEGIN_BLOCK` + `EXECUTE_CURRENT`: enter the block at entry `$i`,
 /// address `$pc`.
 macro_rules! begin_block {
@@ -481,6 +493,6 @@ macro_rules! overflow_checked_jump {
 }
 
 pub(crate) use {
-    begin_block, call, cold_handler, entry, execute, exit, handler, next_block,
+    begin_block, call, cold_handler, entry, execute, execute_to, exit, handler, next_block,
     overflow_checked_jump, resume, tail, unchecked_jump,
 };

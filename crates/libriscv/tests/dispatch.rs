@@ -301,6 +301,35 @@ fn a_breakpoint_after_a_4_byte_instruction_ends_its_block() {
     assert_eq!(m.cpu.reg(REG_ARG0), 2 * 1000);
 }
 
+/// Port of C++ "A breakpoint on the second half of a fused pair": the
+/// decoder fuses ADDI + ADDI, and the first entry then runs the second
+/// instruction too, without dispatching it. A breakpoint installed on the
+/// second instruction must unfuse the pair, or it is never hit.
+#[test]
+fn a_breakpoint_on_the_second_half_of_a_fused_pair() {
+    let program: Vec<u8> = [NOP, addi_a0(1), addi_a0(2), addi_a0(4), JSELF]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    let options = MachineOptions {
+        memory_max: 1 << 20,
+        ebreak_locations: vec![libriscv::EbreakLocation::Address(V + 8)],
+        ..Default::default()
+    };
+    let mut m = Machine::new([].into(), options).unwrap();
+    m.init_execute_area(&program, V).unwrap();
+    m.install_syscall_handler(SYSCALL_EBREAK_NR, |m| {
+        m.stop();
+        Ok(())
+    });
+    m.cpu.jump(V).unwrap();
+    m.simulate(100).unwrap();
+    // Stopped in the breakpoint: only the instructions before it have run.
+    assert_eq!(m.cpu.pc(), V + 8);
+    assert_eq!(m.cpu.reg(REG_ARG0), 1);
+    assert_eq!(m.instruction_counter(), 3);
+}
+
 /// Host stack depths seen by the system call handler [`record_depth`].
 #[derive(Default)]
 struct Depth {

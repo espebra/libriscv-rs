@@ -284,6 +284,43 @@ SH3ADD.UW stays on the slow path, as in C++.
 
 `rvi_fuse.cpp` is not ported: nothing in C++ calls `try_fuse`.
 
+### Fused pairs
+
+Upstream `a94a8c14` fused 128 common pairs of adjacent instructions
+(`fused_pairs.inc`), and `fused.rs` ports them, the pair list unchanged. After
+a segment is decoded and its blocks measured, an entry whose next
+instruction is in the same block, and whose bytecode forms a pair with the
+next one, gets the pair's handler, `fused::<(A, B)>`. That handler runs A's
+body and continues in B's handler with a direct jump (`execute_to!`, C++
+`NEXT_INSTR_TO`) instead of the indirect one through B's entry. B's entry is
+unchanged, as it may be a jump target. Counts are added on block entry, so
+they do not change.
+
+- The bodies are shared through marker types in `bytecode.rs` (C++
+  `bytecode_bodies.hpp`): `First::run` is a handler's body without its
+  transfer, and `Bytecode::HANDLER` its handler. The `sequential!`,
+  `loads!` and `stores!` macros expand each body into both. A load or store
+  outside the arena continues in its own `*_cached` handler, which then
+  dispatches B through its entry as usual.
+- Bytecodes are not identified by handler address: a generic handler
+  (`op::<Add>`) can be instantiated more than once, and LLVM merges
+  identical ones (`fast_jal`, `c_jmp`). `decode::fast_handler` tags the
+  entries it picks a fusable bytecode for with a `fused::Bc`, and fusing
+  goes by those tags. Entries the block measurement forces to end a block
+  (`force_invalid`, `force_funcblock`) lose their tags.
+- C++ `unfuse_entry_before`: `create_block_ending_entry_at` (breakpoints, the
+  libc fast path) first decodes the entry before the patched one again,
+  which gives it its own handler back. These patches are only applied
+  while a segment is created, before native code is installed. Installing
+  JIT or AOT entry points does not unfuse, unlike C++'s livepatch `claim`:
+  a pair before a native entry runs B in the interpreter, with the same
+  result, and enters native code at the next block.
+
+CoreMark, 3000 iterations, `rvlinux -n`, Ryzen 9 7950X, stable dispatch,
+median of five interleaved runs (`perf stat`): rv64imafdc 6.80G to 5.99G
+cycles (-11.9%), rv64imafdc_zba_zbb_zbs 6.07G to 5.58G (-8.2%). Host
+instructions barely change (-0.3%, -0.1%); the direct jumps predict better.
+
 `tests/bytecodes.rs` runs random programs through the bytecodes and the
 precise interpreter and compares registers, memory and faults.
 
@@ -1629,6 +1666,7 @@ and JIT. `rustguestfuzzer` exercises collection operations on supplied bytes.
 - [x] Stable-Rust dispatch by default, `nightly-dispatch` opt-in, one set of handlers (`dispatch/abi.rs`; `dispatch_slice`, `rvlinux --dispatch-slice`); see "Dispatch"
 - [x] Stable toolchain pin (`rust-toolchain.toml`: 1.98), and CI for both dispatch modes; the pinned nightly only for `nightly-dispatch`, AOT and fuzzing (`fuzz/rust-toolchain.toml`, CI `NIGHTLY`)
 - [x] Instruction fusion (`rvi_fuse.cpp`): nothing to port, C++ never calls `try_fuse`
+- [x] Fused bytecode pairs (`fused_bytecodes.hpp`, `fused_pairs.inc`, `fuse_bytecodes`, `bytecode_bodies.hpp`); see "Fused pairs"
 - [x] Shared execute segments across machines and forks, background JIT results reaching every holder (`decoder_cache.cpp` `SharedExecuteSegments`, `util/crc32.hpp`); see "Shared execute segments"
 - [x] Shared read-only data (`shared_rodata.cpp`), copy-on-write, with the `jit` feature; see "Shared read-only data"
 - [ ] Bounds-check elimination audit (`cargo asm`)
@@ -1703,6 +1741,7 @@ phase starts; names below are the intended targets.
 | `decoder_cache.*`, `decoded_exec_segment.hpp` | `decoder_cache.rs` | 1, 4 | ✅ incl. shared segments, EBREAK locations and the libc fast path patches |
 | `decode_bytecodes.cpp`, `threaded_rewriter.cpp` | `decode.rs` (`fast_handler`, `cpp_entry_bits`) | 1–4 | ✅ RV64IMAFDC + Zcb + B |
 | `bytecode_impl.cpp`, `threaded_bytecodes.hpp` | `bytecode.rs` (slow-path and system bytecodes: `dispatch.rs`) | 4 | ✅ |
+| `fused_bytecodes.hpp`, `fused_pairs.inc`, `bytecode_bodies.hpp` | `fused.rs`, `bytecode.rs` (`Bytecode`, `First`), `decoder_cache.rs` (`fuse_bytecodes`, `unfuse_entry_before`) | 4 | ✅ all 128 pairs |
 | `bytecode_dispatch.cpp`, `threaded_bytecode_array.hpp` | — | — | superseded by tail-call dispatch |
 | `shared_rodata.*` | `memory/shared.rs`, `libriscv-jit-rt/src/arena.rs` | 4 | ✅ copy-on-write image, also with paging and N-bit arenas |
 | `machine_defaults.cpp`, `posix/minimal.cpp` | `machine.rs`, `syscalls/minimal.rs` | 1–2 | ✅ |

@@ -36,9 +36,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use crate::decode;
-use crate::dispatch::{self, Handler};
+use crate::dispatch::{self, Handler, STEP};
 use crate::dyncall::Dyncall;
 use crate::error::{MachineError, Result};
+use crate::fused::{self, Bc};
 use crate::instruction::Instr;
 
 /// Mirrors C++ `compressed_enabled`, which decides the decoder layout.
@@ -525,9 +526,10 @@ impl DecodedSegment {
             #[cfg(feature = "jit")]
             deferred_claimed: AtomicBool::new(false),
         };
-        let (cache, dst) = seg.decode_execute_range(vaddr, end, n_entries);
+        let (cache, mut tags, dst) = seg.decode_execute_range(vaddr, end, n_entries);
         seg.cache = cache.into_boxed_slice();
-        seg.realize_fastsim(vaddr, dst)?;
+        seg.realize_fastsim(vaddr, dst, &mut tags)?;
+        seg.fuse_bytecodes(&tags);
         Ok(seg)
     }
 
@@ -571,6 +573,9 @@ impl DecodedSegment {
                 addr,
             ));
         }
+        // The entry at `addr` changes: a fused pair before it would still
+        // run the old instruction.
+        self.unfuse_entry_before(addr);
         let begin = self.index(self.begin);
         let last = self.index(addr);
         // 1. Look back to find the beginning of the block: every instruction
@@ -673,40 +678,46 @@ impl DecodedSegment {
 
     /// Port of `Memory::decode_execute_range` for the whole segment
     /// (`from` is its beginning): its `n_entries` decoder entries, built in
-    /// order, those after the last instruction invalid. Returns them and
-    /// the address after the last decoded instruction.
+    /// order, those after the last instruction invalid. Returns them, the
+    /// fusable bytecode of each (`fused.rs`), and the address after the
+    /// last decoded instruction.
     fn decode_execute_range(
         &self,
         from: u64,
         to: u64,
         n_entries: usize,
-    ) -> (Vec<DecoderEntry>, u64) {
+    ) -> (Vec<DecoderEntry>, Vec<Option<Bc>>, u64) {
         debug_assert_eq!(from, self.begin);
         let (begin, end) = (self.begin, self.end);
         let mut cache = Vec::with_capacity(n_entries);
+        let mut tags = Vec::with_capacity(n_entries);
         // With compressed instructions, entries that land inside a 4-byte
         // instruction must stay invalid, or they would get wrong block data.
         let mut was_full_instruction = true;
         let mut dst = from;
         while dst < to {
             let instruction = self.read_instruction(dst, end);
-            let new_entry = if !COMPRESSED || was_full_instruction {
+            let (new_entry, tag) = if !COMPRESSED || was_full_instruction {
                 match decode::fast_handler(instruction, dst, begin, end) {
-                    Some((handler, instr)) => DecoderEntry {
-                        handler,
-                        instr,
-                        idxend: 0,
-                        icount: 0,
-                        invalid: false,
-                    },
-                    None => DecoderEntry::invalid(instruction.0),
+                    Some((handler, instr, tag)) => (
+                        DecoderEntry {
+                            handler,
+                            instr,
+                            idxend: 0,
+                            icount: 0,
+                            invalid: false,
+                        },
+                        tag,
+                    ),
+                    None => (DecoderEntry::invalid(instruction.0), None),
                 }
             } else {
                 // Must be invalid, even if technically possible to jump to.
                 // The instruction bits stay zero (C++ never writes them).
-                DecoderEntry::invalid(0)
+                (DecoderEntry::invalid(0), None)
             };
             cache.push(new_entry);
+            tags.push(tag);
             if COMPRESSED {
                 dst += 2;
                 was_full_instruction = if was_full_instruction {
@@ -721,7 +732,67 @@ impl DecodedSegment {
         // The entry after the last instruction is invalid: jumps and
         // branches do not re-check PC after not branching.
         cache.resize(n_entries.max(cache.len()), DecoderEntry::invalid(0));
-        (cache, dst)
+        tags.resize(cache.len(), None);
+        (cache, tags, dst)
+    }
+
+    /// Port of `fuse_bytecodes`: give each entry whose next instruction is
+    /// in the same block, and whose bytecode and the next one form a pair,
+    /// the handler of the pair. `tags` are the entries' fusable bytecodes.
+    /// Runs last: an entry that changes afterwards must unfuse the one
+    /// before it ([`Self::unfuse_entry_before`]).
+    fn fuse_bytecodes(&mut self, tags: &[Option<Bc>]) {
+        for (i, &tag) in tags.iter().enumerate() {
+            let Some(first) = tag else { continue };
+            let Some(entry) = self.cache.get(i) else {
+                continue;
+            };
+            if entry.instruction_count() <= 1 {
+                continue; // The last instruction in its block
+            }
+            let len = if COMPRESSED && self.read_u16(self.address_of(i)) & 3 != 3 {
+                1
+            } else {
+                STEP
+            };
+            if let Some(Some(second)) = tags.get(i + len)
+                && let Some(handler) = fused::fused_handler(first, *second)
+                && let Some(entry) = self.cache.get_mut(i)
+            {
+                entry.handler = handler;
+            }
+        }
+    }
+
+    /// Port of `unfuse_entry_before`, called before the entry at `addr`
+    /// changes: the entry before it (2 or 4 bytes before, in the same
+    /// block) gets its own handler back, decoded again. Only while the
+    /// segment is being built: an entry in the middle of a block is then
+    /// always the decoder's own (patches end their blocks).
+    fn unfuse_entry_before(&mut self, addr: u64) {
+        debug_assert!(self.native.is_none(), "unfusing with native code installed");
+        let (begin, end) = (self.begin, self.end);
+        for len in [2, 4] {
+            if (len == 2 && !COMPRESSED) || addr < begin.saturating_add(len) {
+                continue;
+            }
+            let pc = addr - len;
+            let i = self.index(pc);
+            let Some(e) = self.cache.get(i) else { continue };
+            if e.invalid || e.instruction_count() <= 1 {
+                continue;
+            }
+            let instruction = self.read_instruction(pc, end);
+            if instruction.length() as u64 != len {
+                continue;
+            }
+            if let Some((handler, instr, _)) = decode::fast_handler(instruction, pc, begin, end)
+                && let Some(e) = self.cache.get_mut(i)
+                && e.instr == instr
+            {
+                e.handler = handler;
+            }
+        }
     }
 
     /// Turns an entry into a block-ending invalid instruction. C++ sets the
@@ -729,7 +800,10 @@ impl DecodedSegment {
     /// bits, which become the fault's data. Those are C++'s bits exactly,
     /// which differ from this entry's where this port picks a different
     /// bytecode than C++ (see `decode::cpp_entry_bits`).
-    fn force_invalid(&mut self, i: usize) {
+    fn force_invalid(&mut self, i: usize, tags: &mut [Option<Bc>]) {
+        if let Some(tag) = tags.get_mut(i) {
+            *tag = None;
+        }
         let (pc, begin, end) = (self.address_of(i), self.begin, self.end);
         let original = self.read_instruction(pc, end);
         if let Some(e) = self.cache.get_mut(i) {
@@ -744,7 +818,10 @@ impl DecodedSegment {
 
     /// Turns an entry into a block-ending `FUNCBLOCK` entry that executes
     /// `instr` through its precise handler (C++ `RV32I_BC_FUNCBLOCK`).
-    fn force_funcblock(&mut self, i: usize, instr: Instr) {
+    fn force_funcblock(&mut self, i: usize, instr: Instr, tags: &mut [Option<Bc>]) {
+        if let Some(tag) = tags.get_mut(i) {
+            *tag = None;
+        }
         if let Some(e) = self.cache.get_mut(i) {
             // The dyncall bytecode ends a block like FUNCBLOCK does, and
             // publishes the counter to the handler, which FUNCBLOCK does not.
@@ -759,17 +836,28 @@ impl DecodedSegment {
     }
 
     /// Port of `realize_fastsim`: measures blocks and fills in `idxend` and
-    /// `icount` for every entry.
-    fn realize_fastsim(&mut self, base_pc: u64, last_pc: u64) -> Result<()> {
+    /// `icount` for every entry. Entries it forces to end their block lose
+    /// their fusable bytecode in `tags`.
+    fn realize_fastsim(
+        &mut self,
+        base_pc: u64,
+        last_pc: u64,
+        tags: &mut [Option<Bc>],
+    ) -> Result<()> {
         if COMPRESSED {
-            self.realize_compressed(base_pc, last_pc)
+            self.realize_compressed(base_pc, last_pc, tags)
         } else {
-            self.realize_uncompressed(base_pc, last_pc);
+            self.realize_uncompressed(base_pc, last_pc, tags);
             Ok(())
         }
     }
 
-    fn realize_compressed(&mut self, base_pc: u64, last_pc: u64) -> Result<()> {
+    fn realize_compressed(
+        &mut self,
+        base_pc: u64,
+        last_pc: u64,
+        tags: &mut [Option<Bc>],
+    ) -> Result<()> {
         if base_pc >= last_pc {
             return Err(MachineError::invalid_program(
                 "The execute segment has an overflow",
@@ -803,7 +891,7 @@ impl DecodedSegment {
                 ))?;
                 // An instruction crossing the segment end must force an invalid block end.
                 if pc > last_pc {
-                    self.force_invalid(entry);
+                    self.force_invalid(entry, tags);
                     break;
                 }
                 // All opcodes that can modify PC end the block.
@@ -820,7 +908,7 @@ impl DecodedSegment {
                 // The last instruction should have ended the block. Since it
                 // did not, force-end the block here.
                 if pc >= last_pc {
-                    self.force_invalid(entry);
+                    self.force_invalid(entry, tags);
                     break;
                 }
                 iptr += length;
@@ -828,7 +916,7 @@ impl DecodedSegment {
                 // FUNCBLOCK entry that re-executes the original instruction.
                 if (iptr - block_pc) >> 1 >= 255 {
                     let instruction = self.read_instruction(pc - length, last_pc);
-                    self.force_funcblock(entry, instruction);
+                    self.force_funcblock(entry, instruction, tags);
                     break;
                 }
                 entry += count as usize;
@@ -870,7 +958,7 @@ impl DecodedSegment {
         Ok(())
     }
 
-    fn realize_uncompressed(&mut self, base_pc: u64, last_pc: u64) {
+    fn realize_uncompressed(&mut self, base_pc: u64, last_pc: u64, tags: &mut [Option<Bc>]) {
         // Count the distance to the next branching instruction backwards.
         let mut idxend: u32 = 0;
         let mut pc = last_pc.wrapping_sub(4);
@@ -886,7 +974,7 @@ impl DecodedSegment {
             let i = self.index(pc);
             if idxend == 65535 {
                 // A long sequence of instructions: end the block here.
-                self.force_funcblock(i, instruction);
+                self.force_funcblock(i, instruction, tags);
                 idxend = 0;
             }
             if let Some(e) = self.cache.get_mut(i) {

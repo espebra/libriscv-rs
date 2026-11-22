@@ -80,6 +80,7 @@ mod dispatch;
 mod dyncall;
 mod elf;
 mod error;
+mod fused;
 pub mod guest;
 pub mod instruction;
 mod isa;

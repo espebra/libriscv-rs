@@ -15,16 +15,58 @@
 //! arena, cannot fail. Anything else (the page table, faults) is a separate
 //! cold handler that the fast one tail-calls, so the fast handlers carry
 //! no `Result` and need no stack frame.
+//!
+//! The bytecodes of fused pairs (`fused.rs`) also exist as marker types
+//! ([`Bytecode`], [`First`]), like C++ `bytecode_bodies.hpp`: a fused handler
+//! runs the body of the first and continues directly in the handler of the
+//! second. The macros below expand each body into both the handler and the
+//! marker, so it is still written once.
+
+use std::marker::PhantomData;
 
 use crate::decoder_cache::COMPRESSED;
 use crate::dispatch::abi::{
-    cold_handler, execute, handler, next_block, overflow_checked_jump, tail,
+    Frame, cold_handler, execute, handler, next_block, overflow_checked_jump, tail,
 };
-use crate::dispatch::{STEP, fault};
+use crate::dispatch::{Handler, STEP, fault};
 use crate::error::{ExceptionKind, MachineError};
-use crate::isa::rvi::{RtypeAlu, sext32};
+use crate::isa::rvi::{Add, Addw, Mul, RtypeAlu, Sh1addUw, Sub, sext32};
 use crate::machine::Machine;
 use crate::registers::REG_RA;
+
+/// A bytecode handler as a type: the second half of a fused pair, which the
+/// fused handler continues in directly (C++ `NEXT_INSTR_TO(B)`).
+pub(crate) trait Bytecode {
+    const HANDLER: Handler;
+}
+
+/// A bytecode that can be the first half of a fused pair: its body without
+/// the transfer to the next instruction (C++ `bytecode_body`). Only
+/// sequential bytecodes qualify.
+pub(crate) trait First: Bytecode {
+    /// Decoder entries to the next instruction: [`STEP`] (C++
+    /// `NEXT_INSTR`) or 1 for compressed instructions (`NEXT_C_INSTR`).
+    const STEP: usize;
+    /// Where the instruction continues, with the same frame, when [`run`]
+    /// declines it: the slow path of a load or store outside the arena,
+    /// which then dispatches the next entry itself.
+    ///
+    /// [`run`]: First::run
+    const MISS: Handler;
+    /// Execute the instruction. `false` (only loads and stores) means
+    /// nothing happened yet: continue in [`First::MISS`].
+    fn run(f: &mut Frame<'_>) -> bool;
+}
+
+/// [`Bytecode`] markers for the block-ending second halves of fused pairs.
+macro_rules! markers {
+    ($($marker:ident => $h:expr,)*) => {$(
+        pub(crate) struct $marker;
+        impl Bytecode for $marker {
+            const HANDLER: Handler = $h;
+        }
+    )*};
+}
 
 /// C++ `FasterItype`: `imm:16 | rs2:8 | rs1:8`. For most bytecodes `rs1` is
 /// the destination and `rs2` the source; for branches and stores they are
@@ -176,8 +218,9 @@ fn set(m: &mut Machine, r: u32, v: u64) {
 
 /// A sequential bytecode: `|m, ins| body`, then continue `$step` decoder
 /// entries further on (C++ `NEXT_INSTR` is [`STEP`], `NEXT_C_INSTR` is 1).
+/// `name: Marker` also defines the [`First`] marker type.
 macro_rules! sequential {
-    ($($(#[$attr:meta])* $name:ident, $step:expr, |$m:ident, $ins:ident| $body:block)*) => {$(
+    ($($(#[$attr:meta])* $name:ident $(: $marker:ident)?, $step:expr, |$m:ident, $ins:ident| $body:block)*) => {$(
         handler! {
             $(#[$attr])*
             pub(crate) fn $name(f) {
@@ -189,32 +232,49 @@ macro_rules! sequential {
                 execute!(f, f.i() + $step)
             }
         }
+        $(
+            pub(crate) struct $marker;
+            impl Bytecode for $marker {
+                const HANDLER: Handler = $name;
+            }
+            impl First for $marker {
+                const STEP: usize = $step;
+                const MISS: Handler = $name;
+                #[inline(always)]
+                fn run(f: &mut Frame<'_>) -> bool {
+                    let $ins = f.ins();
+                    let $m = &mut *f.m;
+                    $body
+                    true
+                }
+            }
+        )?
     )*};
 }
 
 sequential! {
     /// C++ `RV32I_BC_ADDI`
-    addi, STEP, |m, ins| {
+    addi: Addi, STEP, |m, ins| {
         let fi = FasterItype(ins);
         set(m, fi.rs1(), reg(m, fi.rs2()).wrapping_add(fi.signed_imm() as u64));
     }
     /// C++ `RV32I_BC_LI`
-    li, STEP, |m, ins| {
+    li: Li, STEP, |m, ins| {
         let fi = FasterImmediate(ins);
         set(m, fi.rd(), fi.signed_imm() as u64);
     }
     /// C++ `RV32I_BC_MV`
-    mv, STEP, |m, ins| {
+    mv: Mv, STEP, |m, ins| {
         let fi = FasterMove(ins);
         set(m, fi.rd(), reg(m, fi.rs1()));
     }
     /// C++ `RV64I_BC_ADDIW`
-    addiw, STEP, |m, ins| {
+    addiw: Addiw, STEP, |m, ins| {
         let fi = FasterItype(ins);
         set(m, fi.rs1(), sext32((reg(m, fi.rs2()) as u32).wrapping_add(fi.signed_imm() as u32)));
     }
     /// C++ `RV32I_BC_SLLI`
-    slli, STEP, |m, ins| {
+    slli: Slli, STEP, |m, ins| {
         let fi = FasterItype(ins);
         set(m, fi.rs1(), reg(m, fi.rs2()).wrapping_shl(fi.unsigned_imm()));
     }
@@ -234,7 +294,7 @@ sequential! {
         set(m, fi.rs1(), reg(m, fi.rs2()) ^ fi.signed_imm() as u64);
     }
     /// C++ `RV32I_BC_SRLI`
-    srli, STEP, |m, ins| {
+    srli: Srli, STEP, |m, ins| {
         let fi = FasterItype(ins);
         set(m, fi.rs1(), reg(m, fi.rs2()).wrapping_shr(fi.unsigned_imm()));
     }
@@ -249,12 +309,12 @@ sequential! {
         set(m, fi.rs1(), reg(m, fi.rs2()) | fi.signed_imm() as u64);
     }
     /// C++ `RV32I_BC_ANDI`
-    andi, STEP, |m, ins| {
+    andi: Andi, STEP, |m, ins| {
         let fi = FasterItype(ins);
         set(m, fi.rs1(), reg(m, fi.rs2()) & fi.signed_imm() as u64);
     }
     /// C++ `RV32I_BC_LUI`
-    lui, STEP, |m, ins| {
+    lui: Lui, STEP, |m, ins| {
         let fi = FasterJtype(ins);
         set(m, fi.rd(), fi.upper_imm());
     }
@@ -295,22 +355,22 @@ sequential! {
     }
 
     /// C++ `RV32C_BC_ADDI` (C.ADDI, C.ADDI4SPN, C.ADDI16SP and C.LI)
-    c_addi, 1, |m, ins| {
+    c_addi: CAddi, 1, |m, ins| {
         let fi = FasterItype(ins);
         set(m, fi.rs1(), reg(m, fi.rs2()).wrapping_add(fi.signed_imm() as u64));
     }
     /// C++ `RV32C_BC_MV`
-    c_mv, 1, |m, ins| {
+    c_mv: CMv, 1, |m, ins| {
         let fi = FasterMove(ins);
         set(m, fi.rd(), reg(m, fi.rs1()));
     }
     /// C++ `RV32C_BC_SLLI`
-    c_slli, 1, |m, ins| {
+    c_slli: CSlli, 1, |m, ins| {
         let fi = FasterItype(ins);
         set(m, fi.rs1(), reg(m, fi.rs1()).wrapping_shl(fi.unsigned_imm()));
     }
     /// C++ `RV32C_BC_SRLI`
-    c_srli, 1, |m, ins| {
+    c_srli: CSrli, 1, |m, ins| {
         let fi = FasterItype(ins);
         set(m, fi.rs1(), reg(m, fi.rs1()).wrapping_shr(fi.unsigned_imm()));
     }
@@ -320,12 +380,12 @@ sequential! {
         set(m, fi.rs1(), reg(m, fi.rs1()) & fi.signed_imm() as u64);
     }
     /// C++ `RV32C_BC_ADD`
-    c_add, 1, |m, ins| {
+    c_add: CAdd, 1, |m, ins| {
         let fi = FasterItype(ins);
         set(m, fi.rs1(), reg(m, fi.rs1()).wrapping_add(reg(m, fi.rs2())));
     }
     /// C++ `RV32C_BC_XOR`
-    c_xor, 1, |m, ins| {
+    c_xor: CXor, 1, |m, ins| {
         let fi = FasterItype(ins);
         set(m, fi.rs1(), reg(m, fi.rs1()) ^ reg(m, fi.rs2()));
     }
@@ -345,12 +405,40 @@ handler! {
     /// The register-register bytecodes (C++ `RV32I_BC_OP_*`, `RV64I_BC_OP_*`),
     /// sharing their arithmetic with the precise handlers.
     pub(crate) fn op<O: RtypeAlu>(f) {
-        let fi = FasterOpType(f.ins());
-        let v = O::compute(reg(f.m, fi.rs1()), reg(f.m, fi.rs2()));
-        set(f.m, fi.rd(), v);
+        Op::<O>::run(&mut f);
         execute!(f, f.i() + STEP)
     }
 }
+
+/// The [`First`] marker of [`op`].
+pub(crate) struct Op<O>(PhantomData<O>);
+
+impl<O: RtypeAlu> Bytecode for Op<O> {
+    const HANDLER: Handler = op::<O>;
+}
+
+impl<O: RtypeAlu> First for Op<O> {
+    const STEP: usize = STEP;
+    const MISS: Handler = op::<O>;
+    #[inline(always)]
+    fn run(f: &mut Frame<'_>) -> bool {
+        let fi = FasterOpType(f.ins());
+        let v = O::compute(reg(f.m, fi.rs1()), reg(f.m, fi.rs2()));
+        set(f.m, fi.rd(), v);
+        true
+    }
+}
+
+/// C++ `RV32I_BC_OP_ADD`
+pub(crate) type OpAdd = Op<Add>;
+/// C++ `RV32I_BC_OP_SUB`
+pub(crate) type OpSub = Op<Sub>;
+/// C++ `RV32I_BC_OP_MUL`
+pub(crate) type OpMul = Op<Mul>;
+/// C++ `RV64I_BC_OP_ADDW`
+pub(crate) type OpAddw = Op<Addw>;
+/// C++ `RV64I_BC_OP_SH1ADD_UW`
+pub(crate) type OpSh1addUw = Op<Sh1addUw>;
 
 handler! {
     /// The CA-format register-register ops `rs1 = rs1 op rs2`: C++
@@ -371,7 +459,7 @@ sequential! {
         set(m, fi.rs1(), (reg(m, fi.rs1()) as i64).wrapping_shr(fi.unsigned_imm()) as u64);
     }
     /// C++ `RV32C_BC_LUI`, in the `FasterJtype` format of `RV32I_BC_LUI`
-    c_lui, 1, |m, ins| {
+    c_lui: CLui, 1, |m, ins| {
         let fi = FasterJtype(ins);
         set(m, fi.rd(), fi.upper_imm());
     }
@@ -380,10 +468,27 @@ sequential! {
 handler! {
     /// AUIPC reconstructs its address from the block end (C++ `rv32i_auipc`).
     pub(crate) fn auipc(f) {
+        Auipc::run(&mut f);
+        execute!(f, f.i() + STEP)
+    }
+}
+
+/// The [`First`] marker of [`auipc`].
+pub(crate) struct Auipc;
+
+impl Bytecode for Auipc {
+    const HANDLER: Handler = auipc;
+}
+
+impl First for Auipc {
+    const STEP: usize = STEP;
+    const MISS: Handler = auipc;
+    #[inline(always)]
+    fn run(f: &mut Frame<'_>) -> bool {
         let fi = FasterJtype(f.ins());
         let here = f.this_pc();
         set(f.m, fi.rd(), here.wrapping_add(fi.upper_imm()));
-        execute!(f, f.i() + STEP)
+        true
     }
 }
 
@@ -392,7 +497,31 @@ handler! {
 /// everything else goes through `$slow`, which uses the page table and
 /// raises faults.
 macro_rules! loads {
-    ($($(#[$attr:meta])* $name:ident, $cached:ident, $slow:ident, $step:expr, $n:literal, |$m:ident, $rd:ident, $b:ident| $set:expr;)*) => {$(
+    ($($(#[$attr:meta])* $name:ident $(: $marker:ident)?, $cached:ident, $slow:ident, $step:expr, $n:literal, |$m:ident, $rd:ident, $b:ident| $set:expr;)*) => {$(
+        $(
+            /// The [`First`] marker: the arena path, else `$cached`.
+            pub(crate) struct $marker;
+            impl Bytecode for $marker {
+                const HANDLER: Handler = $name;
+            }
+            impl First for $marker {
+                const STEP: usize = $step;
+                const MISS: Handler = $cached;
+                #[inline(always)]
+                fn run(f: &mut Frame<'_>) -> bool {
+                    let fi = FasterItype(f.ins());
+                    let $m = &mut *f.m;
+                    let addr = reg($m, fi.rs2()).wrapping_add(fi.signed_imm() as u64);
+                    if let Some($b) = $m.memory.arena_read::<$n>(addr) {
+                        let $rd = fi.rs1();
+                        $set;
+                        return true;
+                    }
+                    false
+                }
+            }
+        )?
+
         handler! {
             $(#[$attr])*
             pub(crate) fn $name(f) {
@@ -452,24 +581,24 @@ loads! {
     /// C++ `RV32I_BC_LDB`
     ldb, ldb_cached, ldb_slow, STEP, 1, |m, rd, b| set(m, rd, b[0] as i8 as i64 as u64);
     /// C++ `RV32I_BC_LDBU`
-    ldbu, ldbu_cached, ldbu_slow, STEP, 1, |m, rd, b| set(m, rd, u64::from(b[0]));
+    ldbu: Ldbu, ldbu_cached, ldbu_slow, STEP, 1, |m, rd, b| set(m, rd, u64::from(b[0]));
     /// C++ `RV32I_BC_LDH`
-    ldh, ldh_cached, ldh_slow, STEP, 2, |m, rd, b| set(m, rd, i16::from_le_bytes(b) as i64 as u64);
+    ldh: Ldh, ldh_cached, ldh_slow, STEP, 2, |m, rd, b| set(m, rd, i16::from_le_bytes(b) as i64 as u64);
     /// C++ `RV32I_BC_LDHU`
-    ldhu, ldhu_cached, ldhu_slow, STEP, 2, |m, rd, b| set(m, rd, u64::from(u16::from_le_bytes(b)));
+    ldhu: Ldhu, ldhu_cached, ldhu_slow, STEP, 2, |m, rd, b| set(m, rd, u64::from(u16::from_le_bytes(b)));
     /// C++ `RV32I_BC_LDW`
-    ldw, ldw_cached, ldw_slow, STEP, 4, |m, rd, b| set(m, rd, sext32(u32::from_le_bytes(b)));
+    ldw: Ldw, ldw_cached, ldw_slow, STEP, 4, |m, rd, b| set(m, rd, sext32(u32::from_le_bytes(b)));
     /// C++ `RV32I_BC_LDWU`
     ldwu, ldwu_cached, ldwu_slow, STEP, 4, |m, rd, b| set(m, rd, u64::from(u32::from_le_bytes(b)));
     /// C++ `RV32I_BC_LDD`
-    ldd, ldd_cached, ldd_slow, STEP, 8, |m, rd, b| set(m, rd, u64::from_le_bytes(b));
+    ldd: Ldd, ldd_cached, ldd_slow, STEP, 8, |m, rd, b| set(m, rd, u64::from_le_bytes(b));
     /// C++ `RV32C_BC_LDW` (C.LW, C.LWSP)
-    c_ldw, c_ldw_cached, c_ldw_slow, 1, 4, |m, rd, b| set(m, rd, sext32(u32::from_le_bytes(b)));
+    c_ldw: CLdw, c_ldw_cached, c_ldw_slow, 1, 4, |m, rd, b| set(m, rd, sext32(u32::from_le_bytes(b)));
     /// C++ `RV32C_BC_LDD` (C.LD, C.LDSP)
-    c_ldd, c_ldd_cached, c_ldd_slow, 1, 8, |m, rd, b| set(m, rd, u64::from_le_bytes(b));
+    c_ldd: CLdd, c_ldd_cached, c_ldd_slow, 1, 8, |m, rd, b| set(m, rd, u64::from_le_bytes(b));
     /// C++ `RV32C_BC_FLD` (C.FLD, C.FLDSP). Like the precise C.FLD handlers,
     /// not gated on the F extension.
-    c_fld, c_fld_cached, c_fld_slow, 1, 8, |m, rd, b| m.cpu.regs.set_fp_bits(rd, u64::from_le_bytes(b));
+    c_fld: CFld, c_fld_cached, c_fld_slow, 1, 8, |m, rd, b| m.cpu.regs.set_fp_bits(rd, u64::from_le_bytes(b));
 }
 
 #[cfg(feature = "ext-f")]
@@ -477,13 +606,34 @@ loads! {
     /// C++ `RV32F_BC_FLW`
     flw, flw_cached, flw_slow, STEP, 4, |m, rd, b| crate::isa::rvfd::load_u32(m, rd, u32::from_le_bytes(b));
     /// C++ `RV32F_BC_FLD`
-    fld, fld_cached, fld_slow, STEP, 8, |m, rd, b| m.cpu.regs.set_fp_bits(rd, u64::from_le_bytes(b));
+    fld: Fld, fld_cached, fld_slow, STEP, 8, |m, rd, b| m.cpu.regs.set_fp_bits(rd, u64::from_le_bytes(b));
 }
 
 /// Stores: `write(rs1 + imm, rs2)` (C++ `RV32I_BC_ST*`, `RV32C_BC_ST*`,
 /// `RV32F_BC_FS*`), with a cold page-table handler like [`loads!`].
 macro_rules! stores {
-    ($($(#[$attr:meta])* $name:ident, $cached:ident, $slow:ident, $step:expr, |$m:ident, $rs2:ident| $value:expr;)*) => {$(
+    ($($(#[$attr:meta])* $name:ident $(: $marker:ident)?, $cached:ident, $slow:ident, $step:expr, |$m:ident, $rs2:ident| $value:expr;)*) => {$(
+        $(
+            /// The [`First`] marker: the arena path, else `$cached`.
+            pub(crate) struct $marker;
+            impl Bytecode for $marker {
+                const HANDLER: Handler = $name;
+            }
+            impl First for $marker {
+                const STEP: usize = $step;
+                const MISS: Handler = $cached;
+                #[inline(always)]
+                fn run(f: &mut Frame<'_>) -> bool {
+                    let fi = FasterItype(f.ins());
+                    let $m = &mut *f.m;
+                    let addr = reg($m, fi.rs1()).wrapping_add(fi.signed_imm() as u64);
+                    let $rs2 = fi.rs2();
+                    let value = $value;
+                    $m.memory.arena_write(addr, value)
+                }
+            }
+        )?
+
         handler! {
             $(#[$attr])*
             pub(crate) fn $name(f) {
@@ -540,17 +690,17 @@ macro_rules! stores {
 
 stores! {
     /// C++ `RV32I_BC_STB`
-    stb, stb_cached, stb_slow, STEP, |m, rs2| (reg(m, rs2) as u8).to_le_bytes();
+    stb: Stb, stb_cached, stb_slow, STEP, |m, rs2| (reg(m, rs2) as u8).to_le_bytes();
     /// C++ `RV32I_BC_STH`
-    sth, sth_cached, sth_slow, STEP, |m, rs2| (reg(m, rs2) as u16).to_le_bytes();
+    sth: Sth, sth_cached, sth_slow, STEP, |m, rs2| (reg(m, rs2) as u16).to_le_bytes();
     /// C++ `RV32I_BC_STW`
-    stw, stw_cached, stw_slow, STEP, |m, rs2| (reg(m, rs2) as u32).to_le_bytes();
+    stw: Stw, stw_cached, stw_slow, STEP, |m, rs2| (reg(m, rs2) as u32).to_le_bytes();
     /// C++ `RV32I_BC_STD`
-    std, std_cached, std_slow, STEP, |m, rs2| reg(m, rs2).to_le_bytes();
+    std: Std, std_cached, std_slow, STEP, |m, rs2| reg(m, rs2).to_le_bytes();
     /// C++ `RV32C_BC_STW` (C.SW, C.SWSP)
-    c_stw, c_stw_cached, c_stw_slow, 1, |m, rs2| (reg(m, rs2) as u32).to_le_bytes();
+    c_stw: CStw, c_stw_cached, c_stw_slow, 1, |m, rs2| (reg(m, rs2) as u32).to_le_bytes();
     /// C++ `RV32C_BC_STD` (C.SD, C.SDSP)
-    c_std, c_std_cached, c_std_slow, 1, |m, rs2| reg(m, rs2).to_le_bytes();
+    c_std: CStd, c_std_cached, c_std_slow, 1, |m, rs2| reg(m, rs2).to_le_bytes();
     /// C++ `RV32C_BC_FSD` (C.FSD, C.FSDSP)
     c_fsd, c_fsd_cached, c_fsd_slow, 1, |m, rs2| m.cpu.regs.fp_bits(rs2).to_le_bytes();
 }
@@ -560,7 +710,7 @@ stores! {
     /// C++ `RV32F_BC_FSW`
     fsw, fsw_cached, fsw_slow, STEP, |m, rs2| (m.cpu.regs.fp_bits(rs2) as u32).to_le_bytes();
     /// C++ `RV32F_BC_FSD`
-    fsd, fsd_cached, fsd_slow, STEP, |m, rs2| m.cpu.regs.fp_bits(rs2).to_le_bytes();
+    fsd: Fsd, fsd_cached, fsd_slow, STEP, |m, rs2| m.cpu.regs.fp_bits(rs2).to_le_bytes();
 }
 
 /// FADD/FSUB/FMUL/FDIV (C++ `RV32F_BC_F*`). The rewriter only picks these
@@ -644,6 +794,19 @@ branches! {
     bltu, forward: false, |a, b| a < b;
     /// C++ `RV32I_BC_BGEU`
     bgeu, forward: false, |a, b| a >= b;
+}
+
+markers! {
+    BeqFw => beq_fw,
+    Bne => bne,
+    BneFw => bne_fw,
+    Bltu => bltu,
+    Bgeu => bgeu,
+    CBeqz => c_beqz,
+    CJr => c_jr,
+    FastJal => fast_jal,
+    FastCall => fast_call,
+    Jalr => jalr,
 }
 
 handler! {
