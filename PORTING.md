@@ -967,8 +967,8 @@ and `page.hpp`.
 The page table uses `BTreeMap<page number, slot>` and stable `Vec` slots
 containing `(page number, Page)`. Attributes include read/write/execute,
 copy-on-write, `dont_fork`, and a user byte. Storage is arena-backed, owned,
-or a shared zero/host page. Owned bytes use `Arc<[u8; 4096]>`; writes use
-`Arc::make_mut` to isolate forks. Range operations use `BTreeMap::range`.
+or a shared zero/host page, or loaned from a fork's snapshot. Owned bytes
+use `Arc<[u8; 4096]>`; writes use `Arc::make_mut` to isolate forks. Range operations use `BTreeMap::range`.
 
 A 512-entry direct-mapped page cache stores slots as relaxed `AtomicUsize`
 values, allowing lookup through `&self` while preserving `Memory: Sync`.
@@ -977,13 +977,25 @@ copy-on-write, protection changes, or removal. Misses have logarithmic B-tree
 cost rather than a guest-controlled hash-collision risk. Arena-free machines
 use this path for every load and store; see fork benchmarks.
 
-A fork clones one `Arc` per shared page, and dropping it releases them, so
-concurrent forks of one master contend on those reference counts (C++ lends
-the pages without counting). `benches/scaling.rs` measures it: on a 7-vCPU
-Linux AArch64 VM, fork + drop of one master takes 1.0 µs on one thread,
-8.8 µs each on two and 23.5 µs each on seven, so total forks/s barely grows
-past one thread; with a master per thread, 2.2 µs each on seven. Not yet
-addressed.
+Forks loan pages through a snapshot (`paging::Snapshot`): the master's
+page bytes (one `Arc` each) and a ready page table for a fork, whose loaned
+pages are indices into those bytes. A fork copies the page table and takes
+one reference to the bytes, so threads forking one master do not contend on
+per-page reference counts (C++ loans pages without counting; here the
+master may go first). A machine without an arena caches its snapshot until
+its pages change: every mutable access to a page table slot drops it, except
+guest stores to bytes nothing else holds (`Arc::get_mut`), which a snapshot
+cannot contain. A machine with an arena snapshots at every fork, since guest
+stores change the arena directly. `tests/brutal.rs`
+(`forks_see_every_change_made_since_the_last_fork`) checks that every kind
+of change reaches later forks only.
+
+Measured with `benches/fork.rs` and `benches/scaling.rs` on a 7-vCPU Linux
+AArch64 VM, against one `Arc` per loaned page before: fork + drop 4.5 µs →
+3.0 µs; random access in a fork 19.7 → 17.5 ns per iteration; reading all
+2 MiB of a fresh fork ~5% slower (890–930 → 940–975 µs; a loaned page's
+bytes are one more lookup away); fork + write a page + drop on seven
+threads 81k → 312k forks/s (efficiency 20% → 73%).
 
 Only arena pages with non-default attributes need entries. A bitmap tracks
 C++-equivalent active pages for `pages_active`, `getrusage`'s `ru_maxrss`, and
